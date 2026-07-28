@@ -1,0 +1,13 @@
+menu "on9kvdb"
+
+    config ON9KVDB_RUNTIME_MEMORY_BUDGET
+        int "Default component-owned runtime memory budget in bytes"
+        default 102400
+        range 32768 204799
+        help
+            Default memory budget used by on9kvdb_cfg. The v1 target is
+            PSRAM and all runtime overrides must remain below 200 KiB.
+            No component-owned allocation is allowed during normal operations
+            after initialization completes.
+
+endmenu

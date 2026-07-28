@@ -635,44 +635,122 @@ the resulting image and compare it with a simple committed-state model.
 - memory use stays within the approved init-time allocation budget; and
 - corruption produces an explicit error, never a silent format/reset.
 
-## Open decisions: ask before implementation
+## Phase 0 design decisions
 
-1. What problem with ESP-IDF NVS is the custom engine intended to solve:
-   SD-card support, capacity, RAM, latency, atomic multi-key commits,
-   portability, value size, or another measured requirement?
-2. Which storage media and exact ESP32 targets are mandatory for v1?
-3. What are the maximum database bytes, namespaces, keys, live data bytes,
-   string/blob bytes, mutations per commit, and staged transaction bytes?
-4. What are the expected and worst-case write rates and required service life?
-5. What RAM may be reserved at init for staging, memtable, indexes, compaction,
-   descriptors, and optional cache?
-6. What are the maximum acceptable init/recovery time, normal commit latency,
-   and worst-case flush/compaction stall?
-7. Should names exactly match NVS's 15-character namespace/key limits, or use a
-   different fixed bound?
-8. Is atomic multi-key `commit()` required, and can one transaction touch more
-   than one namespace/handle?
-9. What is the required pre-commit read visibility/read-your-writes behavior?
-10. Should `close()` discard staged changes, reject close while dirty, or
-    commit them?
-11. Is the primary public API C++, C, or a C++ core plus C wrapper?
-12. Which NVS features are v1 requirements: stats, iteration, find-key,
-    erase-all, secure purge, encryption, partition-like multiple stores?
-13. Must setters accept values larger than one WAL/SSTable block, and is
-    streaming blob I/O required?
-14. Is synchronous foreground compaction acceptable, or is a bounded
-    background task required?
-15. What corruption/factory-reset policy should the application use? The
-    database itself will not auto-format.
-16. Is at-rest encryption required? Filesystem or flash encryption is separate
-    from database atomicity and must have an explicit key policy.
-17. Which FAT type, cluster size, sector size, mount `max_files`, and
-    `use_one_fat` settings will production use?
-18. For SD cards, what durability claim is acceptable given controller/card
-    behavior, and is a qualified card list available?
-19. Should Soulcloud snapshots, command deduplication, and terminal-result
-    replay be implemented above this generic KV API or as a database
-    transaction use case in this component's tests?
+Reviewed on 2026-07-29. Phase 1 is approved. Later phases must follow these
+decisions and must ask before changing them.
+
+### Motivation and platform scope
+
+- The custom engine is intended to avoid known or suspected NVS scaling and
+  latency limitations and to support SD-card storage, which ESP-IDF NVS does
+  not provide.
+- V1 must support both SD card and NOR flash through mounted FATFS.
+- A filesystem journaling layer is a platform prerequisite. Upstream
+  `esp_jrnl` may be used for NOR flash; the planned SD-card port is separate
+  work and is not owned by `on9kvdb`.
+- FATFS must retain both FAT copies: production sets `use_one_fat=false`.
+- Production `max_files` must be comfortably above the component's final,
+  measured descriptor requirement rather than assuming that three descriptors
+  are sufficient.
+- Expected SD media are SanDisk High Endurance/Max Endurance cards or qualified
+  SLC-based SD NAND such as XTX-class parts. Published TBW informs endurance
+  planning but does not prove power-loss durability.
+
+### Capacity, names, and workload
+
+- Each permanent FAT32-compatible database file is at most `UINT32_MAX` bytes
+  (4 GiB minus one byte). Total database capacity depends on the persisted file
+  count and geometry, which are not yet frozen.
+- Namespace and key names contain 1 through 32 bytes, excluding the terminating
+  NUL used by the C++ API. The limit is bytes, not Unicode code points.
+- A persisted string or blob is at most 8192 bytes. String length includes the
+  terminating NUL, so a string contains at most 8191 non-NUL bytes.
+- Values that exceed the limit are rejected. Fragmented and streaming
+  string/blob I/O are not v1 features.
+- A transaction contains at most 10 mutations. Its staged byte capacity is
+  also limited by the configured memory budget, so ten maximum-sized values
+  are not guaranteed to fit simultaneously.
+- The expected workload is at most 10 commits per normal day and 20 commits per
+  peak day. A typical commit changes two keys; a commit changes at most ten.
+- Required service life is ten years.
+
+A **live key** is the latest committed, non-tombstoned `(namespace, key)` pair
+across the whole database. It is not a namespace handle, an old LSM version, or
+an uncommitted mutation. V1 does not require one permanent RAM-index entry per
+live key: total live namespaces and keys are bounded by fixed on-disk capacity
+and persisted counters. Open handles, active transactions, staged mutations,
+memtable entries, and compaction scratch space remain independently bounded RAM
+resources.
+
+### Memory and performance
+
+- Runtime arenas are allocated from PSRAM during initialization.
+- The default component-owned runtime-memory budget is 100 KiB.
+- The configurable v1 hard ceiling is strictly less than 200 KiB.
+- Exact arena partitioning is Phase 3 work. Normal operations must allocate no
+  component-owned heap after initialization.
+- SD-card initialization or recovery may take up to approximately three
+  minutes. Long scans must yield or otherwise integrate with task-watchdog
+  policy; disabling safety checks globally is not an acceptable shortcut.
+- Foreground synchronous flush and compaction are accepted for v1.
+- Commit/flush performance should improve on ESP-IDF NVS, but that target is
+  not yet quantified. Before making a performance claim, benchmark both engines
+  with the same logical workload and report initialization, get, set/commit,
+  compaction, and tail latency.
+
+### API and transaction semantics
+
+- The primary v1 API is C++. A C wrapper is deferred.
+- One namespace handle selects exactly one namespace.
+- A v1 transaction is associated with one namespace handle. Atomic
+  cross-namespace transactions are deferred.
+- Commit is atomic across every mutation staged in the transaction.
+- A transaction reads its own staged mutations. Other namespace handles see
+  only committed state.
+- Explicit transaction `close()` is an alias for commit and returns
+  `esp_err_t`. A failed close leaves the transaction valid for retry or abort.
+- Namespace close returns `ESP_ERR_ON9KVDB_BUSY` while its transaction is
+  active.
+- Destruction or abandonment aborts dirty transaction state rather than
+  silently committing it.
+- Typed integer, string, blob, erase-key, stats, and find-key operations are v1
+  requirements.
+- General iteration, erase-all, secure purge, encryption, namespace
+  enumeration, partition-like multiple stores, and the C wrapper are deferred.
+
+### Corruption, reset, and integration policy
+
+- Corruption handling is fail-closed. Do not start services that require stored
+  configuration; report a typed diagnostic and wait for maintenance.
+- The database never automatically deletes files, formats FATFS, or replaces
+  corrupt data with defaults.
+- Deleting FATFS files is not `erase_all()` or normal factory reset.
+- A later explicit logical reset must reinitialize structurally valid fixed
+  files in place. Repairing or reformatting damaged FATFS is a separate
+  platform maintenance action.
+- At-rest encryption is not a v1 requirement.
+- Soulcloud snapshot, command-deduplication, and terminal-result logic belongs
+  above the generic KV API. Add that integration after the KV engine is usable;
+  the Soulcloud client itself is not part of the current implementation.
+
+### Decisions still required by later phases
+
+These items do not reopen Phase 1, but they gate the phase that consumes them:
+
+- Phase 2 must freeze manifest/WAL/table file sizes and counts, FAT type,
+  cluster/sector geometry validation, the exact descriptor budget, and the
+  supported ESP32 production targets.
+- Phases 3–5 must freeze the arena split, memtable capacity, WAL capacity,
+  SSTable levels/size ratio, compaction reserve, and the behavior when a
+  transaction reaches its byte limit before ten mutations.
+- Performance acceptance requires a measured NVS baseline rather than relying
+  on recollection that some operations are `O(n)`.
+- Final SD power-loss qualification waits for the separately owned journal
+  port and testing on the selected endurance/SLC media.
+- Soulcloud integration tests wait for enough of the generic database and
+  client stack to exist, but the storage semantics in the Soulcloud
+  requirements remain mandatory.
 
 ## Suggested source-file split
 
