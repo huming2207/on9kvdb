@@ -15,11 +15,26 @@ namespace on9kvdb_def
     static const constexpr size_t runtime_memory_budget_max =
         200U * 1024U - 1U;
     static const constexpr uint64_t max_fat32_file_size = UINT32_MAX;
+    static const constexpr uint32_t format_alignment = 4096;
+    static const constexpr uint32_t manifest_slot_size = format_alignment;
+    static const constexpr uint32_t manifest_slot_count = 2;
+    static const constexpr uint32_t manifest_file_size =
+        manifest_slot_size * manifest_slot_count;
+    static const constexpr uint32_t identity_slot_size = format_alignment;
+    static const constexpr uint32_t identity_slot_count = 2;
+    static const constexpr uint32_t identity_region_size =
+        identity_slot_size * identity_slot_count;
+    static const constexpr uint32_t wal_file_count = 2;
 
     static const constexpr uint16_t storage_revision = 1;
+    static const constexpr uint16_t geometry_revision = 1;
     static const constexpr uint32_t manifest_magic = 0x394d564bUL; // "KVM9"
     static const constexpr uint32_t wal_magic = 0x3957564bUL; // "KVW9"
     static const constexpr uint32_t table_magic = 0x3954564bUL; // "KVT9"
+    static const constexpr uint16_t manifest_state_provisioning_owned =
+        0x7001;
+    static const constexpr uint16_t manifest_state_ready = 0x7002;
+    static const constexpr uint16_t file_prefix_flag_identity = 1U << 0;
 
     enum class file_kind : uint16_t {
         invalid = 0,
@@ -69,6 +84,37 @@ namespace on9kvdb_def
         uint32_t checksum = 0;
     };
 
+    struct storage_geometry {
+        uint64_t provisioned_size = 0;
+        uint64_t max_live_bytes = 0;
+        uint32_t manifest_size = 0;
+        uint32_t wal_size = 0;
+        uint32_t wal_count = 0;
+        uint32_t table_size = 0;
+        uint32_t table_count = 0;
+        uint32_t alignment = 0;
+    };
+
+    struct manifest_record {
+        uint64_t generation = 0;
+        uint64_t database_id = 0;
+        uint16_t state = 0;
+        storage_geometry geometry = {};
+    };
+
+    struct file_identity {
+        uint64_t generation = 0;
+        uint64_t database_id = 0;
+        uint64_t file_size = 0;
+        uint32_t slot = 0;
+        file_kind kind = file_kind::invalid;
+    };
+
+    static const constexpr size_t manifest_record_size = 96;
+    static const constexpr size_t manifest_record_checksum_offset = 92;
+    static const constexpr size_t file_identity_size = 56;
+    static const constexpr size_t file_identity_checksum_offset = 52;
+
     bool checked_add_size(size_t lhs, size_t rhs, size_t *result_out);
     bool checked_mul_size(size_t lhs, size_t rhs, size_t *result_out);
     bool checked_align_up_size(size_t value, size_t alignment,
@@ -107,4 +153,17 @@ namespace on9kvdb_def
                                      uint32_t expected_magic,
                                      file_kind expected_kind,
                                      decoded_file_prefix *prefix_out);
+
+    bool validate_storage_geometry(const storage_geometry &geometry);
+    bool storage_geometry_equal(const storage_geometry &lhs,
+                                const storage_geometry &rhs);
+    bool encode_manifest_record(uint8_t *buf, size_t buf_len,
+                                const manifest_record &record);
+    format_status decode_manifest_record(const uint8_t *buf, size_t buf_len,
+                                         manifest_record *record_out);
+    bool encode_file_identity(uint8_t *buf, size_t buf_len,
+                              const file_identity &identity);
+    format_status decode_file_identity(const uint8_t *buf, size_t buf_len,
+                                       file_kind expected_kind,
+                                       file_identity *identity_out);
 }

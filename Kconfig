@@ -1,5 +1,49 @@
 menu "on9kvdb"
 
+    config ON9KVDB_MAX_LIVE_DATA_SIZE
+        int "Maximum encoded live data in bytes"
+        default 2097152
+        range 65536 4294967295
+        help
+            Maximum encoded size of the newest committed, non-tombstoned
+            namespace/key records. This includes record metadata, namespace,
+            key, type, and value bytes. Existing databases must match this
+            build-time value exactly.
+
+    config ON9KVDB_PROVISIONED_DATABASE_SIZE
+        int "Total provisioned database size in bytes"
+        default 4194304
+        range 196608 4294967295
+        help
+            Exact sum of manifest, both WAL files, and every SSTable file.
+            Every file is allocated contiguously at its final size. Existing
+            databases must match this build-time value exactly.
+
+    config ON9KVDB_WAL_FILE_SIZE
+        int "Size of each WAL file in bytes"
+        default 262144
+        range 65536 4294967295
+        help
+            Final preallocated size of each of the two permanent WAL files.
+            Must be a multiple of 4096 bytes.
+
+    config ON9KVDB_SSTABLE_FILE_SIZE
+        int "Size of each SSTable file in bytes"
+        default 610304
+        range 65536 4294967295
+        help
+            Final preallocated size of each permanent SSTable file. The
+            default is 596 KiB. Must be a multiple of 4096 bytes.
+
+    config ON9KVDB_SSTABLE_COUNT
+        int "Number of permanent SSTable files"
+        default 6
+        range 2 64
+        help
+            Number of fixed physical SSTable slots. The FATFS mount must
+            allow at least this value plus three on9kvdb file descriptors,
+            in addition to descriptors required by the application.
+
     config ON9KVDB_RUNTIME_MEMORY_BUDGET
         int "Default component-owned runtime memory budget in bytes"
         default 102400

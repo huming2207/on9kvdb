@@ -6,6 +6,9 @@ This file is the design and implementation plan for `on9kvdb`. No storage
 format or public API described as **proposed** below is approved merely by
 appearing in this plan.
 
+Phase 1 and Phase 2 are implemented. Phase 3 is the next implementation phase;
+do not treat the current component as a usable key-value database yet.
+
 The intended component is a fixed-capacity, namespaced key-value database for
 ESP32-class devices. It should expose an API similar to ESP-IDF NVS while using
 an LSM tree over files on an already-mounted, filesystem-journaled FATFS
@@ -72,7 +75,10 @@ instead of silently selecting a value.
   healthy database file. Reuse fixed physical slots by changing checked
   logical generations inside them.
 - Treat the geometry persisted by an existing database as authoritative. A
-  later Kconfig or runtime default must not resize or reinterpret it.
+  later Kconfig must not resize or reinterpret it. V1 additionally requires
+  every persisted geometry field to match the running firmware's Kconfig
+  exactly; a mismatch fails initialization and requires an application-owned
+  delete/recreate maintenance operation.
 - Bound every offset and length before seeking, reading, writing, or converting
   to `off_t`.
 - Check all I/O results, including short reads/writes and `fsync()`.
@@ -237,9 +243,10 @@ background worker. Begin with it unless latency requirements show it is
 unacceptable. A second immutable memtable and background work add concurrency,
 memory, shutdown, and recovery states and require explicit approval.
 
-## Proposed physical layout
+## V1 physical layout
 
-This layout is a design candidate, not yet frozen:
+Phase 2 freezes the permanent filenames, file counts/sizes, manifest slots,
+and the two identity slots at the beginning of every WAL/SSTable file:
 
 ```text
 <base path>/
@@ -252,7 +259,8 @@ This layout is a design candidate, not yet frozen:
 └── table_<N-1>.db
 ```
 
-Every file is permanent, contiguous, and fixed-size.
+Every file is permanent, contiguous, and fixed-size. WAL record layout and
+SSTable block/index/footer layout remain later-phase designs.
 
 ### Manifest
 
@@ -333,8 +341,9 @@ Compaction must be copy-on-write:
 Reserve enough unselected table capacity to complete worst-case compaction.
 Returning `NOT_ENOUGH_SPACE` is preferable to overwriting a live table.
 
-The level count, size ratio, table-slot sizes, compaction policy, and tombstone
-drop rules remain open until workload and capacity limits are supplied.
+The level count, size ratio, compaction policy, output-reserve policy, and
+tombstone drop rules remain open until the later-phase implementation and
+measurements are reviewed.
 
 ## Proposed logical model
 
@@ -637,8 +646,9 @@ the resulting image and compare it with a simple committed-state model.
 
 ## Phase 0 design decisions
 
-Reviewed on 2026-07-29. Phase 1 is approved. Later phases must follow these
-decisions and must ask before changing them.
+Reviewed on 2026-07-29. Phase 1 is approved. Phase 2 geometry and compatibility
+policy were approved on 2026-07-29. Later phases must follow these decisions
+and must ask before changing them.
 
 ### Motivation and platform scope
 
@@ -660,8 +670,32 @@ decisions and must ask before changing them.
 ### Capacity, names, and workload
 
 - Each permanent FAT32-compatible database file is at most `UINT32_MAX` bytes
-  (4 GiB minus one byte). Total database capacity depends on the persisted file
-  count and geometry, which are not yet frozen.
+  (4 GiB minus one byte).
+- V1 geometry is selected at compile time through Kconfig and persisted in the
+  manifest. The default maximum encoded live-data size is 2 MiB and the default
+  total provisioned database size is exactly 4 MiB.
+- The default permanent layout is one 8 KiB manifest, two 256 KiB WAL files,
+  and six 596 KiB SSTable files. All file sizes and the total are multiples of
+  4096 bytes:
+
+  ```text
+  8192 + 2 * 262144 + 6 * 610304 = 4194304 bytes
+  ```
+
+- Kconfig exposes maximum live bytes, total provisioned bytes, WAL file size,
+  SSTable file size, and SSTable count. Invalid arithmetic, non-4096-byte
+  alignment, files above the FAT32 limit, fewer than two WALs, fewer than two
+  SSTables, or a file-size sum different from the configured total fail at
+  build time where possible and at initialization otherwise.
+- "Live bytes" means the encoded size of the newest committed,
+  non-tombstoned records, including namespace, key, type, value, and required
+  record metadata. It is a logical admission limit, not the number of bytes
+  currently occupied by old LSM versions.
+- "Provisioned bytes" means the sum of every permanent file's final FATFS file
+  size, including manifests, WALs, SSTables, stale versions, and compaction
+  workspace. It excludes unrelated application files, FAT metadata, and the
+  unused tail of a file's final allocation cluster. Actual volume consumption
+  is the sum of each file size rounded up to the mounted cluster size.
 - Namespace and key names contain 1 through 32 bytes, excluding the terminating
   NUL used by the C++ API. The limit is bytes, not Unicode code points.
 - A persisted string or blob is at most 8192 bytes. String length includes the
@@ -729,6 +763,11 @@ resources.
 - A later explicit logical reset must reinitialize structurally valid fixed
   files in place. Repairing or reformatting damaged FATFS is a separate
   platform maintenance action.
+- V1 performs no geometry migration. If any persisted geometry differs from
+  the running firmware's Kconfig, `init()` returns
+  `ESP_ERR_ON9KVDB_INCOMPATIBLE_GEOMETRY`. The component does not delete,
+  resize, or recreate the database; the application/user must deliberately
+  remove the complete database file set and provision a new database.
 - At-rest encryption is not a v1 requirement.
 - Soulcloud snapshot, command-deduplication, and terminal-result logic belongs
   above the generic KV API. Add that integration after the KV engine is usable;
@@ -738,9 +777,25 @@ resources.
 
 These items do not reopen Phase 1, but they gate the phase that consumes them:
 
-- Phase 2 must freeze manifest/WAL/table file sizes and counts, FAT type,
-  cluster/sector geometry validation, the exact descriptor budget, and the
-  supported ESP32 production targets.
+- Phase 2 uses FAT32 only, with 512-byte or 4096-byte logical sectors and
+  4096-byte database format slots/alignment. It supports ESP32-family targets
+  through ESP-IDF v6.0.2 FATFS; the initial project qualification target is
+  ESP32-S3.
+- A future backend may target LittleFS v3 or another suitable filesystem, but
+  that is outside v1 and must not weaken or silently reinterpret the FAT32
+  on-disk contract.
+- The application must mount FATFS with two FAT copies and a file-descriptor
+  allowance of at least `SSTABLE_COUNT + 3` for one database, plus its own
+  descriptors. The component keeps the manifest, both WALs, and every SSTable
+  open after initialization.
+- ESP-IDF's public mounted-FATFS API does not expose the mounted FAT subtype,
+  logical-sector size, cluster size, FAT-copy count, or configured
+  `max_files`. Phase 2 validates the mount through `esp_vfs_fat_info()`, checks
+  every permanent file with `stat()` and the contiguous-file API, and fails on
+  any observable mismatch. FAT32, 512/4096-byte sectors, two FAT copies,
+  journaling, and the descriptor allowance remain an explicit platform mount
+  contract until ESP-IDF exposes a stable query API; do not couple the
+  component to private VFS/FatFs context structures merely to inspect them.
 - Phases 3–5 must freeze the arena split, memtable capacity, WAL capacity,
   SSTable levels/size ratio, compaction reserve, and the behavior when a
   transaction reaches its byte limit before ten mutations.
