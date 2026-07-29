@@ -7,24 +7,23 @@ over permanent contiguous files on a journaled FATFS volume.
 
 This project is vibe-coded by GPT-5 Codex and reviewed by Kimi K3, tested by human (me).
 
-The component is currently at **Phase 4**. It has fixed-capacity namespace and
+The component is currently at **Phase 6**. It has fixed-capacity namespace and
 transaction handles, typed staging, read-your-writes, recoverable atomic WAL
 transactions, automatic immutable SSTable flush, and committed lookup across
 the memtable and every published table.
 
-This remains a deliberately capacity-limited milestone. Phase 4 does not
-compact or reuse table/WAL slots. The default two WAL files hold 120
-minimum-frame transactions in total; a flush permanently consumes one of six
-table slots. Safe reuse and sustained operation require the approved Phase 5
-compaction policy. Capacity exhaustion returns `ESP_ERR_NO_MEM` without
-overwriting published state.
+Phase 5 adds foreground full compaction and safe table/WAL reuse. The six
+SSTables form two banks of three files. Compaction writes and validates the
+inactive bank before atomically selecting it through the manifest; the old
+bank is not reusable until both redundant manifest copies no longer reference
+it.
 
 ## Default fixed geometry
 
 New databases use build-time Kconfig geometry:
 
 ```text
-CONFIG_ON9KVDB_MAX_LIVE_DATA_SIZE          2097152 bytes
+CONFIG_ON9KVDB_MAX_LIVE_DATA_SIZE           786432 bytes
 CONFIG_ON9KVDB_PROVISIONED_DATABASE_SIZE   4194304 bytes
 CONFIG_ON9KVDB_WAL_FILE_SIZE                262144 bytes
 CONFIG_ON9KVDB_SSTABLE_FILE_SIZE            610304 bytes
@@ -54,10 +53,15 @@ firmware configured for six. The component does not migrate, delete, resize,
 or recreate it. The application/user must deliberately remove the complete
 old database file set before provisioning a replacement.
 
+Phase 5 uses storage revision 4. Earlier development-format databases are not
+migrated and return `ESP_ERR_INVALID_VERSION`; remove the complete database
+file set deliberately before provisioning a replacement.
+
 `MAX_LIVE_DATA_SIZE` and `PROVISIONED_DATABASE_SIZE` mean different things:
 
-- Live bytes are the encoded newest committed, non-deleted records, including
-  namespace, key, type, value, and record metadata.
+- Logical-state bytes are the encoded newest committed records, including
+  tombstones, namespace, key, type, value, and record metadata. The historical
+  Kconfig field name remains `MAX_LIVE_DATA_SIZE`.
 - Provisioned bytes are the final sizes of all permanent database files,
   including WAL space, stale LSM versions, and compaction workspace.
 
@@ -67,12 +71,10 @@ length is rounded up independently to the mounted cluster size. If the public
 free-byte check does not account for enough cluster-tail slack, contiguous
 creation fails with `ESP_ERR_NO_MEM` rather than changing the geometry.
 
-The physical table format can hold far more data than one memtable flush, but
-Phase 4 intentionally writes one level-0 table per flush and never reuses it.
-With the defaults, one flush contains at most 512 distinct composite keys and
-the two unrecycled WALs contain at most 120 minimum-frame transactions. Do not
-use the 2 MiB live-data geometry as a Phase 4 sustained-capacity promise;
-compaction and reuse are Phase 5 requirements.
+The 768 KiB default is a conservative hard admission bound for arbitrary
+permitted record-size mixtures. Records do not span 12 KiB blocks, so the
+bound includes worst-case block packing and leaves both deletion state and
+publication safety governed by the same limit.
 
 ## Phase 2 file provisioning
 
@@ -192,8 +194,8 @@ It does not silently consume the arena from internal RAM.
 Default runtime partitions include 64 namespaces, 8 open handles, one active
 transaction with 10 mutation slots and 24576 staged value bytes, a 512-bucket
 memtable index, 36864 bytes of committed record storage, two 12288-byte table
-blocks, and 512 sortable 32-bit record offsets. The v1 configuration ceiling
-is 204799 bytes, strictly below 200 KiB.
+blocks, 512 sortable 32-bit record offsets, and bounded compaction cursors. The
+v1 configuration ceiling is 204799 bytes, strictly below 200 KiB.
 
 Both mutation count and available staged bytes limit a transaction. Ten 8 KiB
 values are not promised to fit in the 100 KiB default because the component
@@ -204,18 +206,23 @@ compaction must not allocate heap memory.
 
 ## Durability and visibility contract
 
-The Phase 4 commit/flush order is:
+The commit/flush order is:
 
 ```text
 validate/stage transaction
-    -> if required, reserve one table slot in a durable manifest
-    -> write, sync, and readback-validate the immutable table
-    -> publish the table and checkpoint in a durable manifest
+    -> if required, write and validate a free active-bank table
+    -> publish the table and checkpoint through the manifest
     -> append WAL mutations and commit record
     -> fsync WAL
     -> publish transaction to committed memtable
     -> return ESP_OK
 ```
+
+When the active table bank is full, foreground compaction merges its tables
+and the committed memtable into the inactive bank. Every output is synced and
+validated before one manifest publication selects the new bank. A second
+manifest publication stabilizes the selection before old table or WAL files
+can be reused.
 
 Only a complete checksummed WAL transaction with a durable commit record is
 replayed. Other handles cannot observe staged data. An acknowledged commit must
@@ -252,7 +259,7 @@ WAL       "KVW9"
 SSTable   "KVT9"
 ```
 
-Phase 4 uses the complete 4096-byte manifest slot and a 56-byte permanent
+The component uses the complete 4096-byte manifest slot and a 56-byte permanent
 file-identity record. All fields are explicitly little-endian and both records
 have a CRC covering the complete authoritative encoding.
 
@@ -270,7 +277,7 @@ offset  size  field
 0x34       4  WAL file count
 0x38       4  SSTable file size
 0x3c       4  SSTable file count
-0x40       8  maximum encoded live bytes
+0x40       8  maximum encoded logical-state bytes
 0x48       8  total provisioned bytes
 0x50       2  logical-limits revision
 0x52       2  reserved, zero
@@ -288,14 +295,17 @@ offset  size  field
 0x88       8  safe checkpoint sequence
 0x90       8  next logical table generation
 0x98       4  active table count
-0x9c       4  monotonic consumed-table-slot mask
+0x9c       4  active table bank: 0 or 1
 0xa0    2944  sixteen fixed table-reference descriptors
 0xc20    988  reserved, zero
 0xffc      4  complete-record CRC-32
 ```
 
 The valid record with the greatest generation is selected, provided all valid
-copies agree on database identity and geometry.
+copies agree on database identity and geometry. Adjacent generations may
+temporarily select different banks or WAL sets only across an interrupted
+copy-on-write publication; recovery validates the selected files and writes a
+stabilizing manifest before reuse.
 
 Every WAL and SSTable reserves its first two 4096-byte slots for permanent
 identity copies:
@@ -334,12 +344,12 @@ record never spans blocks. Data blocks, the index, footer, and headers are
 checksummed; the manifest reference also binds their generation, physical
 slot, key/sequence ranges, counts, and aggregate content checksum.
 
-A flush first publishes a manifest generation that marks the selected physical
-slot consumed. It then writes and syncs data/index/footer/headers, reads the
-complete authoritative table back for validation, and finally publishes a
-second manifest generation that activates the table and advances the safe
-checkpoint. A failed or interrupted attempt leaves the slot consumed, so an
-older manifest copy can never make a formerly attempted table reusable.
+A level-0 flush writes an unreferenced slot in the active bank, syncs and
+readback-validates it, then publishes one manifest generation that activates
+the table and advances the safe checkpoint. A full compaction writes only the
+opposite bank and keeps the newest version of every composite key, including
+the newest tombstone. The old bank remains untouched until the new selection
+exists in both manifest copies.
 
 ## Minimal API flow
 
@@ -370,9 +380,27 @@ mismatch uses `ESP_ERR_INVALID_RESPONSE`, capacity exhaustion uses
 `ESP_ERR_NO_MEM`, and corrupt or unsupported storage uses
 `ESP_ERR_INVALID_CRC` or `ESP_ERR_INVALID_VERSION`.
 
+`get_stats()` returns a lock-consistent, non-secret diagnostic snapshot. It
+includes logical counts and byte use, compaction totals/latency, configured
+logical and provisioned capacity, runtime/scratch memory, active table/WAL
+topology, manifest generation/checkpoint, redundant-copy count, and whether a
+manifest stabilization barrier or latched storage fault remains. Compaction
+totals are saturating per-boot counters; they are not persisted.
+
+If a manifest write or sync fails, the component latches a storage fault because
+it cannot prove whether the new generation became durable. Subsequent normal
+operations return `ESP_ERR_INVALID_STATE`; call `deinit(true)` and then
+`init()` so recovery can select and validate the authoritative generation
+before reuse. `get_stats()` remains available while this fault is latched.
+
+General iterators and `erase_all()` are intentionally deferred. Removing the
+complete fixed file set is an application maintenance operation performed only
+while the database is closed; it is not equivalent to a transactional API
+erase.
+
 ## Tests
 
-Native Phase 1 through Phase 4 tests:
+Native Phase 1 through Phase 5 tests:
 
 ```sh
 cmake -S tests -B /tmp/on9kvdb-tests
@@ -386,8 +414,13 @@ manifest/identity write and sync boundary. Phase 3 tests every interrupted byte
 prefix across single- and multi-frame WAL transactions and every single-byte
 corruption in a complete frame. They verify that recovery can recognize the
 whole transaction or no transaction, never a partial transaction. Phase 4
-adds manifest table-reference/reservation, header/footer, data-entry, sparse
-index, padding, and corruption codec tests.
+adds immutable-table codec and publication tests. Phase 5 verifies the
+hard-capacity geometry and the stabilizing-manifest boundary required before
+table-bank or WAL reuse.
+
+The ESP-IDF Unity component test also compiles the Phase 6 overloaded getter
+signatures and checks the default opaque-handle and diagnostic structures.
+Runtime media and power-cut testing remains Phase 7 work.
 
 ## License
 

@@ -1,14 +1,14 @@
 menu "on9kvdb"
 
     config ON9KVDB_MAX_LIVE_DATA_SIZE
-        int "Maximum encoded live data in bytes"
-        default 2097152
+        int "Maximum encoded logical state in bytes"
+        default 786432
         range 65536 4294967295
         help
-            Maximum encoded size of the newest committed, non-tombstoned
-            namespace/key records. This includes record metadata, namespace,
-            key, type, and value bytes. Existing databases must match this
-            build-time value exactly.
+            Maximum encoded size of the newest committed namespace/key
+            records, including tombstones. This includes record metadata,
+            namespace, key, type, and value bytes. Existing databases must
+            match this build-time value exactly.
 
     config ON9KVDB_PROVISIONED_DATABASE_SIZE
         int "Total provisioned database size in bytes"
@@ -38,11 +38,12 @@ menu "on9kvdb"
     config ON9KVDB_SSTABLE_COUNT
         int "Number of permanent SSTable files"
         default 6
-        range 2 16
+        range 4 16
         help
-            Number of fixed physical SSTable slots. The FATFS mount must
-            allow at least this value plus three on9kvdb file descriptors,
-            in addition to descriptors required by the application.
+            Even number of fixed physical SSTable slots split into two equal
+            compaction banks. The FATFS mount must allow at least this value
+            plus three on9kvdb file descriptors, in addition to descriptors
+            required by the application.
 
     config ON9KVDB_SSTABLE_BLOCK_SIZE
         int "Logical SSTable block size in bytes"

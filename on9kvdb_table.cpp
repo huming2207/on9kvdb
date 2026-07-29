@@ -118,41 +118,6 @@ esp_err_t on9kvdb::write_table_bytes_unsafe(uint32_t slot, uint64_t offset, cons
     return ESP_OK;
 }
 
-esp_err_t on9kvdb::table_slot_available_unsafe(uint32_t slot, bool *available_out) const
-{
-    if (slot >= manifest.geometry.table_count || available_out == nullptr) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    *available_out = false;
-    for (uint32_t copy = 0; copy < on9kvdb_def::table_header_slot_count; copy += 1) {
-        const uint64_t offset =
-            on9kvdb_def::table_header_region_offset + static_cast<uint64_t>(copy) * on9kvdb_def::table_header_slot_size;
-        esp_err_t ret = read_table_bytes_unsafe(slot, offset, io_frame, on9kvdb_def::table_metadata_size);
-        if (ret != ESP_OK) {
-            return ret;
-        }
-        for (size_t idx = 0; idx < on9kvdb_def::table_metadata_size; idx += 1) {
-            if (io_frame[idx] != 0) {
-                return ESP_OK;
-            }
-        }
-    }
-
-    esp_err_t ret = read_table_bytes_unsafe(slot, manifest.geometry.table_size - on9kvdb_def::table_footer_slot_size, io_frame,
-                                            on9kvdb_def::table_metadata_size);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-    for (size_t idx = 0; idx < on9kvdb_def::table_metadata_size; idx += 1) {
-        if (io_frame[idx] != 0) {
-            return ESP_OK;
-        }
-    }
-    *available_out = true;
-    return ESP_OK;
-}
-
 int on9kvdb::compare_memtable_records_unsafe(uint32_t lhs_offset, uint32_t rhs_offset) const
 {
     const auto *lhs = reinterpret_cast<const memtable_record_header *>(memtable_data + lhs_offset);
@@ -256,23 +221,18 @@ esp_err_t on9kvdb::flush_memtable_unsafe()
         return ESP_ERR_INVALID_STATE;
     }
 
-    uint32_t table_slot = manifest.geometry.table_count;
-    for (uint32_t slot = 0; slot < manifest.geometry.table_count; slot += 1) {
-        if ((manifest.consumed_table_mask & (UINT32_C(1) << slot)) != 0) {
-            continue;
-        }
-        bool available = false;
-        const esp_err_t available_ret = table_slot_available_unsafe(slot, &available);
-        if (available_ret != ESP_OK) {
-            return available_ret;
-        }
-        if (available) {
+    const uint32_t bank_size = manifest.geometry.table_count / 2U;
+    const uint32_t bank_start = manifest.active_table_bank * bank_size;
+    const uint32_t bank_end = bank_start + bank_size;
+    uint32_t table_slot = bank_end;
+    for (uint32_t slot = bank_start; slot < bank_end; slot += 1) {
+        if (!manifest.tables[slot].active) {
             table_slot = slot;
             break;
         }
     }
-    if (table_slot == manifest.geometry.table_count) {
-        return ESP_ERR_NO_MEM;
+    if (table_slot == bank_end) {
+        return compact_tables_unsafe();
     }
 
     const size_t sort_bytes = static_cast<size_t>(CONFIG_ON9KVDB_MEMTABLE_ENTRY_COUNT) * sizeof(uint32_t);
@@ -282,16 +242,7 @@ esp_err_t on9kvdb::flush_memtable_unsafe()
     }
 
     const uint64_t table_generation = manifest.next_table_generation;
-    const uint32_t previous_consumed_table_mask = manifest.consumed_table_mask;
-    const uint64_t previous_next_table_generation = manifest.next_table_generation;
-    manifest.consumed_table_mask |= UINT32_C(1) << table_slot;
-    manifest.next_table_generation += 1U;
-    esp_err_t ret = write_manifest_copy(manifest.generation + 1U, on9kvdb_def::manifest_state_ready);
-    if (ret != ESP_OK) {
-        manifest.consumed_table_mask = previous_consumed_table_mask;
-        manifest.next_table_generation = previous_next_table_generation;
-        return ret;
-    }
+    esp_err_t ret = ESP_OK;
 
     auto *offsets = reinterpret_cast<uint32_t *>(future_scratch);
     uint8_t *data_block = future_scratch + sort_bytes;
@@ -473,12 +424,15 @@ esp_err_t on9kvdb::flush_memtable_unsafe()
     }
 
     const uint64_t reservation_checkpoint = manifest.safe_checkpoint_sequence;
+    const uint64_t previous_next_table_generation = manifest.next_table_generation;
     manifest.tables[table_slot] = reference;
     manifest.safe_checkpoint_sequence = metadata.max_sequence;
+    manifest.next_table_generation += 1U;
     ret = write_manifest_copy(manifest.generation + 1U, on9kvdb_def::manifest_state_ready);
     if (ret != ESP_OK) {
         manifest.tables[table_slot] = {};
         manifest.safe_checkpoint_sequence = reservation_checkpoint;
+        manifest.next_table_generation = previous_next_table_generation;
         return ret;
     }
 
@@ -820,6 +774,8 @@ esp_err_t on9kvdb::recover_tables_unsafe()
                     return ret;
                 }
                 if (newest.transaction_sequence == entry.transaction_sequence) {
+                    stats.logical_state_bytes += align_table_entry_size(
+                        on9kvdb_def::table_entry_header_size + entry.namespace_size + entry.key_size + newest.value_size);
                     if (newest.tombstone) {
                         stats.tombstone_count += 1U;
                     } else {

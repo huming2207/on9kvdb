@@ -1,9 +1,23 @@
 #include <cstring>
+#include <type_traits>
 
 #include <sdkconfig.h>
 #include <unity.h>
 
+#include "on9kvdb.hpp"
 #include "on9kvdb_defs.hpp"
+
+using get_u32_handle_signature = esp_err_t (on9kvdb::*)(on9kvdb_handle, const char *, uint32_t *) const;
+using get_u32_transaction_signature = esp_err_t (on9kvdb::*)(on9kvdb_transaction_handle, const char *, uint32_t *) const;
+using get_blob_handle_signature = esp_err_t (on9kvdb::*)(on9kvdb_handle, const char *, void *, size_t *) const;
+using get_blob_transaction_signature = esp_err_t (on9kvdb::*)(on9kvdb_transaction_handle, const char *, void *, size_t *) const;
+
+static_assert(std::is_same_v<decltype(static_cast<get_u32_handle_signature>(&on9kvdb::get_u32)), get_u32_handle_signature>);
+static_assert(
+    std::is_same_v<decltype(static_cast<get_u32_transaction_signature>(&on9kvdb::get_u32)), get_u32_transaction_signature>);
+static_assert(std::is_same_v<decltype(static_cast<get_blob_handle_signature>(&on9kvdb::get_blob)), get_blob_handle_signature>);
+static_assert(
+    std::is_same_v<decltype(static_cast<get_blob_transaction_signature>(&on9kvdb::get_blob)), get_blob_transaction_signature>);
 
 TEST_CASE("on9kvdb Phase 1 validates names", "[on9kvdb]")
 {
@@ -67,4 +81,21 @@ TEST_CASE("on9kvdb Phase 2 manifest persists geometry", "[on9kvdb]")
                       static_cast<int>(on9kvdb_def::decode_manifest_record(encoded, sizeof(encoded), &decoded)));
     TEST_ASSERT_EQUAL_UINT64(geometry.provisioned_size, decoded.geometry.provisioned_size);
     TEST_ASSERT_EQUAL_UINT32(geometry.table_count, decoded.geometry.table_count);
+}
+
+TEST_CASE("on9kvdb Phase 6 public diagnostics have bounded defaults", "[on9kvdb]")
+{
+    const on9kvdb_handle handle = {};
+    const on9kvdb_transaction_handle transaction = {};
+    const on9kvdb_stats stats = {};
+
+    TEST_ASSERT_FALSE(handle.is_valid());
+    TEST_ASSERT_FALSE(transaction.is_valid());
+    TEST_ASSERT_EQUAL_UINT64(0, stats.logical_state_capacity_bytes);
+    TEST_ASSERT_EQUAL_UINT64(0, stats.wal_record_capacity_bytes);
+    TEST_ASSERT_EQUAL_UINT64(0, stats.runtime_memory_bytes);
+    TEST_ASSERT_EQUAL_UINT32(0, stats.active_table_count);
+    TEST_ASSERT_EQUAL_UINT32(0, stats.referenced_wal_count);
+    TEST_ASSERT_FALSE(stats.manifest_stabilization_required);
+    TEST_ASSERT_FALSE(stats.storage_faulted);
 }

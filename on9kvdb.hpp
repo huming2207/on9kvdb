@@ -78,8 +78,28 @@ struct on9kvdb_stats {
     uint64_t tombstone_count = 0;
     uint64_t committed_transaction_count = 0;
     uint64_t logical_value_bytes = 0;
+    uint64_t logical_state_bytes = 0;
     uint64_t wal_bytes_used = 0;
     uint64_t table_bytes_used = 0;
+    uint64_t compaction_count = 0;
+    uint64_t compaction_input_record_bytes = 0;
+    uint64_t compaction_output_record_bytes = 0;
+    uint64_t last_compaction_time_us = 0;
+    uint64_t maximum_compaction_time_us = 0;
+    uint64_t logical_state_capacity_bytes = 0;
+    uint64_t wal_record_capacity_bytes = 0;
+    uint64_t provisioned_database_bytes = 0;
+    uint64_t runtime_memory_bytes = 0;
+    uint64_t runtime_scratch_bytes = 0;
+    uint64_t manifest_generation = 0;
+    uint64_t safe_checkpoint_sequence = 0;
+    uint32_t active_table_count = 0;
+    uint32_t referenced_wal_count = 0;
+    uint32_t valid_manifest_copy_count = 0;
+    uint32_t active_table_bank = 0;
+    uint32_t active_wal_slot = 0;
+    bool manifest_stabilization_required = false;
+    bool storage_faulted = false;
 };
 
 class on9kvdb
@@ -226,7 +246,31 @@ private:
         uint16_t data_block_entry_count = 0;
     };
 
+    struct compaction_cursor {
+        on9kvdb_def::composite_key key = {};
+        uint64_t transaction_sequence = 0;
+        uint32_t source_slot = 0;
+        uint32_t block_index = 0;
+        uint32_t entry_offset = 0;
+        uint32_t block_payload_end = 0;
+        uint32_t total_size = 0;
+        uint32_t value_size = 0;
+        uint16_t entry_index = 0;
+        uint16_t block_entry_count = 0;
+        uint8_t type = 0;
+        uint8_t flags = 0;
+        bool active = false;
+    };
+
+    struct compaction_output {
+        table_build_state build = {};
+        on9kvdb_def::table_metadata metadata = {};
+        uint32_t maximum_data_blocks = 0;
+        bool active = false;
+    };
+
 private:
+    static size_t minimum_future_scratch_size();
     esp_err_t create_locks();
     esp_err_t validate_init_args() const;
     esp_err_t allocate_runtime_memory();
@@ -234,7 +278,9 @@ private:
     esp_err_t finish_initialisation();
     void reset_runtime_state_unsafe();
     void close_storage_unsafe();
+    esp_err_t acquire_operation_lock_internal(bool allow_storage_fault) const;
     esp_err_t acquire_operation_lock() const;
+    esp_err_t acquire_diagnostic_lock() const;
     void release_operation_lock() const;
 
 private: // Handles and transactions
@@ -255,6 +301,7 @@ private: // Manifest and provisioning
     esp_err_t open_existing_manifest();
     esp_err_t load_manifest();
     esp_err_t write_manifest_copy(uint64_t generation, uint16_t state);
+    esp_err_t stabilize_manifest_unsafe();
     esp_err_t provision_all_data_files();
     esp_err_t provision_one_data_file(on9kvdb_def::file_kind kind, uint32_t slot);
     esp_err_t load_file_identity(int file_fd, on9kvdb_def::file_kind kind, uint32_t slot,
@@ -267,7 +314,7 @@ private: // WAL
     esp_err_t load_wal_header(uint32_t slot, uint64_t expected_generation, on9kvdb_def::wal_header *header_out) const;
     esp_err_t recover_wal();
     esp_err_t scan_wal_slot(uint32_t slot, uint64_t generation, uint64_t *expected_sequence);
-    esp_err_t activate_second_wal_unsafe();
+    esp_err_t rotate_wal_unsafe();
     esp_err_t append_transaction_unsafe(transaction_slot *transaction, const handle_slot &handle);
     esp_err_t calculate_transaction_payload_unsafe(const transaction_slot &transaction, const handle_slot &handle,
                                                    uint32_t *payload_size_out, uint32_t *checksum_out) const;
@@ -279,6 +326,15 @@ private: // WAL
 
 private: // Immutable SSTables
     esp_err_t flush_memtable_unsafe();
+    esp_err_t compact_tables_unsafe();
+    esp_err_t load_compaction_cursor_unsafe(compaction_cursor *cursor);
+    esp_err_t advance_compaction_cursor_unsafe(compaction_cursor *cursor);
+    esp_err_t start_compaction_output_unsafe(compaction_output *output, uint32_t slot, uint64_t generation, uint8_t *data_block,
+                                             uint8_t *index_block);
+    esp_err_t append_compaction_entry_unsafe(compaction_output *output, const compaction_cursor *table_cursor,
+                                             const memtable_record_header *memtable_record,
+                                             const namespace_slot *memtable_namespace);
+    esp_err_t finish_compaction_output_unsafe(compaction_output *output, on9kvdb_def::table_reference *reference_out);
     esp_err_t recover_tables_unsafe();
     esp_err_t validate_table_unsafe(const on9kvdb_def::table_reference &reference);
     esp_err_t lookup_tables_unsafe(const char *namespace_name, const char *key, value_view *view_out) const;
@@ -287,7 +343,6 @@ private: // Immutable SSTables
     esp_err_t lookup_committed_unsafe(const char *namespace_name, const char *key, value_view *view_out) const;
     esp_err_t read_table_bytes_unsafe(uint32_t slot, uint64_t offset, uint8_t *destination, size_t size) const;
     esp_err_t write_table_bytes_unsafe(uint32_t slot, uint64_t offset, const uint8_t *source, size_t size);
-    esp_err_t table_slot_available_unsafe(uint32_t slot, bool *available_out) const;
     esp_err_t finish_table_data_block_unsafe(table_build_state *state);
     int compare_memtable_records_unsafe(uint32_t lhs_offset, uint32_t rhs_offset) const;
     void sift_memtable_offsets_unsafe(uint32_t *offsets, uint32_t count, uint32_t root) const;
@@ -342,6 +397,7 @@ private:
     on9kvdb_def::manifest_record manifest = {};
     uint32_t manifest_slot = 0;
     uint32_t manifest_valid_copy_count = 0;
+    bool manifest_stabilization_required = false;
     SemaphoreHandle_t lifecycle_lock = nullptr;
     SemaphoreHandle_t operation_lock = nullptr;
 
@@ -364,6 +420,7 @@ private:
     on9kvdb_stats stats = {};
     bool initialized = false;
     bool shutting_down = false;
+    bool storage_faulted = false;
 
 private:
     static const constexpr char TAG[] = "on9kvdb";

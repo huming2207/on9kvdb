@@ -41,7 +41,7 @@ namespace on9kvdb_def
     static const constexpr uint32_t table_entry_header_size = 24;
     static const constexpr uint32_t table_index_entry_header_size = 16;
 
-    static const constexpr uint16_t storage_revision = 3;
+    static const constexpr uint16_t storage_revision = 4;
     static const constexpr uint16_t geometry_revision = 1;
     static const constexpr uint16_t logical_limits_revision = 2;
     static const constexpr uint16_t wal_header_revision = 1;
@@ -171,7 +171,7 @@ namespace on9kvdb_def
         uint64_t wal_generation[wal_file_count] = {};
         uint64_t safe_checkpoint_sequence = 0;
         uint64_t next_table_generation = 1;
-        uint32_t consumed_table_mask = 0;
+        uint32_t active_table_bank = 0;
         table_reference tables[max_table_count] = {};
     };
 
@@ -313,6 +313,7 @@ namespace on9kvdb_def
     bool validate_storage_geometry(const storage_geometry &geometry);
     bool storage_geometry_equal(const storage_geometry &lhs, const storage_geometry &rhs);
     bool validate_logical_limits(const logical_limits &limits);
+    bool validate_compaction_capacity(const storage_geometry &geometry, const logical_limits &limits);
     bool logical_limits_equal(const logical_limits &lhs, const logical_limits &rhs);
     bool encode_manifest_record(uint8_t *buf, size_t buf_len, const manifest_record &record);
     format_status decode_manifest_record(const uint8_t *buf, size_t buf_len, manifest_record *record_out);

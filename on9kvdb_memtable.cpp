@@ -251,6 +251,8 @@ esp_err_t on9kvdb::preflight_memtable_transaction_unsafe(transaction_slot &trans
 
     uint32_t final_bytes = memtable_data_used;
     uint32_t final_entries = memtable_entry_count;
+    uint64_t final_logical_state_bytes = stats.logical_state_bytes;
+    const uint32_t namespace_size = static_cast<uint32_t>(strlen(namespace_name));
     for (uint16_t idx = 0; idx < transaction_state.mutation_count; idx += 1) {
         mutation_slot &mutation = transaction_state.mutations[idx];
         mutation.previous_state = previous_state_none;
@@ -265,9 +267,8 @@ esp_err_t on9kvdb::preflight_memtable_transaction_unsafe(transaction_slot &trans
             final_bytes -= memtable_index[bucket_index].record_size;
             const auto *old_header =
                 reinterpret_cast<const memtable_record_header *>(memtable_data + memtable_index[bucket_index].record_offset);
-            mutation.previous_state = (old_header->flags & on9kvdb_def::memtable_flag_tombstone) != 0
-                                          ? previous_state_tombstone
-                                          : previous_state_live;
+            mutation.previous_state =
+                (old_header->flags & on9kvdb_def::memtable_flag_tombstone) != 0 ? previous_state_tombstone : previous_state_live;
             mutation.previous_value_size = old_header->value_size;
         } else {
             value_view old_table_value = {};
@@ -282,12 +283,26 @@ esp_err_t on9kvdb::preflight_memtable_transaction_unsafe(transaction_slot &trans
         }
 
         const uint32_t value_size = mutation.kind == on9kvdb_def::mutation_kind_set ? mutation.value_size : 0;
+        if (mutation.previous_state != previous_state_none) {
+            const uint32_t previous_size = align_record_size(static_cast<uint32_t>(sizeof(memtable_record_header)) +
+                                                             namespace_size + mutation.key_size + mutation.previous_value_size);
+            if (previous_size > final_logical_state_bytes) {
+                return ESP_ERR_INVALID_STATE;
+            }
+            final_logical_state_bytes -= previous_size;
+        }
         const uint32_t record_size =
             align_record_size(static_cast<uint32_t>(sizeof(memtable_record_header)) + mutation.key_size + value_size);
+        const uint32_t logical_record_size = align_record_size(static_cast<uint32_t>(sizeof(memtable_record_header)) +
+                                                               namespace_size + mutation.key_size + value_size);
         if (record_size > CONFIG_ON9KVDB_MEMTABLE_DATA_SIZE - final_bytes) {
             return ESP_ERR_NO_MEM;
         }
         final_bytes += record_size;
+        final_logical_state_bytes += logical_record_size;
+        if (final_logical_state_bytes > manifest.geometry.max_live_bytes) {
+            return ESP_ERR_NO_MEM;
+        }
     }
 
     if (final_entries > CONFIG_ON9KVDB_MEMTABLE_ENTRY_COUNT) {
@@ -314,6 +329,10 @@ esp_err_t on9kvdb::apply_transaction_to_memtable_unsafe(const transaction_slot &
             const memtable_bucket &old_bucket = memtable_index[bucket_index];
             const auto *old_header = reinterpret_cast<const memtable_record_header *>(memtable_data + old_bucket.record_offset);
             const bool old_tombstone = (old_header->flags & on9kvdb_def::memtable_flag_tombstone) != 0;
+            const uint32_t old_logical_size = align_record_size(static_cast<uint32_t>(sizeof(memtable_record_header)) +
+                                                                namespaces[old_header->namespace_slot_index].name_size +
+                                                                old_header->key_size + old_header->value_size);
+            stats.logical_state_bytes -= old_logical_size;
             if (old_tombstone) {
                 stats.tombstone_count -= 1;
             } else {
@@ -322,11 +341,16 @@ esp_err_t on9kvdb::apply_transaction_to_memtable_unsafe(const transaction_slot &
             }
             remove_memtable_record_unsafe(bucket_index);
         } else {
+            const uint32_t previous_logical_size =
+                align_record_size(static_cast<uint32_t>(sizeof(memtable_record_header)) +
+                                  namespaces[namespace_slot_index].name_size + mutation.key_size + mutation.previous_value_size);
             if (mutation.previous_state == previous_state_tombstone) {
                 stats.tombstone_count -= 1;
+                stats.logical_state_bytes -= previous_logical_size;
             } else if (mutation.previous_state == previous_state_live) {
                 stats.live_key_count -= 1;
                 stats.logical_value_bytes -= mutation.previous_value_size;
+                stats.logical_state_bytes -= previous_logical_size;
             } else if (mutation.previous_state != previous_state_none) {
                 return ESP_ERR_INVALID_STATE;
             }
@@ -362,6 +386,9 @@ esp_err_t on9kvdb::apply_transaction_to_memtable_unsafe(const transaction_slot &
         bucket.record_offset = memtable_data_used;
         bucket.record_size = record_size;
         memtable_data_used += record_size;
+        stats.logical_state_bytes +=
+            align_record_size(static_cast<uint32_t>(sizeof(memtable_record_header)) + namespaces[namespace_slot_index].name_size +
+                              mutation.key_size + value_size);
         if (tombstone) {
             stats.tombstone_count += 1;
         } else {

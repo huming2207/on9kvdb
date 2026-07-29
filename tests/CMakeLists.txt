@@ -71,3 +71,20 @@ target_compile_options(on9kvdb_phase4_tests PRIVATE
 )
 
 add_test(NAME on9kvdb_phase4 COMMAND on9kvdb_phase4_tests)
+
+add_executable(on9kvdb_phase5_tests
+        "on9kvdb_phase5_tests.cpp"
+        "../on9kvdb_format.cpp"
+)
+
+target_include_directories(on9kvdb_phase5_tests PRIVATE "..")
+target_compile_features(on9kvdb_phase5_tests PRIVATE cxx_std_17)
+target_compile_options(on9kvdb_phase5_tests PRIVATE
+        "-Wall"
+        "-Wextra"
+        "-Werror"
+        "-fno-exceptions"
+        "-fno-rtti"
+)
+
+add_test(NAME on9kvdb_phase5 COMMAND on9kvdb_phase5_tests)

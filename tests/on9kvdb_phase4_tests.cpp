@@ -40,7 +40,7 @@ namespace
     {
         on9kvdb_def::storage_geometry geometry = {};
         geometry.provisioned_size = 4U * 1024U * 1024U;
-        geometry.max_live_bytes = 2U * 1024U * 1024U;
+        geometry.max_live_bytes = 768U * 1024U;
         geometry.manifest_size = on9kvdb_def::manifest_file_size;
         geometry.wal_size = 256U * 1024U;
         geometry.wal_count = on9kvdb_def::wal_file_count;
@@ -85,9 +85,8 @@ namespace
         return metadata;
     }
 
-    bool select_manifest(
-        const uint8_t slots[on9kvdb_def::manifest_slot_count][on9kvdb_def::manifest_record_size],
-        on9kvdb_def::manifest_record *selected_out)
+    bool select_manifest(const uint8_t slots[on9kvdb_def::manifest_slot_count][on9kvdb_def::manifest_record_size],
+                         on9kvdb_def::manifest_record *selected_out)
     {
         bool found = false;
         on9kvdb_def::manifest_record selected = {};
@@ -141,7 +140,6 @@ namespace
         on9kvdb_def::manifest_record manifest = make_ready_manifest(9);
         manifest.safe_checkpoint_sequence = 11;
         manifest.next_table_generation = 4;
-        manifest.consumed_table_mask = UINT32_C(1) << 2;
 
         const on9kvdb_def::table_metadata metadata = make_metadata();
         attach_table_reference(&manifest, metadata);
@@ -158,65 +156,61 @@ namespace
         EXPECT_EQ(on9kvdb_def::format_status::corrupt, on9kvdb_def::decode_manifest_record(encoded, sizeof(encoded), &decoded));
     }
 
-    void test_manifest_slot_reservation()
+    void test_manifest_bank_validation()
     {
         on9kvdb_def::manifest_record manifest = make_ready_manifest(4);
-        manifest.next_table_generation = 2;
-        manifest.consumed_table_mask = 1;
+        manifest.safe_checkpoint_sequence = 11;
+        manifest.next_table_generation = 4;
+        attach_table_reference(&manifest, make_metadata());
 
         uint8_t encoded[on9kvdb_def::manifest_record_size] = {};
         EXPECT_TRUE(on9kvdb_def::encode_manifest_record(encoded, sizeof(encoded), manifest));
         on9kvdb_def::manifest_record decoded = {};
         EXPECT_EQ(on9kvdb_def::format_status::ok, on9kvdb_def::decode_manifest_record(encoded, sizeof(encoded), &decoded));
-        EXPECT_EQ(UINT32_C(1), decoded.consumed_table_mask);
-        EXPECT_TRUE(!decoded.tables[0].active);
+        EXPECT_EQ(UINT32_C(0), decoded.active_table_bank);
 
-        manifest.consumed_table_mask = UINT32_C(1) << manifest.geometry.table_count;
+        manifest.active_table_bank = 1;
         EXPECT_TRUE(!on9kvdb_def::encode_manifest_record(encoded, sizeof(encoded), manifest));
     }
 
     void test_interrupted_table_publication()
     {
-        const on9kvdb_def::table_metadata metadata = make_metadata();
         on9kvdb_def::manifest_record base = make_ready_manifest(3);
-        on9kvdb_def::manifest_record reservation = base;
-        reservation.generation = 4;
-        reservation.next_table_generation = 4;
-        reservation.consumed_table_mask = UINT32_C(1) << metadata.slot;
-        on9kvdb_def::manifest_record published = reservation;
-        published.generation = 5;
+        on9kvdb_def::table_metadata metadata = make_metadata();
+        metadata.slot = 3;
+        metadata.generation = 1;
+        on9kvdb_def::manifest_record published = base;
+        published.generation = 4;
+        published.active_table_bank = 1;
+        published.next_table_generation = 2;
         published.safe_checkpoint_sequence = metadata.max_sequence;
         attach_table_reference(&published, metadata);
+        on9kvdb_def::manifest_record stabilized = published;
+        stabilized.generation = 5;
 
         uint8_t base_encoded[on9kvdb_def::manifest_record_size] = {};
-        uint8_t reservation_encoded[on9kvdb_def::manifest_record_size] = {};
         uint8_t published_encoded[on9kvdb_def::manifest_record_size] = {};
+        uint8_t stabilized_encoded[on9kvdb_def::manifest_record_size] = {};
         EXPECT_TRUE(on9kvdb_def::encode_manifest_record(base_encoded, sizeof(base_encoded), base));
-        EXPECT_TRUE(on9kvdb_def::encode_manifest_record(reservation_encoded, sizeof(reservation_encoded), reservation));
         EXPECT_TRUE(on9kvdb_def::encode_manifest_record(published_encoded, sizeof(published_encoded), published));
+        EXPECT_TRUE(on9kvdb_def::encode_manifest_record(stabilized_encoded, sizeof(stabilized_encoded), stabilized));
 
-        for (uint32_t stop_after = 0; stop_after < 5; stop_after += 1) {
+        for (uint32_t stop_after = 0; stop_after < 3; stop_after += 1) {
             uint8_t durable[on9kvdb_def::manifest_slot_count][on9kvdb_def::manifest_record_size] = {};
             memcpy(durable[0], base_encoded, sizeof(base_encoded));
-            bool table_durable = false;
 
             if (stop_after >= 1) {
-                memcpy(durable[1], reservation_encoded, sizeof(reservation_encoded));
+                memcpy(durable[1], published_encoded, sizeof(published_encoded));
             }
             if (stop_after >= 2) {
-                table_durable = true;
-            }
-            if (stop_after >= 4) {
-                memcpy(durable[0], published_encoded, sizeof(published_encoded));
+                memcpy(durable[0], stabilized_encoded, sizeof(stabilized_encoded));
             }
 
             on9kvdb_def::manifest_record selected = {};
             EXPECT_TRUE(select_manifest(durable, &selected));
             if (selected.tables[metadata.slot].active) {
-                EXPECT_TRUE(table_durable);
-                EXPECT_EQ(published.generation, selected.generation);
-            } else if (selected.generation == reservation.generation) {
-                EXPECT_TRUE((selected.consumed_table_mask & (UINT32_C(1) << metadata.slot)) != 0);
+                EXPECT_EQ(UINT32_C(1), selected.active_table_bank);
+                EXPECT_TRUE(selected.generation == published.generation || selected.generation == stabilized.generation);
             } else {
                 EXPECT_EQ(base.generation, selected.generation);
             }
@@ -307,7 +301,7 @@ namespace
 int main()
 {
     test_manifest_table_reference();
-    test_manifest_slot_reservation();
+    test_manifest_bank_validation();
     test_interrupted_table_publication();
     test_table_metadata();
     test_data_and_index_blocks();

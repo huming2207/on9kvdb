@@ -31,8 +31,9 @@ static_assert(CONFIG_ON9KVDB_WAL_FILE_SIZE > on9kvdb_def::wal_record_region_offs
 static_assert(CONFIG_ON9KVDB_SSTABLE_FILE_SIZE > on9kvdb_def::identity_region_size);
 static_assert(CONFIG_ON9KVDB_WAL_FILE_SIZE % on9kvdb_def::format_alignment == 0);
 static_assert(CONFIG_ON9KVDB_SSTABLE_FILE_SIZE % on9kvdb_def::format_alignment == 0);
-static_assert(CONFIG_ON9KVDB_SSTABLE_COUNT >= 2);
+static_assert(CONFIG_ON9KVDB_SSTABLE_COUNT >= 4);
 static_assert(CONFIG_ON9KVDB_SSTABLE_COUNT <= on9kvdb_def::max_table_count);
+static_assert((CONFIG_ON9KVDB_SSTABLE_COUNT & 1U) == 0);
 static_assert(CONFIG_ON9KVDB_SSTABLE_BLOCK_SIZE % on9kvdb_def::format_alignment == 0);
 static_assert(CONFIG_ON9KVDB_SSTABLE_FILE_SIZE >
               on9kvdb_def::table_data_region_offset + CONFIG_ON9KVDB_SSTABLE_BLOCK_SIZE + on9kvdb_def::table_footer_slot_size);
@@ -41,8 +42,12 @@ static_assert((CONFIG_ON9KVDB_SSTABLE_FILE_SIZE - on9kvdb_def::table_data_region
                   CONFIG_ON9KVDB_SSTABLE_BLOCK_SIZE ==
               0);
 static_assert(static_cast<uint64_t>(CONFIG_ON9KVDB_MAX_LIVE_DATA_SIZE) <=
-              static_cast<uint64_t>(CONFIG_ON9KVDB_SSTABLE_COUNT) *
-                  (CONFIG_ON9KVDB_SSTABLE_FILE_SIZE - on9kvdb_def::identity_region_size));
+              (static_cast<uint64_t>(CONFIG_ON9KVDB_SSTABLE_COUNT / 2U) *
+               ((CONFIG_ON9KVDB_SSTABLE_FILE_SIZE - on9kvdb_def::table_data_region_offset - CONFIG_ON9KVDB_SSTABLE_BLOCK_SIZE -
+                 on9kvdb_def::table_footer_slot_size) /
+                CONFIG_ON9KVDB_SSTABLE_BLOCK_SIZE) /
+               2U) *
+                  (CONFIG_ON9KVDB_SSTABLE_BLOCK_SIZE - on9kvdb_def::table_block_header_size));
 static_assert(static_cast<uint64_t>(on9kvdb_def::manifest_file_size) +
                   static_cast<uint64_t>(on9kvdb_def::wal_file_count) * CONFIG_ON9KVDB_WAL_FILE_SIZE +
                   static_cast<uint64_t>(CONFIG_ON9KVDB_SSTABLE_COUNT) * CONFIG_ON9KVDB_SSTABLE_FILE_SIZE ==
@@ -140,6 +145,13 @@ on9kvdb_def::logical_limits on9kvdb::get_build_limits()
     return limits;
 }
 
+size_t on9kvdb::minimum_future_scratch_size()
+{
+    const size_t compaction_bytes = table_sort_bytes + 2U * CONFIG_ON9KVDB_SSTABLE_BLOCK_SIZE +
+                                    (CONFIG_ON9KVDB_SSTABLE_COUNT / 2U) * sizeof(compaction_cursor);
+    return compaction_bytes > manifest_scratch_bytes ? compaction_bytes : manifest_scratch_bytes;
+}
+
 esp_err_t on9kvdb::create_locks()
 {
     if (lifecycle_lock == nullptr) {
@@ -169,7 +181,7 @@ esp_err_t on9kvdb::validate_init_args() const
 
     const on9kvdb_def::storage_geometry geometry = get_build_geometry();
     const on9kvdb_def::logical_limits limits = get_build_limits();
-    if (!on9kvdb_def::validate_storage_geometry(geometry) || !on9kvdb_def::validate_logical_limits(limits) ||
+    if (!on9kvdb_def::validate_compaction_capacity(geometry, limits) ||
         geometry.manifest_size > static_cast<uint64_t>(std::numeric_limits<off_t>::max()) ||
         geometry.wal_size > static_cast<uint64_t>(std::numeric_limits<off_t>::max()) ||
         geometry.table_size > static_cast<uint64_t>(std::numeric_limits<off_t>::max())) {
@@ -246,7 +258,7 @@ esp_err_t on9kvdb::allocate_runtime_memory()
     all_carved =
         all_carved && carve_arena(&cursor, &remaining, alignof(uint64_t), CONFIG_ON9KVDB_MEMTABLE_DATA_SIZE, &allocation);
     memtable_data = static_cast<uint8_t *>(allocation);
-    if (!all_carved || remaining < minimum_future_scratch_bytes) {
+    if (!all_carved || remaining < minimum_future_scratch_size()) {
         reset_runtime_state_unsafe();
         return ESP_ERR_INVALID_SIZE;
     }
@@ -336,7 +348,7 @@ esp_err_t on9kvdb::init()
     return ret;
 }
 
-esp_err_t on9kvdb::acquire_operation_lock() const
+esp_err_t on9kvdb::acquire_operation_lock_internal(bool allow_storage_fault) const
 {
     if (lifecycle_lock == nullptr || xSemaphoreTake(lifecycle_lock, portMAX_DELAY) != pdTRUE) {
         return ESP_ERR_TIMEOUT;
@@ -349,9 +361,24 @@ esp_err_t on9kvdb::acquire_operation_lock() const
         xSemaphoreGive(lifecycle_lock);
         return ESP_ERR_TIMEOUT;
     }
+    if (storage_faulted && !allow_storage_fault) {
+        xSemaphoreGive(operation_lock);
+        xSemaphoreGive(lifecycle_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
 
     xSemaphoreGive(lifecycle_lock);
     return ESP_OK;
+}
+
+esp_err_t on9kvdb::acquire_operation_lock() const
+{
+    return acquire_operation_lock_internal(false);
+}
+
+esp_err_t on9kvdb::acquire_diagnostic_lock() const
+{
+    return acquire_operation_lock_internal(true);
 }
 
 void on9kvdb::release_operation_lock() const
@@ -384,6 +411,7 @@ void on9kvdb::reset_runtime_state_unsafe()
     memtable_entry_count = 0;
     next_transaction_sequence = 1;
     stats = {};
+    storage_faulted = false;
     for (uint32_t slot = 0; slot < on9kvdb_def::wal_file_count; slot += 1) {
         wal_tail[slot] = 0;
     }
@@ -401,6 +429,7 @@ void on9kvdb::close_storage_unsafe()
     manifest = {};
     manifest_slot = 0;
     manifest_valid_copy_count = 0;
+    manifest_stabilization_required = false;
     manifest_path[0] = '\0';
     reset_runtime_state_unsafe();
 }

@@ -2,6 +2,7 @@ idf_component_register(
         SRCS
             "on9kvdb.cpp"
             "on9kvdb_api.cpp"
+            "on9kvdb_compaction.cpp"
             "on9kvdb_format.cpp"
             "on9kvdb_io.cpp"
             "on9kvdb_manifest.cpp"
@@ -15,6 +16,7 @@ idf_component_register(
         REQUIRES
             "esp_common"
             "esp_system"
+            "esp_timer"
             "fatfs"
             "freertos"
             "heap"

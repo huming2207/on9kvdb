@@ -2,18 +2,21 @@
 
 ## Status and scope
 
-This file is the design and implementation plan for `on9kvdb`. No storage
-format or public API described as **proposed** below is approved merely by
-appearing in this plan.
+This file is the design, implementation, and qualification plan for `on9kvdb`.
+Sections explicitly marked approved are authoritative. Any future proposal or
+open decision still requires user approval before implementation.
 
-Phase 1 through Phase 4 are implemented. Phase 4 adds immutable level-0
-SSTables and durable WAL checkpoints, but remains deliberately capacity
-limited because table and WAL reuse require the Phase 5 compaction policy.
+Phase 1 through Phase 6 are implemented. Phase 5 adds bounded foreground
+full-compaction, redundant-manifest stabilization, and safe table/WAL reuse.
+Phase 6 freezes the approved NVS-familiar API and bounded diagnostic snapshot.
+Phase 7 is not complete: hardware media, journal integration, physical
+power-cut behavior, and performance/endurance measurements remain release
+qualification work.
 
-The intended component is a fixed-capacity, namespaced key-value database for
-ESP32-class devices. It should expose an API similar to ESP-IDF NVS while using
-an LSM tree over files on an already-mounted, filesystem-journaled FATFS
-volume. The volume may be on an SD card or NOR flash.
+The component is a fixed-capacity, namespaced key-value database for ESP32-class
+devices. It exposes an API similar to ESP-IDF NVS while using an LSM tree over
+files on an already-mounted, filesystem-journaled FATFS volume. The volume may
+be on an SD card or NOR flash.
 
 The working platform assumption is that a suitable filesystem journaling layer
 can be provided. Upstream `esp_jrnl` may be used for SPI NOR. Porting
@@ -245,7 +248,7 @@ If power fails after the WAL sync but before RAM publication, recovery replays
 the committed transaction. If power fails before the complete commit record
 and durability barrier, recovery ignores it.
 
-**Proposed v1:** use no separate data-block read cache. Use:
+The implemented v1 uses no separate data-block read cache. It uses:
 
 - a fixed transaction-staging arena;
 - one fixed mutable memtable arena;
@@ -254,10 +257,9 @@ and durability barrier, recovery ignores it.
 - a fixed array of sortable entry references/offsets for SSTable flush; and
 - bounded table descriptors and on-disk sparse indexes.
 
-Foreground synchronous flush/compaction is simpler and easier to prove than a
-background worker. Begin with it unless latency requirements show it is
-unacceptable. A second immutable memtable and background work add concurrency,
-memory, shutdown, and recovery states and require explicit approval.
+Foreground synchronous flush/compaction is the approved v1 policy. A second
+immutable memtable or background worker would add concurrency, memory,
+shutdown, and recovery states and requires explicit approval.
 
 ## V1 physical layout
 
@@ -275,14 +277,14 @@ and the two identity slots at the beginning of every WAL/SSTable file:
 └── table_<N-1>.db
 ```
 
-Every file is permanent, contiguous, and fixed-size. WAL record layout and
-SSTable block/index/footer layout remain later-phase designs.
+Every file is permanent, contiguous, and fixed-size. Storage revision 4 freezes
+the WAL framing, SSTable block/index/footer layout, equal table banks, and
+manifest publication fields documented below and in `README.md`.
 
 ### Manifest
 
-`manifest.db` should contain at least two independently checksummed,
-sector-aligned manifest slots. A manifest generation is the sole publication
-point for:
+`manifest.db` contains two independently checksummed, sector-aligned manifest
+slots. A manifest generation is the sole publication point for:
 
 - storage format version and feature flags;
 - database identity;
@@ -291,13 +293,12 @@ point for:
   ranges;
 - active WAL slot/generation and safe replay/checkpoint sequence;
 - next logical transaction/table generation;
-- provisioning/ready state; and
-- bounded health/recovery counters if they are persisted.
+- provisioning/ready state.
 
-Write the inactive manifest slot, `fsync()` it, optionally read it back, and
-only then treat its generation as current. Recovery selects the highest valid
-generation that is internally consistent with referenced files. Do not mutate
-a published manifest slot in place.
+Write and sync the alternating manifest slot before treating its generation as
+current. Recovery selects the highest valid generation that is internally
+consistent with referenced files. Do not mutate a published manifest slot in
+place. Runtime health and compaction counters are deliberately not persisted.
 
 ### WAL slots
 
@@ -337,23 +338,24 @@ transaction. The final frame carries the commit flag, and every frame binds
 the database identity, WAL generation, transaction sequence, frame index/count,
 payload bounds, transaction checksum, and frame checksum.
 
-Phase 3 appends to WAL slot 0, then publishes WAL slot 1 through the manifest
-when the next transaction no longer fits slot 0. Phase 4 checkpoints the
-memtable before that transition but does not recycle either slot. When both
-slots are full it returns `ESP_ERR_NO_MEM`. Recycling remains Phase 5 work.
+The current engine alternates between two logical WAL generations. Before
+overwriting a previously used slot, full compaction checkpoints its reachable
+transactions and both manifest copies are stabilized with that slot
+unreferenced.
 
 ### SSTable slots
 
-An SSTable is immutable after it is published by the manifest. It should
-contain:
+An SSTable is immutable after it is published by the manifest. It contains:
 
-- redundant or separately verifiable header/footer metadata;
+- redundant headers and separately verifiable footer metadata;
 - sorted composite internal keys;
 - type, transaction sequence, tombstone state, and value bytes;
-- per-entry or per-block integrity checks;
+- checksummed data blocks, sparse index, headers, and footer;
 - a bounded sparse index;
-- optional Bloom-filter data only if measurements justify it; and
 - a checksum covering all authoritative table metadata.
+
+V1 has no Bloom filter or compression. Either feature requires measurement and
+explicit approval.
 
 Compaction must be copy-on-write:
 
@@ -362,90 +364,52 @@ Compaction must be copy-on-write:
 3. Sync and validate every output.
 4. Publish one new manifest generation selecting the outputs and no longer
    selecting the inputs.
-5. Reuse old input slots only after that manifest is durable.
+5. Stabilize both manifest copies on the new selection.
+6. Reuse old input slots only after neither valid manifest references them.
 
 Reserve enough unselected table capacity to complete worst-case compaction.
-Returning `NOT_ENOUGH_SPACE` is preferable to overwriting a live table.
+Returning `ESP_ERR_NO_MEM` is preferable to overwriting a live table.
 
-The level count, size ratio, compaction policy, output-reserve policy, and
-tombstone drop rules remain open until the later-phase implementation and
-measurements are reviewed.
+## Implemented logical model
 
-## Proposed logical model
-
-The internal ordering key should be conceptually:
+The logical identity and ordering key is:
 
 ```text
-(namespace bytes, key bytes, transaction sequence descending)
+(namespace bytes, key bytes)
 ```
 
-The exact byte encoding must be explicitly specified and must not depend on C++
-object layout, locale, pointer size, or structure padding.
+Each memtable or SSTable source contains at most one version of that composite
+key. When multiple published sources contain it, the greatest committed
+transaction sequence wins. Persistent encoding is explicitly little-endian and
+does not depend on C++ object layout, locale, pointer size, or structure
+padding.
 
-Lookup order should be:
+Lookup considers:
 
-1. the calling handle's uncommitted staged overlay, if read-your-writes is
-   approved;
+1. the calling transaction's staged overlay for transaction getter overloads;
 2. the committed mutable memtable;
-3. any immutable memtable, if later introduced;
-4. live SSTables in an order proven by manifest level/generation invariants.
+3. every manifest-selected immutable SSTable whose key range may match.
 
-The first matching newest sequence decides the result. A tombstone means not
-found.
+The greatest matching committed sequence decides the result. A tombstone means
+not found.
 
-## Proposed public API surface
+## Approved public API surface
 
 Keep the lifetime of the database instance explicit because storage is a FATFS
 path rather than an NVS partition.
 
-Candidate shape:
+The v1 API is a C++ instance API with opaque generation-checked namespace and
+transaction handles. It provides:
 
-```c++
-struct on9kvdb_cfg;
-using on9kvdb_handle_t = uint32_t;
-
-class on9kvdb
-{
-public:
-    explicit on9kvdb(const char *file_path, const on9kvdb_cfg *config);
-    ~on9kvdb();
-
-    esp_err_t init();
-    esp_err_t open(const char *namespace_name, on9kvdb_open_mode mode,
-                   on9kvdb_handle_t *handle_out);
-    void close(on9kvdb_handle_t handle);
-
-    esp_err_t set_i8(...);
-    esp_err_t set_u8(...);
-    esp_err_t set_i16(...);
-    esp_err_t set_u16(...);
-    esp_err_t set_i32(...);
-    esp_err_t set_u32(...);
-    esp_err_t set_i64(...);
-    esp_err_t set_u64(...);
-    esp_err_t set_str(...);
-    esp_err_t set_blob(...);
-
-    esp_err_t get_i8(...) const;
-    esp_err_t get_u8(...) const;
-    esp_err_t get_i16(...) const;
-    esp_err_t get_u16(...) const;
-    esp_err_t get_i32(...) const;
-    esp_err_t get_u32(...) const;
-    esp_err_t get_i64(...) const;
-    esp_err_t get_u64(...) const;
-    esp_err_t get_str(...) const;
-    esp_err_t get_blob(...) const;
-
-    esp_err_t erase_key(...);
-    esp_err_t erase_all(...);
-    esp_err_t commit(on9kvdb_handle_t handle);
-    esp_err_t deinit(bool force = false);
-};
-```
-
-This is illustrative; freeze exact declarations only after deciding whether the
-primary API is the C++ instance API above, a C opaque-store API, or both.
+- explicit `init()` and `deinit()`;
+- namespace `open()` and `close()`;
+- one explicit atomic transaction at a time with `begin()`, `commit()`,
+  transaction `close()`, and `abort()`;
+- signed and unsigned 8-, 16-, 32-, and 64-bit setters/getters;
+- string and blob setters/getters, including length queries;
+- `erase_key()` and `find_key()`; and
+- `get_stats()` for bounded counters, capacities, topology, and manifest
+  recovery state.
 
 Required NVS-familiar behavior:
 
@@ -454,19 +418,16 @@ Required NVS-familiar behavior:
 - setters are typed and type mismatch is reported;
 - `get_str()` and `get_blob()` support a null output buffer length query;
 - too-small output reports required length without overflow;
-- `erase_key()`, `erase_all()`, `commit()`, and `close()` have documented
-  uncommitted-change behavior;
+- `erase_key()`, `commit()`, transaction `close()`, `abort()`, and handle
+  `close()` have documented uncommitted-change behavior;
 - closing a handle does not silently convert an unsuccessful commit into
   success;
 - handles have fixed capacity and stale handles cannot alias newly opened ones
   without a generation check.
 
-**Proposed extension:** make one `commit()` atomic across all staged mutations
-on that handle. This is stronger and more useful than merely persisting each
-setter independently, but it must be explicitly approved and documented.
-
-Stats, iterators, `find_key()`, namespace enumeration, secure purge, encryption,
-and a C wrapper are later phases unless selected as v1 requirements.
+One `commit()` is atomic across every staged mutation. General iterators,
+`erase_all()`, namespace enumeration, secure purge, encryption, and a C wrapper
+are deferred.
 
 Do not reuse `ESP_ERR_NVS_*` values for a different engine and do not define
 new component errors. V1 maps outcomes to existing values:
@@ -511,7 +472,8 @@ erase them automatically.
 2. Read both/all manifest slots and select a valid consistent generation.
 3. Validate every referenced table header/footer, generation, bounds, ordering,
    and integrity metadata.
-4. Recover the active WAL generation up to the last valid record.
+4. Recover referenced WAL generations in logical-generation order up to each
+   last valid record.
 5. Replay only complete committed transactions newer than the manifest's safe
    checkpoint sequence.
 6. Rebuild bounded RAM indexes without allocating after the init allocation
@@ -527,34 +489,24 @@ about both.
 
 ## Concurrency and visibility
 
-**Proposed v1:**
+The implemented v1 uses one lifecycle mutex and one serialized operation mutex.
+There is one active writer transaction globally and no background compaction.
+Lock ordering is lifecycle then operation; no application callback or unrelated
+network I/O runs under either lock.
 
-- one lifecycle mutex;
-- one serialized writer/transaction mutex;
-- one reader mutex only where shared descriptors or scratch buffers require it;
-- no background compaction;
-- no lock held while application callbacks or unrelated network I/O run.
-
-Document lock ordering and never invert it. Public getters must not return
-pointers into mutable internal arenas. Copy values into caller-owned buffers.
-
-The visibility point is not allowed to precede the successful WAL durability
-barrier. Decide before coding whether uncommitted staged writes are visible:
-
-- only to the same handle;
-- to all handles in the same namespace; or
-- to no getters until commit.
-
-Do not assume NVS behavior here; specify and test the selected rule.
+Public getters copy into caller-owned buffers. A transaction reads its own
+staged overlay. Every other handle, including another handle for the same
+namespace, sees only committed state. Committed visibility never precedes the
+successful WAL durability barrier.
 
 ## Implementation phases
 
-Each phase ends with tests and a review before the next on-disk dependency is
-added.
+Phases 0 through 6 are complete. Phase 7 is pending. The phase descriptions
+remain as the required implementation and review record.
 
 ### Phase 0: freeze requirements and budgets
 
-- Resolve all open decisions listed below.
+- Resolve the workload, durability, API, and capacity decisions recorded below.
 - Capture expected key count, namespace count, value distribution, maximum
   transaction, update rate, retention expectations, medium, and service life.
 - Record RAM, boot-time, commit-latency, and storage-capacity budgets.
@@ -619,11 +571,12 @@ not call it complete until WAL recycling is protected by SSTables.
 
 ### Phase 6: complete NVS-familiar API
 
-- Complete all approved integer, string, blob, erase, stats, and iterator APIs.
+- Complete all approved integer, string, blob, erase, find, and stats APIs.
 - Validate mode, handle, name, type, length, and namespace behavior against the
   written contract.
-- Add optional C wrapper only if approved.
 - Add health/status reporting with bounded counters and no secret data.
+- Keep iterators, `erase_all()`, namespace enumeration, encryption, and the C
+  wrapper deferred.
 
 ### Phase 7: hardware and power-cut qualification
 
@@ -638,6 +591,23 @@ not call it complete until WAL recycling is protected by SSTables.
 - Record mount/recovery time, commit latency distribution, compaction stalls,
   stack use, steady-state heap delta, and write amplification.
 
+## Current verification status
+
+Completed on 2026-07-29:
+
+- The ESP32-S3 demo firmware builds with the current component and revision-4
+  format.
+- Native Phase 1 through Phase 5 format, fault-model, capacity, and publication
+  tests pass.
+- A separate ESP-IDF Unity compile application validates the Phase 6 public
+  overloads and diagnostic structure.
+- `git diff --check`, the 130-column audit, and the no-lambda audit pass.
+
+These checks do not replace Phase 7. The complete database has not yet been
+qualified on mounted NOR/SD FATFS with the intended journal, physical reset
+injection, endurance media, watchdog policy, or measured latency/write
+amplification.
+
 ## Verification requirements
 
 ### Deterministic tests
@@ -646,9 +616,9 @@ not call it complete until WAL recycling is protected by SSTables.
 - maximum and over-limit namespace, key, value, and transaction sizes;
 - type mismatch and WinAPI-style string/blob length queries;
 - read-only handles, stale handles, handle exhaustion, and namespace isolation;
-- repeated set, no-op set, delete, delete missing key, erase-all, and
-  delete/recreate ordering;
-- transaction atomicity with multiple keys and namespaces as approved;
+- repeated set, no-op set, delete, delete missing key, and delete/recreate
+  ordering;
+- transaction atomicity with multiple keys in its single associated namespace;
 - sequence wrap/exhaustion handling;
 - WAL torn header, payload, checksum, commit record, and tail;
 - either manifest copy corrupt or torn; both invalid;
@@ -684,9 +654,9 @@ the resulting image and compare it with a simple committed-state model.
 
 ## Phase 0 design decisions
 
-Reviewed on 2026-07-29. Phase 1 is approved. Phase 2 geometry and compatibility
-policy were approved on 2026-07-29. Later phases must follow these decisions
-and must ask before changing them.
+Reviewed on 2026-07-29. Phase 0 decisions and the Phase 1 through Phase 6
+implementation policies are approved. Later changes must follow these
+decisions and must ask before changing them.
 
 ### Motivation and platform scope
 
@@ -710,8 +680,8 @@ and must ask before changing them.
 - Each permanent FAT32-compatible database file is at most `UINT32_MAX` bytes
   (4 GiB minus one byte).
 - V1 geometry is selected at compile time through Kconfig and persisted in the
-  manifest. The default maximum encoded live-data size is 2 MiB and the default
-  total provisioned database size is exactly 4 MiB.
+  manifest. The default maximum encoded logical-state size is 768 KiB and the
+  default total provisioned database size is exactly 4 MiB.
 - The default permanent layout is one 8 KiB manifest, two 256 KiB WAL files,
   and six 596 KiB SSTable files. All file sizes and the total are multiples of
   4096 bytes:
@@ -720,15 +690,16 @@ and must ask before changing them.
   8192 + 2 * 262144 + 6 * 610304 = 4194304 bytes
   ```
 
-- Kconfig exposes maximum live bytes, total provisioned bytes, WAL file size,
+- Kconfig exposes maximum logical-state bytes, total provisioned bytes, WAL file size,
   SSTable file size, and SSTable count. Invalid arithmetic, non-4096-byte
-  alignment, files above the FAT32 limit, fewer than two WALs, fewer than two
-  SSTables, or a file-size sum different from the configured total fail at
+  alignment, files above the FAT32 limit, fewer than two WALs, fewer than four
+  SSTables, an odd SSTable count, or a file-size sum different from the configured total fail at
   build time where possible and at initialization otherwise.
-- "Live bytes" means the encoded size of the newest committed,
-  non-tombstoned records, including namespace, key, type, value, and required
-  record metadata. It is a logical admission limit, not the number of bytes
-  currently occupied by old LSM versions.
+- "Logical-state bytes" means the encoded size of the newest committed records,
+  including tombstones, namespace, key, type, value, and required record
+  metadata. The persisted and Kconfig field retains its historical
+  `max_live_bytes` name. It is a logical admission limit, not the number of
+  bytes currently occupied by old LSM versions.
 - "Provisioned bytes" means the sum of every permanent file's final FATFS file
   size, including manifests, WALs, SSTables, stale versions, and compaction
   workspace. It excludes unrelated application files, FAT metadata, and the
@@ -750,8 +721,8 @@ and must ask before changing them.
 A **live key** is the latest committed, non-tombstoned `(namespace, key)` pair
 across the whole database. It is not a namespace handle, an old LSM version, or
 an uncommitted mutation. V1 does not require one permanent RAM-index entry per
-live key: total live namespaces and keys are bounded by fixed on-disk capacity
-and persisted counters. Open handles, active transactions, staged mutations,
+live key: total live namespaces and keys are bounded by the fixed logical-state
+and on-disk capacity. Open handles, active transactions, staged mutations,
 memtable entries, and compaction scratch space remain independently bounded RAM
 resources.
 
@@ -760,8 +731,10 @@ resources.
 - Runtime arenas are allocated from PSRAM during initialization.
 - The default component-owned runtime-memory budget is 100 KiB.
 - The configurable v1 hard ceiling is strictly less than 200 KiB.
-- Exact arena partitioning is Phase 3 work. Normal operations must allocate no
-  component-owned heap after initialization.
+- The runtime arena has fixed partitions for namespaces, handles, the
+  transaction, staging/recovery bytes, memtable buckets/data, sortable offsets,
+  table blocks, manifest snapshots, and compaction cursors. Normal operations
+  allocate no component-owned heap after initialization.
 - SD-card initialization or recovery may take up to approximately three
   minutes. Long scans must yield or otherwise integrate with task-watchdog
   policy; disabling safety checks globally is not an acceptable shortcut.
@@ -831,8 +804,9 @@ Reviewed and approved on 2026-07-29:
   directly.
 - WAL transaction frames are exactly 4096 bytes even on a FATFS volume using
   512-byte logical sectors. Each transaction begins and ends at a frame
-  boundary. Phase 3 has 240 KiB of frame area per default WAL file, or 120
-  minimum-size transactions across both slots before Phase 4 recycling.
+  boundary. Each default WAL file has 240 KiB of frame area. Phase 5 safely
+  recycles a slot only after compaction checkpoints its reachable transactions
+  and both manifest copies release it.
 - The manifest persists the WAL frame size, namespace/handle limits, memtable
   capacity, transaction mutation/byte limits, active WAL slot, referenced WAL
   generations, and safe checkpoint sequence. V1 requires an exact match with
@@ -854,14 +828,9 @@ Approved on 2026-07-29:
   8 KiB redundant generation headers, 47 12-KiB data blocks, one 12-KiB sparse
   index block, and one 4-KiB footer slot.
 - One flush creates one immutable level-0 table in an unreferenced physical
-  slot. Phase 4 never reuses a referenced or formerly referenced table slot
-  and never recycles a WAL slot; safe reuse remains Phase 5 work.
-- Before writing a table, Phase 4 durably reserves its physical slot and
-  logical generation in the manifest's monotonic consumed-slot mask. A second
-  manifest publication makes the validated table active. This reservation
-  remains consumed after a reset or failed publication, so fallback to the
-  preceding manifest generation cannot make a formerly attempted slot
-  reusable.
+  slot of the active bank. The revision-4 manifest persists the active bank;
+  Phase 5 may reuse only the opposite bank after redundant-copy
+  stabilization.
 - FatFs `f_expand()` does not initialize newly allocated data sectors.
   Provisioning therefore writes and syncs zeroed table header/footer marker
   slots explicitly; the implementation never assumes preallocated contents
@@ -882,12 +851,56 @@ Approved on 2026-07-29:
 - The checkpoint advances only after the new table reference is durable in the
   manifest. Recovery validates referenced tables before replaying WAL
   transactions newer than the safe checkpoint.
-- Phase 4 preserves all tombstones. Tombstone removal requires Phase 5
-  compaction proof that no older value can remain reachable.
+- Phase 4 preserves all tombstones. Phase 5 retains the newest tombstone for
+  each erased key so namespace identity remains durable.
 - No compression, Bloom filter, generic read cache, or public manual-flush API
   is added in Phase 4. Commit flushes automatically when the current memtable
   cannot accept the complete transaction or when transitioning to the second
   WAL slot.
+
+### Phase 5 compaction and reuse decisions
+
+Approved on 2026-07-29:
+
+- The default remains six 596-KiB SSTables and exactly 4 MiB provisioned. The
+  default hard logical-state limit becomes 768 KiB.
+- The configured SSTable count is even and split into two equal banks. One
+  bank is authoritative while foreground full compaction writes the other.
+- Compaction merges every published table and the committed memtable, keeping
+  only the newest record for each composite key. V1 retains the newest
+  tombstone so a namespace remains durable after its final key is erased.
+- Every output table is synced, read back, and validated before manifest
+  publication. A second stabilizing manifest write makes both redundant
+  copies select the new bank before any old table slot can be reused.
+- Compaction is synchronous and uses only bounded initialization-time scratch
+  memory. There is no background task, second immutable memtable, STL
+  container, or steady-state heap allocation.
+- WAL reuse follows the same reachability rule. A WAL generation can be
+  overwritten only after all its committed transactions are checkpointed and
+  neither valid manifest copy references it.
+- If the complete logical state cannot fit the inactive bank, the operation
+  returns `ESP_ERR_NO_MEM` without publishing partial output or overwriting the
+  authoritative bank.
+- General iterators and `erase_all()` remain deferred. Deleting the complete
+  database file set is an explicit application maintenance operation, not an
+  `on9kvdb` API.
+
+### Phase 6 API and diagnostics decisions
+
+Approved on 2026-07-29:
+
+- V1 freezes the C++ API listed above. It includes all integer, string, blob,
+  erase-key, find-key, explicit-transaction, and stats operations.
+- `get_stats()` returns a lock-consistent, non-secret snapshot. It includes
+  logical counts, byte use, compaction totals/latency, capacities, bounded RAM
+  use, active table/WAL topology, and manifest recovery state.
+- Compaction totals are saturating per-boot diagnostics and are not persisted.
+- A failed manifest write or sync latches a storage fault because publication
+  is ambiguous. Normal APIs then return `ESP_ERR_INVALID_STATE` until
+  `deinit(true)` followed by `init()` performs recovery. `get_stats()` remains
+  available to report that fault.
+- General iterators, `erase_all()`, namespace enumeration, encryption, and a C
+  wrapper remain deferred.
 
 ### Corruption, reset, and integration policy
 
@@ -909,9 +922,10 @@ Approved on 2026-07-29:
   above the generic KV API. Add that integration after the KV engine is usable;
   the Soulcloud client itself is not part of the current implementation.
 
-### Decisions still required by later phases
+### Remaining integration and qualification decisions
 
-These items do not reopen Phase 1, but they gate the phase that consumes them:
+These items do not reopen the implemented phases, but they gate Phase 7 or a
+future backend/integration:
 
 - Phase 2 uses FAT32 only, with 512-byte or 4096-byte logical sectors and
   4096-byte database format slots/alignment. It supports ESP32-family targets
@@ -932,9 +946,9 @@ These items do not reopen Phase 1, but they gate the phase that consumes them:
   journaling, and the descriptor allowance remain an explicit platform mount
   contract until ESP-IDF exposes a stable query API; do not couple the
   component to private VFS/FatFs context structures merely to inspect them.
-- Phase 5 must freeze the SSTable level ratio, compaction reserve, slot-reuse
-  policy, and tombstone-drop proof. Phase 4 has frozen the immutable table
-  format, level-0 flush, exact scratch reuse, and non-recycling behavior.
+- Phase 5 uses the approved equal-bank full-compaction, stabilization, and
+  reuse policy documented above. V1 retains newest tombstones to preserve
+  durable namespace identity.
 - Performance acceptance requires a measured NVS baseline rather than relying
   on recollection that some operations are `O(n)`.
 - Final SD power-loss qualification waits for the separately owned journal
@@ -958,7 +972,6 @@ on9kvdb_wal.cpp             WAL append, commit, scan, replay, slot transition
 on9kvdb_memtable.cpp        bounded staging/memtable/index
 on9kvdb_table.cpp           SSTable build, validate, and lookup
 on9kvdb_compaction.cpp      merge and slot-reuse policy
-on9kvdb_crc.cpp             only if constexpr/private-header placement is poor
 Kconfig
 CMakeLists.txt
 README.md
@@ -970,7 +983,7 @@ commits, the memtable is a RAM view, and SSTables are immutable published data.
 
 ## Acceptance criteria
 
-The component is complete only when:
+The component is release-qualified only when:
 
 1. The approved NVS-familiar API and all limits are documented.
 2. Every permanent file is provisioned contiguously at final size and never

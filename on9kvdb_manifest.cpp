@@ -156,6 +156,7 @@ esp_err_t on9kvdb::load_manifest()
     auto *valid = reinterpret_cast<on9kvdb_def::manifest_record *>(future_scratch);
     on9kvdb_def::manifest_record *selected = nullptr;
     uint32_t selected_slot = 0;
+    bool stabilization_required = false;
     bool slot_valid[on9kvdb_def::manifest_slot_count] = {};
     for (uint32_t slot = 0; slot < on9kvdb_def::manifest_slot_count; slot += 1) {
         new (&valid[slot]) on9kvdb_def::manifest_record{};
@@ -208,7 +209,6 @@ esp_err_t on9kvdb::load_manifest()
             !on9kvdb_def::storage_geometry_equal(valid[slot].geometry, selected->geometry) ||
             !on9kvdb_def::logical_limits_equal(valid[slot].limits, selected->limits) ||
             (valid[slot].generation != selected->generation && selected->generation - valid[slot].generation != 1U) ||
-            (valid[slot].consumed_table_mask & ~selected->consumed_table_mask) != 0 ||
             valid[slot].next_table_generation > selected->next_table_generation ||
             valid[slot].safe_checkpoint_sequence > selected->safe_checkpoint_sequence ||
             (valid[slot].generation == selected->generation && valid[slot].state != selected->state) ||
@@ -217,12 +217,18 @@ esp_err_t on9kvdb::load_manifest()
             return ESP_ERR_INVALID_CRC;
         }
         if (valid[slot].generation < selected->generation) {
-            for (uint32_t table_slot = 0; table_slot < selected->geometry.table_count; table_slot += 1) {
-                if (valid[slot].tables[table_slot].active &&
-                    !on9kvdb_def::table_reference_equal(valid[slot].tables[table_slot], selected->tables[table_slot])) {
-                    return ESP_ERR_INVALID_CRC;
+            if (valid[slot].active_table_bank == selected->active_table_bank) {
+                for (uint32_t table_slot = 0; table_slot < selected->geometry.table_count; table_slot += 1) {
+                    if (valid[slot].tables[table_slot].active &&
+                        !on9kvdb_def::table_reference_equal(valid[slot].tables[table_slot], selected->tables[table_slot])) {
+                        return ESP_ERR_INVALID_CRC;
+                    }
                 }
             }
+            stabilization_required = valid[slot].active_table_bank != selected->active_table_bank ||
+                                     valid[slot].active_wal_slot != selected->active_wal_slot ||
+                                     valid[slot].wal_generation[0] != selected->wal_generation[0] ||
+                                     valid[slot].wal_generation[1] != selected->wal_generation[1];
         }
     }
 
@@ -234,6 +240,7 @@ esp_err_t on9kvdb::load_manifest()
             manifest_valid_copy_count += 1;
         }
     }
+    manifest_stabilization_required = stabilization_required || manifest_valid_copy_count < on9kvdb_def::manifest_slot_count;
     return ESP_OK;
 }
 
@@ -264,8 +271,29 @@ esp_err_t on9kvdb::write_manifest_copy(uint64_t generation, uint16_t state)
     if (ret == ESP_OK) {
         manifest = *next;
         manifest_slot = slot;
+    } else {
+        // A failed write or sync cannot prove whether this generation reached durable storage. Stop normal operations so no
+        // file selected by a possibly valid copy can be reused before deinit/re-init performs recovery.
+        storage_faulted = true;
     }
 
+    return ret;
+}
+
+esp_err_t on9kvdb::stabilize_manifest_unsafe()
+{
+    if (!manifest_stabilization_required) {
+        return ESP_OK;
+    }
+    if (manifest.generation == UINT64_MAX) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const esp_err_t ret = write_manifest_copy(manifest.generation + 1U, manifest.state);
+    if (ret == ESP_OK) {
+        manifest_valid_copy_count = on9kvdb_def::manifest_slot_count;
+        manifest_stabilization_required = false;
+    }
     return ret;
 }
 

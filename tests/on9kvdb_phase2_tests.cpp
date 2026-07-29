@@ -33,7 +33,7 @@ namespace
     {
         on9kvdb_def::storage_geometry geometry = {};
         geometry.provisioned_size = 4U * 1024U * 1024U;
-        geometry.max_live_bytes = 2U * 1024U * 1024U;
+        geometry.max_live_bytes = 768U * 1024U;
         geometry.manifest_size = on9kvdb_def::manifest_file_size;
         geometry.wal_size = 256U * 1024U;
         geometry.wal_count = on9kvdb_def::wal_file_count;
@@ -260,11 +260,11 @@ namespace
 
         on9kvdb_def::storage_geometry mismatch = geometry;
         mismatch.table_count = 3;
-        mismatch.max_live_bytes = 1024U * 1024U;
+        mismatch.max_live_bytes = 512U * 1024U;
         mismatch.provisioned_size = mismatch.manifest_size + static_cast<uint64_t>(mismatch.wal_count) * mismatch.wal_size +
                                     static_cast<uint64_t>(mismatch.table_count) * mismatch.table_size;
         EXPECT_TRUE(!on9kvdb_def::storage_geometry_equal(geometry, mismatch));
-        EXPECT_TRUE(on9kvdb_def::validate_storage_geometry(mismatch));
+        EXPECT_TRUE(!on9kvdb_def::validate_storage_geometry(mismatch));
 
         on9kvdb_def::manifest_record record = {};
         record.generation = 7;

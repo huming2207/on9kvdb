@@ -372,8 +372,8 @@ bool on9kvdb_def::validate_storage_geometry(const storage_geometry &geometry)
 {
     if (geometry.provisioned_size == 0 || geometry.max_live_bytes == 0 || geometry.max_live_bytes > geometry.provisioned_size ||
         geometry.manifest_size != manifest_file_size || geometry.wal_size <= identity_region_size ||
-        geometry.wal_count != wal_file_count || geometry.table_size <= identity_region_size || geometry.table_count < 2 ||
-        geometry.table_count > max_table_count || geometry.alignment != format_alignment ||
+        geometry.wal_count != wal_file_count || geometry.table_size <= identity_region_size || geometry.table_count < 4 ||
+        geometry.table_count > max_table_count || (geometry.table_count & 1U) != 0 || geometry.alignment != format_alignment ||
         geometry.manifest_size % format_alignment != 0 || geometry.wal_size % format_alignment != 0 ||
         geometry.table_size % format_alignment != 0) {
         return false;
@@ -407,6 +407,29 @@ bool on9kvdb_def::validate_logical_limits(const logical_limits &limits)
            limits.max_transaction_mutations > 0 && limits.max_transaction_mutations <= max_transaction_mutations &&
            limits.transaction_staging_bytes >= max_value_len && limits.sstable_block_bytes % format_alignment == 0 &&
            limits.sstable_block_bytes > table_block_header_size + maximum_entry_size;
+}
+
+bool on9kvdb_def::validate_compaction_capacity(const storage_geometry &geometry, const logical_limits &limits)
+{
+    if (!validate_storage_geometry(geometry) || !validate_logical_limits(limits) ||
+        geometry.table_size <= table_data_region_offset + limits.sstable_block_bytes + table_footer_slot_size) {
+        return false;
+    }
+
+    const uint64_t data_region_bytes =
+        geometry.table_size - table_data_region_offset - limits.sstable_block_bytes - table_footer_slot_size;
+    if (data_region_bytes % limits.sstable_block_bytes != 0) {
+        return false;
+    }
+
+    const uint64_t data_blocks_per_table = data_region_bytes / limits.sstable_block_bytes;
+    const uint64_t bank_block_count = data_blocks_per_table * (geometry.table_count / 2U);
+    const uint64_t block_payload_bytes = limits.sstable_block_bytes - table_block_header_size;
+
+    // Next-fit block packing guarantees that every completed pair of blocks contains more than one block of encoded records.
+    // Reserving the unpaired block gives a simple hard bound for arbitrary permitted record-size mixtures.
+    const uint64_t guaranteed_logical_bytes = (bank_block_count / 2U) * block_payload_bytes;
+    return geometry.max_live_bytes <= guaranteed_logical_bytes;
 }
 
 bool on9kvdb_def::logical_limits_equal(const logical_limits &lhs, const logical_limits &rhs)
@@ -574,17 +597,28 @@ bool on9kvdb_def::encode_manifest_record(uint8_t *buf, size_t buf_len, const man
     uint32_t active_table_count = 0;
     uint64_t greatest_table_generation = 0;
     uint64_t greatest_table_sequence = 0;
-    bool table_references_valid = record.geometry.table_count <= max_table_count;
-    const uint32_t configured_table_mask =
-        record.geometry.table_count <= max_table_count ? (UINT32_C(1) << record.geometry.table_count) - 1U : 0;
+    const bool bank_geometry_valid = record.geometry.table_count >= 4 && record.geometry.table_count <= max_table_count &&
+                                     (record.geometry.table_count & 1U) == 0 && record.active_table_bank < 2;
+    const uint32_t bank_size = bank_geometry_valid ? record.geometry.table_count / 2U : 0;
+    const uint32_t bank_start = record.active_table_bank * bank_size;
+    const uint32_t bank_end = bank_start + bank_size;
+    bool table_references_valid = bank_geometry_valid;
     for (uint32_t slot = 0; table_references_valid && slot < max_table_count; slot += 1) {
         const table_reference &reference = record.tables[slot];
         if (!reference.active) {
             continue;
         }
-        if (slot >= record.geometry.table_count || (record.consumed_table_mask & (UINT32_C(1) << slot)) == 0 ||
-            !valid_table_reference(reference, slot, record.safe_checkpoint_sequence)) {
+        if (slot < bank_start || slot >= bank_end || !valid_table_reference(reference, slot, record.safe_checkpoint_sequence)) {
             table_references_valid = false;
+            break;
+        }
+        for (uint32_t previous = bank_start; previous < slot; previous += 1) {
+            if (record.tables[previous].active && record.tables[previous].generation == reference.generation) {
+                table_references_valid = false;
+                break;
+            }
+        }
+        if (!table_references_valid) {
             break;
         }
         active_table_count += 1;
@@ -598,15 +632,13 @@ bool on9kvdb_def::encode_manifest_record(uint8_t *buf, size_t buf_len, const man
 
     if (buf == nullptr || buf_len < manifest_record_size || record.generation == 0 || record.database_id == 0 ||
         (record.state != manifest_state_provisioning_owned && record.state != manifest_state_ready) ||
-        !validate_storage_geometry(record.geometry) || !validate_logical_limits(record.limits) ||
-        record.active_wal_slot >= wal_file_count || record.next_table_generation == 0 || !table_references_valid ||
-        (record.consumed_table_mask & ~configured_table_mask) != 0 || greatest_table_generation >= record.next_table_generation ||
-        greatest_table_sequence != record.safe_checkpoint_sequence ||
+        !validate_compaction_capacity(record.geometry, record.limits) || record.active_wal_slot >= wal_file_count ||
+        record.next_table_generation == 0 || !table_references_valid ||
+        greatest_table_generation >= record.next_table_generation || greatest_table_sequence != record.safe_checkpoint_sequence ||
         (record.state == manifest_state_provisioning_owned &&
          (record.wal_generation[0] != 0 || record.wal_generation[1] != 0 || record.safe_checkpoint_sequence != 0 ||
-          active_table_count != 0 || record.next_table_generation != 1 || record.consumed_table_mask != 0)) ||
-        (record.state == manifest_state_ready &&
-         (record.wal_generation[0] == 0 || record.wal_generation[record.active_wal_slot] == 0))) {
+          active_table_count != 0 || record.next_table_generation != 1 || record.active_table_bank != 0)) ||
+        (record.state == manifest_state_ready && record.wal_generation[record.active_wal_slot] == 0)) {
         return false;
     }
 
@@ -634,7 +666,7 @@ bool on9kvdb_def::encode_manifest_record(uint8_t *buf, size_t buf_len, const man
         !write_u64_le(buf, buf_len, 128, record.wal_generation[1]) ||
         !write_u64_le(buf, buf_len, 136, record.safe_checkpoint_sequence) ||
         !write_u64_le(buf, buf_len, 144, record.next_table_generation) || !write_u32_le(buf, buf_len, 152, active_table_count) ||
-        !write_u32_le(buf, buf_len, 156, record.consumed_table_mask)) {
+        !write_u32_le(buf, buf_len, 156, record.active_table_bank)) {
         return false;
     }
     for (uint32_t slot = 0; slot < max_table_count; slot += 1) {
@@ -693,7 +725,7 @@ on9kvdb_def::format_status on9kvdb_def::decode_manifest_record(const uint8_t *bu
         read_u64_le(buf, buf_len, 136, &record.safe_checkpoint_sequence) &&
         read_u64_le(buf, buf_len, 144, &record.next_table_generation) &&
         read_u32_le(buf, buf_len, 152, &encoded_active_table_count) &&
-        read_u32_le(buf, buf_len, 156, &record.consumed_table_mask) &&
+        read_u32_le(buf, buf_len, 156, &record.active_table_bank) &&
         read_u32_le(buf, buf_len, manifest_record_checksum_offset, &checksum);
     if (!decoded) {
         return format_status::invalid_size;
@@ -702,6 +734,11 @@ on9kvdb_def::format_status on9kvdb_def::decode_manifest_record(const uint8_t *bu
     uint32_t active_table_count = 0;
     uint64_t greatest_table_generation = 0;
     uint64_t greatest_table_sequence = 0;
+    const bool bank_geometry_valid = record.geometry.table_count >= 4 && record.geometry.table_count <= max_table_count &&
+                                     (record.geometry.table_count & 1U) == 0 && record.active_table_bank < 2;
+    const uint32_t bank_size = bank_geometry_valid ? record.geometry.table_count / 2U : 0;
+    const uint32_t bank_start = record.active_table_bank * bank_size;
+    const uint32_t bank_end = bank_start + bank_size;
     for (uint32_t slot = 0; slot < max_table_count; slot += 1) {
         const size_t offset = manifest_table_reference_offset + static_cast<size_t>(slot) * manifest_table_reference_size;
         const format_status status = decode_manifest_table_reference(buf, buf_len, offset, &record.tables[slot]);
@@ -711,9 +748,14 @@ on9kvdb_def::format_status on9kvdb_def::decode_manifest_record(const uint8_t *bu
         if (!record.tables[slot].active) {
             continue;
         }
-        if (slot >= record.geometry.table_count || (record.consumed_table_mask & (UINT32_C(1) << slot)) == 0 ||
+        if (!bank_geometry_valid || slot < bank_start || slot >= bank_end ||
             !valid_table_reference(record.tables[slot], slot, record.safe_checkpoint_sequence)) {
             return format_status::corrupt;
+        }
+        for (uint32_t previous = bank_start; previous < slot; previous += 1) {
+            if (record.tables[previous].active && record.tables[previous].generation == record.tables[slot].generation) {
+                return format_status::corrupt;
+            }
         }
         active_table_count += 1;
         if (record.tables[slot].generation > greatest_table_generation) {
@@ -725,23 +767,19 @@ on9kvdb_def::format_status on9kvdb_def::decode_manifest_record(const uint8_t *bu
     }
 
     record.generation = prefix.generation;
-    const uint32_t configured_table_mask =
-        record.geometry.table_count <= max_table_count ? (UINT32_C(1) << record.geometry.table_count) - 1U : 0;
     if (record.database_id == 0 || (record.state != manifest_state_provisioning_owned && record.state != manifest_state_ready) ||
         (record.state == manifest_state_ready && record.generation < 3) || geometry_format != geometry_revision ||
         limits_format != logical_limits_revision || !is_zero_range(buf, 82, 2) ||
         !is_zero_range(buf, manifest_table_reference_offset + max_table_count * manifest_table_reference_size,
                        manifest_record_checksum_offset -
                            (manifest_table_reference_offset + max_table_count * manifest_table_reference_size)) ||
-        !validate_storage_geometry(record.geometry) || !validate_logical_limits(record.limits) ||
-        record.active_wal_slot >= wal_file_count || record.next_table_generation == 0 ||
-        (record.consumed_table_mask & ~configured_table_mask) != 0 || active_table_count != encoded_active_table_count ||
+        !validate_compaction_capacity(record.geometry, record.limits) || record.active_wal_slot >= wal_file_count ||
+        record.next_table_generation == 0 || active_table_count != encoded_active_table_count ||
         greatest_table_generation >= record.next_table_generation || greatest_table_sequence != record.safe_checkpoint_sequence ||
         (record.state == manifest_state_provisioning_owned &&
          (record.wal_generation[0] != 0 || record.wal_generation[1] != 0 || record.safe_checkpoint_sequence != 0 ||
-          active_table_count != 0 || record.next_table_generation != 1 || record.consumed_table_mask != 0)) ||
-        (record.state == manifest_state_ready &&
-         (record.wal_generation[0] == 0 || record.wal_generation[record.active_wal_slot] == 0))) {
+          active_table_count != 0 || record.next_table_generation != 1 || record.active_table_bank != 0)) ||
+        (record.state == manifest_state_ready && record.wal_generation[record.active_wal_slot] == 0)) {
         return format_status::corrupt;
     }
     if (checksum != calc_record_crc(buf, manifest_record_size, manifest_record_checksum_offset)) {

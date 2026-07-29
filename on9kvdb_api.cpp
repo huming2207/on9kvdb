@@ -580,11 +580,33 @@ esp_err_t on9kvdb::get_stats(on9kvdb_stats *stats_out) const
     if (stats_out == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
-    const esp_err_t ret = acquire_operation_lock();
+    const esp_err_t ret = acquire_diagnostic_lock();
     if (ret != ESP_OK) {
         return ret;
     }
     *stats_out = stats;
+    stats_out->logical_state_capacity_bytes = manifest.geometry.max_live_bytes;
+    stats_out->provisioned_database_bytes = manifest.geometry.provisioned_size;
+    stats_out->runtime_memory_bytes = cfg.runtime_memory_budget;
+    stats_out->runtime_scratch_bytes = future_scratch_size;
+    stats_out->manifest_generation = manifest.generation;
+    stats_out->safe_checkpoint_sequence = manifest.safe_checkpoint_sequence;
+    stats_out->valid_manifest_copy_count = manifest_valid_copy_count;
+    stats_out->active_table_bank = manifest.active_table_bank;
+    stats_out->active_wal_slot = manifest.active_wal_slot;
+    stats_out->manifest_stabilization_required = manifest_stabilization_required;
+    stats_out->storage_faulted = storage_faulted;
+    for (uint32_t slot = 0; slot < manifest.geometry.table_count; slot += 1) {
+        if (manifest.tables[slot].active) {
+            stats_out->active_table_count += 1U;
+        }
+    }
+    for (uint32_t slot = 0; slot < on9kvdb_def::wal_file_count; slot += 1) {
+        if (manifest.wal_generation[slot] != 0) {
+            stats_out->referenced_wal_count += 1U;
+            stats_out->wal_record_capacity_bytes += manifest.geometry.wal_size - on9kvdb_def::wal_record_region_offset;
+        }
+    }
     release_operation_lock();
     return ESP_OK;
 }
