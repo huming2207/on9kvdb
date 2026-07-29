@@ -53,6 +53,7 @@ namespace
         limits.memtable_data_bytes = 36U * 1024U;
         limits.max_transaction_mutations = on9kvdb_def::max_transaction_mutations;
         limits.transaction_staging_bytes = 24U * 1024U;
+        limits.sstable_block_bytes = 12U * 1024U;
         return limits;
     }
 

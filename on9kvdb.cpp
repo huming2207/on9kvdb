@@ -32,6 +32,14 @@ static_assert(CONFIG_ON9KVDB_SSTABLE_FILE_SIZE > on9kvdb_def::identity_region_si
 static_assert(CONFIG_ON9KVDB_WAL_FILE_SIZE % on9kvdb_def::format_alignment == 0);
 static_assert(CONFIG_ON9KVDB_SSTABLE_FILE_SIZE % on9kvdb_def::format_alignment == 0);
 static_assert(CONFIG_ON9KVDB_SSTABLE_COUNT >= 2);
+static_assert(CONFIG_ON9KVDB_SSTABLE_COUNT <= on9kvdb_def::max_table_count);
+static_assert(CONFIG_ON9KVDB_SSTABLE_BLOCK_SIZE % on9kvdb_def::format_alignment == 0);
+static_assert(CONFIG_ON9KVDB_SSTABLE_FILE_SIZE >
+              on9kvdb_def::table_data_region_offset + CONFIG_ON9KVDB_SSTABLE_BLOCK_SIZE + on9kvdb_def::table_footer_slot_size);
+static_assert((CONFIG_ON9KVDB_SSTABLE_FILE_SIZE - on9kvdb_def::table_data_region_offset - CONFIG_ON9KVDB_SSTABLE_BLOCK_SIZE -
+               on9kvdb_def::table_footer_slot_size) %
+                  CONFIG_ON9KVDB_SSTABLE_BLOCK_SIZE ==
+              0);
 static_assert(static_cast<uint64_t>(CONFIG_ON9KVDB_MAX_LIVE_DATA_SIZE) <=
               static_cast<uint64_t>(CONFIG_ON9KVDB_SSTABLE_COUNT) *
                   (CONFIG_ON9KVDB_SSTABLE_FILE_SIZE - on9kvdb_def::identity_region_size));
@@ -47,7 +55,11 @@ static_assert(static_cast<uint64_t>(on9kvdb_def::manifest_file_size) +
 namespace
 {
     static const constexpr size_t internal_io_bytes = on9kvdb_def::wal_frame_size;
-    static const constexpr size_t minimum_future_scratch_bytes = 16U * 1024U;
+    static const constexpr size_t table_sort_bytes = CONFIG_ON9KVDB_MEMTABLE_ENTRY_COUNT * sizeof(uint32_t);
+    static const constexpr size_t table_scratch_bytes = table_sort_bytes + 2U * CONFIG_ON9KVDB_SSTABLE_BLOCK_SIZE;
+    static const constexpr size_t manifest_scratch_bytes = 2U * sizeof(on9kvdb_def::manifest_record);
+    static const constexpr size_t minimum_future_scratch_bytes =
+        table_scratch_bytes > manifest_scratch_bytes ? table_scratch_bytes : manifest_scratch_bytes;
     static const constexpr size_t transaction_recovery_overhead =
         8U + on9kvdb_def::max_name_len + on9kvdb_def::max_transaction_mutations * (8U + on9kvdb_def::max_name_len);
 
@@ -124,6 +136,7 @@ on9kvdb_def::logical_limits on9kvdb::get_build_limits()
     limits.memtable_data_bytes = CONFIG_ON9KVDB_MEMTABLE_DATA_SIZE;
     limits.max_transaction_mutations = CONFIG_ON9KVDB_MAX_TRANSACTION_MUTATIONS;
     limits.transaction_staging_bytes = CONFIG_ON9KVDB_TRANSACTION_STAGING_SIZE;
+    limits.sstable_block_bytes = CONFIG_ON9KVDB_SSTABLE_BLOCK_SIZE;
     return limits;
 }
 

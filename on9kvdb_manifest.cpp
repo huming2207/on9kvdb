@@ -1,6 +1,7 @@
 #include <cerrno>
 #include <cstring>
 #include <inttypes.h>
+#include <new>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -145,23 +146,31 @@ esp_err_t on9kvdb::open_existing_manifest()
 
 esp_err_t on9kvdb::load_manifest()
 {
+    if (io_frame == nullptr || future_scratch == nullptr || future_scratch_size < 2U * sizeof(on9kvdb_def::manifest_record)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
     const int manifest_fd = storage_fds[descriptor_index(on9kvdb_def::file_kind::manifest, 0)];
     bool found = false;
     bool newer_version_found = false;
-    on9kvdb_def::manifest_record selected = {};
+    auto *valid = reinterpret_cast<on9kvdb_def::manifest_record *>(future_scratch);
+    on9kvdb_def::manifest_record *selected = nullptr;
     uint32_t selected_slot = 0;
-    on9kvdb_def::manifest_record valid[on9kvdb_def::manifest_slot_count] = {};
     bool slot_valid[on9kvdb_def::manifest_slot_count] = {};
+    for (uint32_t slot = 0; slot < on9kvdb_def::manifest_slot_count; slot += 1) {
+        new (&valid[slot]) on9kvdb_def::manifest_record{};
+    }
 
     for (uint32_t slot = 0; slot < on9kvdb_def::manifest_slot_count; slot += 1) {
-        uint8_t encoded[on9kvdb_def::manifest_record_size] = {};
         const uint64_t offset = static_cast<uint64_t>(slot) * on9kvdb_def::manifest_slot_size;
-        esp_err_t ret = read_exact_fd(manifest_fd, on9kvdb_def::manifest_file_size, offset, encoded, sizeof(encoded));
+        esp_err_t ret =
+            read_exact_fd(manifest_fd, on9kvdb_def::manifest_file_size, offset, io_frame, on9kvdb_def::manifest_record_size);
         if (ret != ESP_OK) {
             return ret;
         }
 
-        const on9kvdb_def::format_status status = on9kvdb_def::decode_manifest_record(encoded, sizeof(encoded), &valid[slot]);
+        const on9kvdb_def::format_status status =
+            on9kvdb_def::decode_manifest_record(io_frame, on9kvdb_def::manifest_record_size, &valid[slot]);
         if (status == on9kvdb_def::format_status::new_version || status == on9kvdb_def::format_status::invalid_revision) {
             newer_version_found = true;
             continue;
@@ -175,8 +184,8 @@ esp_err_t on9kvdb::load_manifest()
         }
 
         slot_valid[slot] = true;
-        if (!found || valid[slot].generation > selected.generation) {
-            selected = valid[slot];
+        if (!found || valid[slot].generation > selected->generation) {
+            selected = &valid[slot];
             selected_slot = slot;
             found = true;
         }
@@ -189,22 +198,35 @@ esp_err_t on9kvdb::load_manifest()
         return ESP_ERR_INVALID_CRC;
     }
 
+    // Both copies describe the same database. Only an adjacent generation is valid because each manifest update replaces one
+    // alternating slot after the previous generation has already reached durable storage.
     for (uint32_t slot = 0; slot < on9kvdb_def::manifest_slot_count; slot += 1) {
         if (!slot_valid[slot]) {
             continue;
         }
-        if (valid[slot].database_id != selected.database_id ||
-            !on9kvdb_def::storage_geometry_equal(valid[slot].geometry, selected.geometry) ||
-            !on9kvdb_def::logical_limits_equal(valid[slot].limits, selected.limits) ||
-            (valid[slot].generation != selected.generation && selected.generation - valid[slot].generation != 1U) ||
-            (valid[slot].generation == selected.generation && valid[slot].state != selected.state) ||
-            (valid[slot].generation < selected.generation && valid[slot].state == on9kvdb_def::manifest_state_ready &&
-             selected.state == on9kvdb_def::manifest_state_provisioning_owned)) {
+        if (valid[slot].database_id != selected->database_id ||
+            !on9kvdb_def::storage_geometry_equal(valid[slot].geometry, selected->geometry) ||
+            !on9kvdb_def::logical_limits_equal(valid[slot].limits, selected->limits) ||
+            (valid[slot].generation != selected->generation && selected->generation - valid[slot].generation != 1U) ||
+            (valid[slot].consumed_table_mask & ~selected->consumed_table_mask) != 0 ||
+            valid[slot].next_table_generation > selected->next_table_generation ||
+            valid[slot].safe_checkpoint_sequence > selected->safe_checkpoint_sequence ||
+            (valid[slot].generation == selected->generation && valid[slot].state != selected->state) ||
+            (valid[slot].generation < selected->generation && valid[slot].state == on9kvdb_def::manifest_state_ready &&
+             selected->state == on9kvdb_def::manifest_state_provisioning_owned)) {
             return ESP_ERR_INVALID_CRC;
+        }
+        if (valid[slot].generation < selected->generation) {
+            for (uint32_t table_slot = 0; table_slot < selected->geometry.table_count; table_slot += 1) {
+                if (valid[slot].tables[table_slot].active &&
+                    !on9kvdb_def::table_reference_equal(valid[slot].tables[table_slot], selected->tables[table_slot])) {
+                    return ESP_ERR_INVALID_CRC;
+                }
+            }
         }
     }
 
-    manifest = selected;
+    manifest = *selected;
     manifest_slot = selected_slot;
     manifest_valid_copy_count = 0;
     for (uint32_t slot = 0; slot < on9kvdb_def::manifest_slot_count; slot += 1) {
@@ -218,28 +240,29 @@ esp_err_t on9kvdb::load_manifest()
 esp_err_t on9kvdb::write_manifest_copy(uint64_t generation, uint16_t state)
 {
     if (generation == 0 || manifest.database_id == 0 || manifest.generation == UINT64_MAX ||
-        generation != manifest.generation + 1U) {
+        generation != manifest.generation + 1U || future_scratch == nullptr ||
+        future_scratch_size < sizeof(on9kvdb_def::manifest_record)) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    on9kvdb_def::manifest_record next = manifest;
-    next.generation = generation;
-    next.state = state;
+    auto *next = new (future_scratch) on9kvdb_def::manifest_record(manifest);
+    next->generation = generation;
+    next->state = state;
 
-    uint8_t encoded[on9kvdb_def::manifest_record_size] = {};
-    if (!on9kvdb_def::encode_manifest_record(encoded, sizeof(encoded), next)) {
+    if (io_frame == nullptr || !on9kvdb_def::encode_manifest_record(io_frame, on9kvdb_def::manifest_record_size, *next)) {
         return ESP_ERR_INVALID_STATE;
     }
 
     const uint32_t slot = static_cast<uint32_t>((generation - 1U) % on9kvdb_def::manifest_slot_count);
     const uint64_t offset = static_cast<uint64_t>(slot) * on9kvdb_def::manifest_slot_size;
     const int manifest_fd = storage_fds[descriptor_index(on9kvdb_def::file_kind::manifest, 0)];
-    esp_err_t ret = write_exact_fd(manifest_fd, on9kvdb_def::manifest_file_size, offset, encoded, sizeof(encoded));
+    esp_err_t ret =
+        write_exact_fd(manifest_fd, on9kvdb_def::manifest_file_size, offset, io_frame, on9kvdb_def::manifest_record_size);
     if (ret == ESP_OK) {
         ret = sync_fd(manifest_fd);
     }
     if (ret == ESP_OK) {
-        manifest = next;
+        manifest = *next;
         manifest_slot = slot;
     }
 
@@ -357,6 +380,28 @@ esp_err_t on9kvdb::provision_one_data_file(on9kvdb_def::file_kind kind, uint32_t
     }
     if (ret != ESP_OK) {
         return ret;
+    }
+
+    if (manifest.state == on9kvdb_def::manifest_state_provisioning_owned && kind == on9kvdb_def::file_kind::table) {
+        // FatFs f_expand() allocates clusters but does not initialize their sectors. Explicit zero publication markers let
+        // Phase 4 distinguish a never-published slot from a slot that must not be overwritten after manifest-copy fallback.
+        memset(io_frame, 0, on9kvdb_def::wal_frame_size);
+        for (uint32_t copy_slot = 0; copy_slot < on9kvdb_def::table_header_slot_count; copy_slot += 1) {
+            const uint64_t offset =
+                on9kvdb_def::table_header_region_offset + static_cast<uint64_t>(copy_slot) * on9kvdb_def::table_header_slot_size;
+            ret = write_exact_fd(storage_fds[fd_index], file_size, offset, io_frame, on9kvdb_def::table_header_slot_size);
+            if (ret != ESP_OK) {
+                return ret;
+            }
+        }
+        ret = write_exact_fd(storage_fds[fd_index], file_size, file_size - on9kvdb_def::table_footer_slot_size, io_frame,
+                             on9kvdb_def::table_footer_slot_size);
+        if (ret == ESP_OK) {
+            ret = sync_fd(storage_fds[fd_index]);
+        }
+        if (ret != ESP_OK) {
+            return ret;
+        }
     }
 
     if (manifest.state == on9kvdb_def::manifest_state_provisioning_owned) {

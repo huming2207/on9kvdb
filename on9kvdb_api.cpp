@@ -383,6 +383,12 @@ esp_err_t on9kvdb::commit(on9kvdb_transaction_handle transaction_handle)
     compact_memtable_unsafe();
     uint16_t namespace_index = 0;
     ret = preflight_memtable_transaction_unsafe(*transaction_state, handle.namespace_name, &namespace_index);
+    if (ret == ESP_ERR_NO_MEM && memtable_entry_count > 0) {
+        ret = flush_memtable_unsafe();
+        if (ret == ESP_OK) {
+            ret = preflight_memtable_transaction_unsafe(*transaction_state, handle.namespace_name, &namespace_index);
+        }
+    }
     if (ret == ESP_OK) {
         ret = append_transaction_unsafe(transaction_state, handle);
     }
@@ -390,9 +396,11 @@ esp_err_t on9kvdb::commit(on9kvdb_transaction_handle transaction_handle)
         ret = ensure_namespace_capacity_unsafe(handle.namespace_name, &namespace_index, true);
     }
     if (ret == ESP_OK) {
-        apply_transaction_to_memtable_unsafe(*transaction_state, namespace_index, next_transaction_sequence);
-        next_transaction_sequence += 1U;
-        clear_transaction_unsafe();
+        ret = apply_transaction_to_memtable_unsafe(*transaction_state, namespace_index, next_transaction_sequence);
+        if (ret == ESP_OK) {
+            next_transaction_sequence += 1U;
+            clear_transaction_unsafe();
+        }
     }
 
     release_operation_lock();
@@ -430,7 +438,7 @@ esp_err_t on9kvdb::abort(on9kvdb_transaction_handle transaction_handle)
         ret = get_handle_slot_unsafe(handle, &handle_state);                                                                     \
         value_view view = {};                                                                                                    \
         if (ret == ESP_OK) {                                                                                                     \
-            ret = lookup_memtable_unsafe(handle_state->namespace_name, key, &view);                                              \
+            ret = lookup_committed_unsafe(handle_state->namespace_name, key, &view);                                             \
         }                                                                                                                        \
         if (ret == ESP_OK) {                                                                                                     \
             ret = get_fixed_value_unsafe(view, kv_type, value_out, sizeof(*value_out));                                          \
@@ -481,7 +489,7 @@ ON9KVDB_DEFINE_FIXED_GETTER(get_u64, uint64_t, on9kvdb_type::u64)
         ret = get_handle_slot_unsafe(handle, &handle_state);                                                                     \
         value_view view = {};                                                                                                    \
         if (ret == ESP_OK) {                                                                                                     \
-            ret = lookup_memtable_unsafe(handle_state->namespace_name, key, &view);                                              \
+            ret = lookup_committed_unsafe(handle_state->namespace_name, key, &view);                                             \
         }                                                                                                                        \
         if (ret == ESP_OK) {                                                                                                     \
             ret = get_variable_value_unsafe(view, kv_type, value_out, length);                                                   \
@@ -529,7 +537,7 @@ esp_err_t on9kvdb::find_key(on9kvdb_handle handle, const char *key, on9kvdb_type
     ret = get_handle_slot_unsafe(handle, &handle_state);
     value_view view = {};
     if (ret == ESP_OK) {
-        ret = lookup_memtable_unsafe(handle_state->namespace_name, key, &view);
+        ret = lookup_committed_unsafe(handle_state->namespace_name, key, &view);
     }
     if (ret == ESP_OK && view.tombstone) {
         ret = ESP_ERR_NOT_FOUND;

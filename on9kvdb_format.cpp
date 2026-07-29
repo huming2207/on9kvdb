@@ -373,8 +373,9 @@ bool on9kvdb_def::validate_storage_geometry(const storage_geometry &geometry)
     if (geometry.provisioned_size == 0 || geometry.max_live_bytes == 0 || geometry.max_live_bytes > geometry.provisioned_size ||
         geometry.manifest_size != manifest_file_size || geometry.wal_size <= identity_region_size ||
         geometry.wal_count != wal_file_count || geometry.table_size <= identity_region_size || geometry.table_count < 2 ||
-        geometry.alignment != format_alignment || geometry.manifest_size % format_alignment != 0 ||
-        geometry.wal_size % format_alignment != 0 || geometry.table_size % format_alignment != 0) {
+        geometry.table_count > max_table_count || geometry.alignment != format_alignment ||
+        geometry.manifest_size % format_alignment != 0 || geometry.wal_size % format_alignment != 0 ||
+        geometry.table_size % format_alignment != 0) {
         return false;
     }
 
@@ -399,11 +400,13 @@ bool on9kvdb_def::storage_geometry_equal(const storage_geometry &lhs, const stor
 
 bool on9kvdb_def::validate_logical_limits(const logical_limits &limits)
 {
+    const uint32_t maximum_entry_size = static_cast<uint32_t>(table_entry_header_size + 2U * max_name_len + max_value_len);
     return limits.wal_frame_bytes == wal_frame_size && limits.max_namespaces > 0 && limits.max_namespaces <= UINT16_MAX &&
            limits.max_open_handles > 0 && limits.max_open_handles <= UINT16_MAX && limits.memtable_entries >= 16 &&
            (limits.memtable_entries & (limits.memtable_entries - 1U)) == 0 && limits.memtable_data_bytes >= max_value_len &&
            limits.max_transaction_mutations > 0 && limits.max_transaction_mutations <= max_transaction_mutations &&
-           limits.transaction_staging_bytes >= max_value_len;
+           limits.transaction_staging_bytes >= max_value_len && limits.sstable_block_bytes % format_alignment == 0 &&
+           limits.sstable_block_bytes > table_block_header_size + maximum_entry_size;
 }
 
 bool on9kvdb_def::logical_limits_equal(const logical_limits &lhs, const logical_limits &rhs)
@@ -411,17 +414,197 @@ bool on9kvdb_def::logical_limits_equal(const logical_limits &lhs, const logical_
     return lhs.wal_frame_bytes == rhs.wal_frame_bytes && lhs.max_namespaces == rhs.max_namespaces &&
            lhs.max_open_handles == rhs.max_open_handles && lhs.memtable_entries == rhs.memtable_entries &&
            lhs.memtable_data_bytes == rhs.memtable_data_bytes && lhs.max_transaction_mutations == rhs.max_transaction_mutations &&
-           lhs.transaction_staging_bytes == rhs.transaction_staging_bytes;
+           lhs.transaction_staging_bytes == rhs.transaction_staging_bytes && lhs.sstable_block_bytes == rhs.sstable_block_bytes;
+}
+
+bool on9kvdb_def::composite_key_equal(const composite_key &lhs, const composite_key &rhs)
+{
+    return lhs.namespace_size == rhs.namespace_size && lhs.key_size == rhs.key_size &&
+           memcmp(lhs.namespace_name, rhs.namespace_name, lhs.namespace_size) == 0 && memcmp(lhs.key, rhs.key, lhs.key_size) == 0;
+}
+
+int on9kvdb_def::compare_composite_key(const composite_key &lhs, const composite_key &rhs)
+{
+    const size_t namespace_common = lhs.namespace_size < rhs.namespace_size ? lhs.namespace_size : rhs.namespace_size;
+    const int namespace_comparison = memcmp(lhs.namespace_name, rhs.namespace_name, namespace_common);
+    if (namespace_comparison != 0) {
+        return namespace_comparison;
+    }
+    if (lhs.namespace_size != rhs.namespace_size) {
+        return lhs.namespace_size < rhs.namespace_size ? -1 : 1;
+    }
+
+    const size_t key_common = lhs.key_size < rhs.key_size ? lhs.key_size : rhs.key_size;
+    const int key_comparison = memcmp(lhs.key, rhs.key, key_common);
+    if (key_comparison != 0) {
+        return key_comparison;
+    }
+    if (lhs.key_size != rhs.key_size) {
+        return lhs.key_size < rhs.key_size ? -1 : 1;
+    }
+    return 0;
+}
+
+bool on9kvdb_def::table_reference_equal(const table_reference &lhs, const table_reference &rhs)
+{
+    if (lhs.active != rhs.active) {
+        return false;
+    }
+    if (!lhs.active) {
+        return true;
+    }
+    return lhs.level == rhs.level && lhs.slot == rhs.slot && lhs.data_block_count == rhs.data_block_count &&
+           lhs.generation == rhs.generation && lhs.min_sequence == rhs.min_sequence && lhs.max_sequence == rhs.max_sequence &&
+           lhs.entry_count == rhs.entry_count && lhs.data_bytes == rhs.data_bytes &&
+           lhs.content_checksum == rhs.content_checksum && composite_key_equal(lhs.min_key, rhs.min_key) &&
+           composite_key_equal(lhs.max_key, rhs.max_key);
+}
+
+namespace
+{
+    bool valid_composite_key(const on9kvdb_def::composite_key &key)
+    {
+        return key.namespace_size > 0 && key.namespace_size <= on9kvdb_def::max_name_len && key.key_size > 0 &&
+               key.key_size <= on9kvdb_def::max_name_len && key.namespace_name[key.namespace_size] == '\0' &&
+               key.key[key.key_size] == '\0' && on9kvdb_def::validate_name(key.namespace_name) &&
+               on9kvdb_def::validate_name(key.key);
+    }
+
+    bool valid_table_reference(const on9kvdb_def::table_reference &reference, uint32_t expected_slot,
+                               uint64_t safe_checkpoint_sequence)
+    {
+        return reference.active && reference.level == 0 && reference.slot == expected_slot && reference.generation > 0 &&
+               reference.min_sequence > 0 && reference.max_sequence >= reference.min_sequence &&
+               reference.max_sequence <= safe_checkpoint_sequence && reference.entry_count > 0 &&
+               reference.data_block_count > 0 && reference.data_block_count <= reference.entry_count &&
+               reference.data_bytes > 0 && valid_composite_key(reference.min_key) && valid_composite_key(reference.max_key) &&
+               on9kvdb_def::compare_composite_key(reference.min_key, reference.max_key) <= 0;
+    }
+
+    bool encode_manifest_table_reference(uint8_t *buf, size_t buf_len, size_t offset,
+                                         const on9kvdb_def::table_reference &reference)
+    {
+        if (!reference.active) {
+            return true;
+        }
+        if (!on9kvdb_def::write_u32_le(buf, buf_len, offset + 8, reference.slot) ||
+            !on9kvdb_def::write_u32_le(buf, buf_len, offset + 12, reference.data_block_count) ||
+            !on9kvdb_def::write_u64_le(buf, buf_len, offset + 16, reference.generation) ||
+            !on9kvdb_def::write_u64_le(buf, buf_len, offset + 24, reference.min_sequence) ||
+            !on9kvdb_def::write_u64_le(buf, buf_len, offset + 32, reference.max_sequence) ||
+            !on9kvdb_def::write_u32_le(buf, buf_len, offset + 40, reference.entry_count) ||
+            !on9kvdb_def::write_u32_le(buf, buf_len, offset + 44, reference.data_bytes) ||
+            !on9kvdb_def::write_u32_le(buf, buf_len, offset + 48, reference.content_checksum)) {
+            return false;
+        }
+        buf[offset] = on9kvdb_def::table_reference_flag_active;
+        buf[offset + 1] = reference.level;
+        buf[offset + 2] = reference.min_key.namespace_size;
+        buf[offset + 3] = reference.min_key.key_size;
+        buf[offset + 4] = reference.max_key.namespace_size;
+        buf[offset + 5] = reference.max_key.key_size;
+        memcpy(buf + offset + 56, reference.min_key.namespace_name, reference.min_key.namespace_size);
+        memcpy(buf + offset + 88, reference.min_key.key, reference.min_key.key_size);
+        memcpy(buf + offset + 120, reference.max_key.namespace_name, reference.max_key.namespace_size);
+        memcpy(buf + offset + 152, reference.max_key.key, reference.max_key.key_size);
+        return true;
+    }
+
+    on9kvdb_def::format_status decode_manifest_table_reference(const uint8_t *buf, size_t buf_len, size_t offset,
+                                                               on9kvdb_def::table_reference *reference_out)
+    {
+        if (!is_range_valid(buf_len, offset, on9kvdb_def::manifest_table_reference_size) || reference_out == nullptr) {
+            return on9kvdb_def::format_status::invalid_size;
+        }
+        if (is_zero_range(buf, offset, on9kvdb_def::manifest_table_reference_size)) {
+            *reference_out = {};
+            return on9kvdb_def::format_status::ok;
+        }
+        if (buf[offset] != on9kvdb_def::table_reference_flag_active || buf[offset + 1] != 0 ||
+            (buf[offset] & ~on9kvdb_def::table_reference_flag_active) != 0 || buf[offset + 2] == 0 ||
+            buf[offset + 2] > on9kvdb_def::max_name_len || buf[offset + 3] == 0 || buf[offset + 3] > on9kvdb_def::max_name_len ||
+            buf[offset + 4] == 0 || buf[offset + 4] > on9kvdb_def::max_name_len || buf[offset + 5] == 0 ||
+            buf[offset + 5] > on9kvdb_def::max_name_len || !is_zero_range(buf, offset + 6, 2) ||
+            !is_zero_range(buf, offset + 52, 4)) {
+            return on9kvdb_def::format_status::corrupt;
+        }
+
+        on9kvdb_def::table_reference reference = {};
+        reference.active = true;
+        reference.level = buf[offset + 1];
+        reference.min_key.namespace_size = buf[offset + 2];
+        reference.min_key.key_size = buf[offset + 3];
+        reference.max_key.namespace_size = buf[offset + 4];
+        reference.max_key.key_size = buf[offset + 5];
+        if (!on9kvdb_def::read_u32_le(buf, buf_len, offset + 8, &reference.slot) ||
+            !on9kvdb_def::read_u32_le(buf, buf_len, offset + 12, &reference.data_block_count) ||
+            !on9kvdb_def::read_u64_le(buf, buf_len, offset + 16, &reference.generation) ||
+            !on9kvdb_def::read_u64_le(buf, buf_len, offset + 24, &reference.min_sequence) ||
+            !on9kvdb_def::read_u64_le(buf, buf_len, offset + 32, &reference.max_sequence) ||
+            !on9kvdb_def::read_u32_le(buf, buf_len, offset + 40, &reference.entry_count) ||
+            !on9kvdb_def::read_u32_le(buf, buf_len, offset + 44, &reference.data_bytes) ||
+            !on9kvdb_def::read_u32_le(buf, buf_len, offset + 48, &reference.content_checksum)) {
+            return on9kvdb_def::format_status::invalid_size;
+        }
+        memcpy(reference.min_key.namespace_name, buf + offset + 56, reference.min_key.namespace_size);
+        memcpy(reference.min_key.key, buf + offset + 88, reference.min_key.key_size);
+        memcpy(reference.max_key.namespace_name, buf + offset + 120, reference.max_key.namespace_size);
+        memcpy(reference.max_key.key, buf + offset + 152, reference.max_key.key_size);
+        reference.min_key.namespace_name[reference.min_key.namespace_size] = '\0';
+        reference.min_key.key[reference.min_key.key_size] = '\0';
+        reference.max_key.namespace_name[reference.max_key.namespace_size] = '\0';
+        reference.max_key.key[reference.max_key.key_size] = '\0';
+        if (!is_zero_range(buf, offset + 56 + reference.min_key.namespace_size,
+                           on9kvdb_def::max_name_len - reference.min_key.namespace_size) ||
+            !is_zero_range(buf, offset + 88 + reference.min_key.key_size,
+                           on9kvdb_def::max_name_len - reference.min_key.key_size) ||
+            !is_zero_range(buf, offset + 120 + reference.max_key.namespace_size,
+                           on9kvdb_def::max_name_len - reference.max_key.namespace_size) ||
+            !is_zero_range(buf, offset + 152 + reference.max_key.key_size,
+                           on9kvdb_def::max_name_len - reference.max_key.key_size)) {
+            return on9kvdb_def::format_status::corrupt;
+        }
+        *reference_out = reference;
+        return on9kvdb_def::format_status::ok;
+    }
 }
 
 bool on9kvdb_def::encode_manifest_record(uint8_t *buf, size_t buf_len, const manifest_record &record)
 {
+    uint32_t active_table_count = 0;
+    uint64_t greatest_table_generation = 0;
+    uint64_t greatest_table_sequence = 0;
+    bool table_references_valid = record.geometry.table_count <= max_table_count;
+    const uint32_t configured_table_mask =
+        record.geometry.table_count <= max_table_count ? (UINT32_C(1) << record.geometry.table_count) - 1U : 0;
+    for (uint32_t slot = 0; table_references_valid && slot < max_table_count; slot += 1) {
+        const table_reference &reference = record.tables[slot];
+        if (!reference.active) {
+            continue;
+        }
+        if (slot >= record.geometry.table_count || (record.consumed_table_mask & (UINT32_C(1) << slot)) == 0 ||
+            !valid_table_reference(reference, slot, record.safe_checkpoint_sequence)) {
+            table_references_valid = false;
+            break;
+        }
+        active_table_count += 1;
+        if (reference.generation > greatest_table_generation) {
+            greatest_table_generation = reference.generation;
+        }
+        if (reference.max_sequence > greatest_table_sequence) {
+            greatest_table_sequence = reference.max_sequence;
+        }
+    }
+
     if (buf == nullptr || buf_len < manifest_record_size || record.generation == 0 || record.database_id == 0 ||
         (record.state != manifest_state_provisioning_owned && record.state != manifest_state_ready) ||
         !validate_storage_geometry(record.geometry) || !validate_logical_limits(record.limits) ||
-        record.active_wal_slot >= wal_file_count ||
+        record.active_wal_slot >= wal_file_count || record.next_table_generation == 0 || !table_references_valid ||
+        (record.consumed_table_mask & ~configured_table_mask) != 0 || greatest_table_generation >= record.next_table_generation ||
+        greatest_table_sequence != record.safe_checkpoint_sequence ||
         (record.state == manifest_state_provisioning_owned &&
-         (record.wal_generation[0] != 0 || record.wal_generation[1] != 0 || record.safe_checkpoint_sequence != 0)) ||
+         (record.wal_generation[0] != 0 || record.wal_generation[1] != 0 || record.safe_checkpoint_sequence != 0 ||
+          active_table_count != 0 || record.next_table_generation != 1 || record.consumed_table_mask != 0)) ||
         (record.state == manifest_state_ready &&
          (record.wal_generation[0] == 0 || record.wal_generation[record.active_wal_slot] == 0))) {
         return false;
@@ -446,10 +629,19 @@ bool on9kvdb_def::encode_manifest_record(uint8_t *buf, size_t buf_len, const man
         !write_u32_le(buf, buf_len, 100, record.limits.memtable_data_bytes) ||
         !write_u32_le(buf, buf_len, 104, record.limits.max_transaction_mutations) ||
         !write_u32_le(buf, buf_len, 108, record.limits.transaction_staging_bytes) ||
-        !write_u32_le(buf, buf_len, 112, record.active_wal_slot) || !write_u64_le(buf, buf_len, 120, record.wal_generation[0]) ||
+        !write_u32_le(buf, buf_len, 112, record.limits.sstable_block_bytes) ||
+        !write_u32_le(buf, buf_len, 116, record.active_wal_slot) || !write_u64_le(buf, buf_len, 120, record.wal_generation[0]) ||
         !write_u64_le(buf, buf_len, 128, record.wal_generation[1]) ||
-        !write_u64_le(buf, buf_len, 136, record.safe_checkpoint_sequence)) {
+        !write_u64_le(buf, buf_len, 136, record.safe_checkpoint_sequence) ||
+        !write_u64_le(buf, buf_len, 144, record.next_table_generation) || !write_u32_le(buf, buf_len, 152, active_table_count) ||
+        !write_u32_le(buf, buf_len, 156, record.consumed_table_mask)) {
         return false;
+    }
+    for (uint32_t slot = 0; slot < max_table_count; slot += 1) {
+        const size_t offset = manifest_table_reference_offset + static_cast<size_t>(slot) * manifest_table_reference_size;
+        if (!encode_manifest_table_reference(buf, buf_len, offset, record.tables[slot])) {
+            return false;
+        }
     }
 
     const uint32_t checksum = calc_record_crc(buf, manifest_record_size, manifest_record_checksum_offset);
@@ -477,6 +669,7 @@ on9kvdb_def::format_status on9kvdb_def::decode_manifest_record(const uint8_t *bu
     manifest_record record = {};
     uint16_t geometry_format = 0;
     uint16_t limits_format = 0;
+    uint32_t encoded_active_table_count = 0;
     uint32_t checksum = 0;
     const bool decoded =
         read_u64_le(buf, buf_len, 28, &record.database_id) && read_u16_le(buf, buf_len, 36, &record.state) &&
@@ -494,22 +687,59 @@ on9kvdb_def::format_status on9kvdb_def::decode_manifest_record(const uint8_t *bu
         read_u32_le(buf, buf_len, 100, &record.limits.memtable_data_bytes) &&
         read_u32_le(buf, buf_len, 104, &record.limits.max_transaction_mutations) &&
         read_u32_le(buf, buf_len, 108, &record.limits.transaction_staging_bytes) &&
-        read_u32_le(buf, buf_len, 112, &record.active_wal_slot) && read_u64_le(buf, buf_len, 120, &record.wal_generation[0]) &&
+        read_u32_le(buf, buf_len, 112, &record.limits.sstable_block_bytes) &&
+        read_u32_le(buf, buf_len, 116, &record.active_wal_slot) && read_u64_le(buf, buf_len, 120, &record.wal_generation[0]) &&
         read_u64_le(buf, buf_len, 128, &record.wal_generation[1]) &&
         read_u64_le(buf, buf_len, 136, &record.safe_checkpoint_sequence) &&
+        read_u64_le(buf, buf_len, 144, &record.next_table_generation) &&
+        read_u32_le(buf, buf_len, 152, &encoded_active_table_count) &&
+        read_u32_le(buf, buf_len, 156, &record.consumed_table_mask) &&
         read_u32_le(buf, buf_len, manifest_record_checksum_offset, &checksum);
     if (!decoded) {
         return format_status::invalid_size;
     }
 
+    uint32_t active_table_count = 0;
+    uint64_t greatest_table_generation = 0;
+    uint64_t greatest_table_sequence = 0;
+    for (uint32_t slot = 0; slot < max_table_count; slot += 1) {
+        const size_t offset = manifest_table_reference_offset + static_cast<size_t>(slot) * manifest_table_reference_size;
+        const format_status status = decode_manifest_table_reference(buf, buf_len, offset, &record.tables[slot]);
+        if (status != format_status::ok) {
+            return status;
+        }
+        if (!record.tables[slot].active) {
+            continue;
+        }
+        if (slot >= record.geometry.table_count || (record.consumed_table_mask & (UINT32_C(1) << slot)) == 0 ||
+            !valid_table_reference(record.tables[slot], slot, record.safe_checkpoint_sequence)) {
+            return format_status::corrupt;
+        }
+        active_table_count += 1;
+        if (record.tables[slot].generation > greatest_table_generation) {
+            greatest_table_generation = record.tables[slot].generation;
+        }
+        if (record.tables[slot].max_sequence > greatest_table_sequence) {
+            greatest_table_sequence = record.tables[slot].max_sequence;
+        }
+    }
+
     record.generation = prefix.generation;
+    const uint32_t configured_table_mask =
+        record.geometry.table_count <= max_table_count ? (UINT32_C(1) << record.geometry.table_count) - 1U : 0;
     if (record.database_id == 0 || (record.state != manifest_state_provisioning_owned && record.state != manifest_state_ready) ||
         (record.state == manifest_state_ready && record.generation < 3) || geometry_format != geometry_revision ||
-        limits_format != logical_limits_revision || !is_zero_range(buf, 82, 2) || !is_zero_range(buf, 116, 4) ||
-        !is_zero_range(buf, 144, 12) || !validate_storage_geometry(record.geometry) || !validate_logical_limits(record.limits) ||
-        record.active_wal_slot >= wal_file_count ||
+        limits_format != logical_limits_revision || !is_zero_range(buf, 82, 2) ||
+        !is_zero_range(buf, manifest_table_reference_offset + max_table_count * manifest_table_reference_size,
+                       manifest_record_checksum_offset -
+                           (manifest_table_reference_offset + max_table_count * manifest_table_reference_size)) ||
+        !validate_storage_geometry(record.geometry) || !validate_logical_limits(record.limits) ||
+        record.active_wal_slot >= wal_file_count || record.next_table_generation == 0 ||
+        (record.consumed_table_mask & ~configured_table_mask) != 0 || active_table_count != encoded_active_table_count ||
+        greatest_table_generation >= record.next_table_generation || greatest_table_sequence != record.safe_checkpoint_sequence ||
         (record.state == manifest_state_provisioning_owned &&
-         (record.wal_generation[0] != 0 || record.wal_generation[1] != 0 || record.safe_checkpoint_sequence != 0)) ||
+         (record.wal_generation[0] != 0 || record.wal_generation[1] != 0 || record.safe_checkpoint_sequence != 0 ||
+          active_table_count != 0 || record.next_table_generation != 1 || record.consumed_table_mask != 0)) ||
         (record.state == manifest_state_ready &&
          (record.wal_generation[0] == 0 || record.wal_generation[record.active_wal_slot] == 0))) {
         return format_status::corrupt;
@@ -772,5 +1002,426 @@ on9kvdb_def::format_status on9kvdb_def::decode_wal_frame(const uint8_t *frame, s
 
     *header_out = header;
     *payload_out = payload;
+    return format_status::ok;
+}
+
+namespace
+{
+    bool valid_name_bytes(const uint8_t *name, uint8_t size)
+    {
+        if (name == nullptr || size == 0 || size > on9kvdb_def::max_name_len) {
+            return false;
+        }
+        for (uint8_t idx = 0; idx < size; idx += 1) {
+            if (name[idx] == 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool valid_table_metadata(const on9kvdb_def::table_metadata &metadata)
+    {
+        return metadata.database_id != 0 && metadata.generation != 0 && metadata.min_sequence != 0 &&
+               metadata.max_sequence >= metadata.min_sequence && metadata.slot < on9kvdb_def::max_table_count &&
+               metadata.level == 0 && metadata.block_size > on9kvdb_def::table_block_header_size &&
+               metadata.block_size % on9kvdb_def::format_alignment == 0 &&
+               metadata.data_region_start == on9kvdb_def::table_data_region_offset && metadata.data_block_count > 0 &&
+               metadata.index_offset >= metadata.data_region_start + metadata.data_block_count * metadata.block_size &&
+               (metadata.index_offset - metadata.data_region_start) % metadata.block_size == 0 &&
+               metadata.footer_offset == metadata.index_offset + metadata.block_size &&
+               metadata.footer_offset % on9kvdb_def::format_alignment == 0 && metadata.entry_count > 0 &&
+               metadata.data_block_count <= metadata.entry_count && metadata.data_bytes > 0 &&
+               valid_composite_key(metadata.min_key) && valid_composite_key(metadata.max_key) &&
+               on9kvdb_def::compare_composite_key(metadata.min_key, metadata.max_key) <= 0;
+    }
+
+    uint32_t revision_for_table_metadata_magic(uint32_t magic)
+    {
+        if (magic == on9kvdb_def::table_header_magic) {
+            return on9kvdb_def::table_header_revision;
+        }
+        if (magic == on9kvdb_def::table_footer_magic) {
+            return on9kvdb_def::table_footer_revision;
+        }
+        return 0;
+    }
+
+    uint32_t align_up_u32(uint32_t value, uint32_t alignment)
+    {
+        return (value + alignment - 1U) & ~(alignment - 1U);
+    }
+}
+
+bool on9kvdb_def::encode_table_metadata(uint8_t *buf, size_t buf_len, uint32_t magic, const table_metadata &metadata)
+{
+    const uint32_t revision = revision_for_table_metadata_magic(magic);
+    if (buf == nullptr || buf_len < table_metadata_size || revision == 0 || !valid_table_metadata(metadata)) {
+        return false;
+    }
+
+    memset(buf, 0, table_metadata_size);
+    if (!write_u32_le(buf, buf_len, 0, magic) || !write_u16_le(buf, buf_len, 4, static_cast<uint16_t>(revision)) ||
+        !write_u16_le(buf, buf_len, 6, static_cast<uint16_t>(table_metadata_size)) ||
+        !write_u64_le(buf, buf_len, 8, metadata.database_id) || !write_u64_le(buf, buf_len, 16, metadata.generation) ||
+        !write_u32_le(buf, buf_len, 24, metadata.slot) || !write_u16_le(buf, buf_len, 28, metadata.level) ||
+        !write_u32_le(buf, buf_len, 32, metadata.block_size) || !write_u32_le(buf, buf_len, 36, metadata.data_region_start) ||
+        !write_u32_le(buf, buf_len, 40, metadata.data_block_count) || !write_u32_le(buf, buf_len, 44, metadata.index_offset) ||
+        !write_u32_le(buf, buf_len, 48, metadata.footer_offset) || !write_u32_le(buf, buf_len, 52, metadata.entry_count) ||
+        !write_u32_le(buf, buf_len, 56, metadata.data_bytes) || !write_u32_le(buf, buf_len, 60, metadata.content_checksum) ||
+        !write_u64_le(buf, buf_len, 64, metadata.min_sequence) || !write_u64_le(buf, buf_len, 72, metadata.max_sequence)) {
+        return false;
+    }
+    buf[80] = metadata.min_key.namespace_size;
+    buf[81] = metadata.min_key.key_size;
+    buf[82] = metadata.max_key.namespace_size;
+    buf[83] = metadata.max_key.key_size;
+    memcpy(buf + 88, metadata.min_key.namespace_name, metadata.min_key.namespace_size);
+    memcpy(buf + 120, metadata.min_key.key, metadata.min_key.key_size);
+    memcpy(buf + 152, metadata.max_key.namespace_name, metadata.max_key.namespace_size);
+    memcpy(buf + 184, metadata.max_key.key, metadata.max_key.key_size);
+    const uint32_t checksum = calc_record_crc(buf, table_metadata_size, table_metadata_checksum_offset);
+    return write_u32_le(buf, buf_len, table_metadata_checksum_offset, checksum);
+}
+
+on9kvdb_def::format_status on9kvdb_def::decode_table_metadata(const uint8_t *buf, size_t buf_len, uint32_t expected_magic,
+                                                              table_metadata *metadata_out)
+{
+    const uint32_t expected_revision = revision_for_table_metadata_magic(expected_magic);
+    if (buf == nullptr || metadata_out == nullptr || expected_revision == 0) {
+        return format_status::invalid_argument;
+    }
+    if (buf_len < table_metadata_size) {
+        return format_status::invalid_size;
+    }
+
+    uint32_t magic = 0;
+    uint16_t revision = 0;
+    uint16_t size = 0;
+    uint16_t level = 0;
+    uint32_t checksum = 0;
+    table_metadata metadata = {};
+    const bool decoded =
+        read_u32_le(buf, buf_len, 0, &magic) && read_u16_le(buf, buf_len, 4, &revision) && read_u16_le(buf, buf_len, 6, &size) &&
+        read_u64_le(buf, buf_len, 8, &metadata.database_id) && read_u64_le(buf, buf_len, 16, &metadata.generation) &&
+        read_u32_le(buf, buf_len, 24, &metadata.slot) && read_u16_le(buf, buf_len, 28, &level) &&
+        read_u32_le(buf, buf_len, 32, &metadata.block_size) && read_u32_le(buf, buf_len, 36, &metadata.data_region_start) &&
+        read_u32_le(buf, buf_len, 40, &metadata.data_block_count) && read_u32_le(buf, buf_len, 44, &metadata.index_offset) &&
+        read_u32_le(buf, buf_len, 48, &metadata.footer_offset) && read_u32_le(buf, buf_len, 52, &metadata.entry_count) &&
+        read_u32_le(buf, buf_len, 56, &metadata.data_bytes) && read_u32_le(buf, buf_len, 60, &metadata.content_checksum) &&
+        read_u64_le(buf, buf_len, 64, &metadata.min_sequence) && read_u64_le(buf, buf_len, 72, &metadata.max_sequence) &&
+        read_u32_le(buf, buf_len, table_metadata_checksum_offset, &checksum);
+    if (!decoded) {
+        return format_status::invalid_size;
+    }
+    if (magic != expected_magic) {
+        return format_status::invalid_magic;
+    }
+    if (revision > expected_revision) {
+        return format_status::new_version;
+    }
+    if (revision != expected_revision) {
+        return format_status::invalid_revision;
+    }
+    if (size != table_metadata_size) {
+        return format_status::invalid_size;
+    }
+
+    metadata.level = static_cast<uint8_t>(level);
+    metadata.min_key.namespace_size = buf[80];
+    metadata.min_key.key_size = buf[81];
+    metadata.max_key.namespace_size = buf[82];
+    metadata.max_key.key_size = buf[83];
+    if (level > UINT8_MAX || metadata.min_key.namespace_size == 0 || metadata.min_key.namespace_size > max_name_len ||
+        metadata.min_key.key_size == 0 || metadata.min_key.key_size > max_name_len || metadata.max_key.namespace_size == 0 ||
+        metadata.max_key.namespace_size > max_name_len || metadata.max_key.key_size == 0 ||
+        metadata.max_key.key_size > max_name_len || !is_zero_range(buf, 30, 2) || !is_zero_range(buf, 84, 4) ||
+        !is_zero_range(buf, 216, 36)) {
+        return format_status::corrupt;
+    }
+    memcpy(metadata.min_key.namespace_name, buf + 88, metadata.min_key.namespace_size);
+    memcpy(metadata.min_key.key, buf + 120, metadata.min_key.key_size);
+    memcpy(metadata.max_key.namespace_name, buf + 152, metadata.max_key.namespace_size);
+    memcpy(metadata.max_key.key, buf + 184, metadata.max_key.key_size);
+    metadata.min_key.namespace_name[metadata.min_key.namespace_size] = '\0';
+    metadata.min_key.key[metadata.min_key.key_size] = '\0';
+    metadata.max_key.namespace_name[metadata.max_key.namespace_size] = '\0';
+    metadata.max_key.key[metadata.max_key.key_size] = '\0';
+    if (!is_zero_range(buf, 88 + metadata.min_key.namespace_size, max_name_len - metadata.min_key.namespace_size) ||
+        !is_zero_range(buf, 120 + metadata.min_key.key_size, max_name_len - metadata.min_key.key_size) ||
+        !is_zero_range(buf, 152 + metadata.max_key.namespace_size, max_name_len - metadata.max_key.namespace_size) ||
+        !is_zero_range(buf, 184 + metadata.max_key.key_size, max_name_len - metadata.max_key.key_size) ||
+        !valid_table_metadata(metadata) ||
+        checksum != calc_record_crc(buf, table_metadata_size, table_metadata_checksum_offset)) {
+        return format_status::corrupt;
+    }
+
+    *metadata_out = metadata;
+    return format_status::ok;
+}
+
+bool on9kvdb_def::table_metadata_equal(const table_metadata &lhs, const table_metadata &rhs)
+{
+    return lhs.database_id == rhs.database_id && lhs.generation == rhs.generation && lhs.min_sequence == rhs.min_sequence &&
+           lhs.max_sequence == rhs.max_sequence && lhs.slot == rhs.slot && lhs.block_size == rhs.block_size &&
+           lhs.data_region_start == rhs.data_region_start && lhs.data_block_count == rhs.data_block_count &&
+           lhs.index_offset == rhs.index_offset && lhs.footer_offset == rhs.footer_offset && lhs.entry_count == rhs.entry_count &&
+           lhs.data_bytes == rhs.data_bytes && lhs.content_checksum == rhs.content_checksum && lhs.level == rhs.level &&
+           composite_key_equal(lhs.min_key, rhs.min_key) && composite_key_equal(lhs.max_key, rhs.max_key);
+}
+
+bool on9kvdb_def::encode_table_block_header(uint8_t *block, size_t block_len, const table_block_header &header)
+{
+    if (block == nullptr || block_len < table_block_header_size || header.generation == 0 || header.entry_count == 0 ||
+        header.payload_size == 0 || header.payload_size > block_len - table_block_header_size) {
+        return false;
+    }
+    memset(block, 0, table_block_header_size);
+    if (!write_u32_le(block, block_len, 0, table_block_magic) || !write_u16_le(block, block_len, 4, table_block_revision) ||
+        !write_u16_le(block, block_len, 6, static_cast<uint16_t>(table_block_header_size)) ||
+        !write_u64_le(block, block_len, 8, header.generation) || !write_u32_le(block, block_len, 16, header.block_index) ||
+        !write_u16_le(block, block_len, 20, header.entry_count) || !write_u32_le(block, block_len, 24, header.payload_size)) {
+        return false;
+    }
+    const uint32_t checksum = calc_record_crc(block, block_len, table_block_checksum_offset);
+    return write_u32_le(block, block_len, table_block_checksum_offset, checksum);
+}
+
+on9kvdb_def::format_status on9kvdb_def::decode_table_block_header(const uint8_t *block, size_t block_len,
+                                                                  table_block_header *header_out)
+{
+    if (block == nullptr || header_out == nullptr) {
+        return format_status::invalid_argument;
+    }
+    if (block_len < table_block_header_size) {
+        return format_status::invalid_size;
+    }
+    uint32_t magic = 0;
+    uint16_t revision = 0;
+    uint16_t size = 0;
+    uint16_t reserved = 0;
+    uint32_t checksum = 0;
+    table_block_header header = {};
+    const bool decoded = read_u32_le(block, block_len, 0, &magic) && read_u16_le(block, block_len, 4, &revision) &&
+                         read_u16_le(block, block_len, 6, &size) && read_u64_le(block, block_len, 8, &header.generation) &&
+                         read_u32_le(block, block_len, 16, &header.block_index) &&
+                         read_u16_le(block, block_len, 20, &header.entry_count) && read_u16_le(block, block_len, 22, &reserved) &&
+                         read_u32_le(block, block_len, 24, &header.payload_size) &&
+                         read_u32_le(block, block_len, table_block_checksum_offset, &checksum);
+    if (!decoded) {
+        return format_status::invalid_size;
+    }
+    if (magic != table_block_magic) {
+        return format_status::invalid_magic;
+    }
+    if (revision > table_block_revision) {
+        return format_status::new_version;
+    }
+    if (revision != table_block_revision) {
+        return format_status::invalid_revision;
+    }
+    if (size != table_block_header_size || header.payload_size > block_len - table_block_header_size) {
+        return format_status::invalid_size;
+    }
+    if (header.generation == 0 || header.entry_count == 0 || header.payload_size == 0 || reserved != 0 ||
+        !is_zero_range(block, 28, 32) ||
+        !is_zero_range(block, table_block_header_size + header.payload_size,
+                       block_len - table_block_header_size - header.payload_size) ||
+        checksum != calc_record_crc(block, block_len, table_block_checksum_offset)) {
+        return format_status::corrupt;
+    }
+    *header_out = header;
+    return format_status::ok;
+}
+
+bool on9kvdb_def::encode_table_index_header(uint8_t *block, size_t block_len, const table_index_header &header)
+{
+    if (block == nullptr || block_len < table_index_header_size || header.generation == 0 || header.entry_count == 0 ||
+        header.payload_size == 0 || header.payload_size > block_len - table_index_header_size || header.data_block_count == 0 ||
+        header.entry_count != header.data_block_count) {
+        return false;
+    }
+    memset(block, 0, table_index_header_size);
+    if (!write_u32_le(block, block_len, 0, table_index_magic) || !write_u16_le(block, block_len, 4, table_index_revision) ||
+        !write_u16_le(block, block_len, 6, static_cast<uint16_t>(table_index_header_size)) ||
+        !write_u64_le(block, block_len, 8, header.generation) || !write_u32_le(block, block_len, 16, header.entry_count) ||
+        !write_u32_le(block, block_len, 20, header.payload_size) ||
+        !write_u32_le(block, block_len, 24, header.data_block_count)) {
+        return false;
+    }
+    const uint32_t checksum = calc_record_crc(block, block_len, table_index_checksum_offset);
+    return write_u32_le(block, block_len, table_index_checksum_offset, checksum);
+}
+
+on9kvdb_def::format_status on9kvdb_def::decode_table_index_header(const uint8_t *block, size_t block_len,
+                                                                  table_index_header *header_out)
+{
+    if (block == nullptr || header_out == nullptr) {
+        return format_status::invalid_argument;
+    }
+    if (block_len < table_index_header_size) {
+        return format_status::invalid_size;
+    }
+    uint32_t magic = 0;
+    uint16_t revision = 0;
+    uint16_t size = 0;
+    uint32_t checksum = 0;
+    table_index_header header = {};
+    const bool decoded = read_u32_le(block, block_len, 0, &magic) && read_u16_le(block, block_len, 4, &revision) &&
+                         read_u16_le(block, block_len, 6, &size) && read_u64_le(block, block_len, 8, &header.generation) &&
+                         read_u32_le(block, block_len, 16, &header.entry_count) &&
+                         read_u32_le(block, block_len, 20, &header.payload_size) &&
+                         read_u32_le(block, block_len, 24, &header.data_block_count) &&
+                         read_u32_le(block, block_len, table_index_checksum_offset, &checksum);
+    if (!decoded) {
+        return format_status::invalid_size;
+    }
+    if (magic != table_index_magic) {
+        return format_status::invalid_magic;
+    }
+    if (revision > table_index_revision) {
+        return format_status::new_version;
+    }
+    if (revision != table_index_revision) {
+        return format_status::invalid_revision;
+    }
+    if (size != table_index_header_size || header.payload_size > block_len - table_index_header_size) {
+        return format_status::invalid_size;
+    }
+    if (header.generation == 0 || header.entry_count == 0 || header.payload_size == 0 || header.data_block_count == 0 ||
+        header.entry_count != header.data_block_count || !is_zero_range(block, 28, 32) ||
+        !is_zero_range(block, table_index_header_size + header.payload_size,
+                       block_len - table_index_header_size - header.payload_size) ||
+        checksum != calc_record_crc(block, block_len, table_index_checksum_offset)) {
+        return format_status::corrupt;
+    }
+    *header_out = header;
+    return format_status::ok;
+}
+
+bool on9kvdb_def::encode_table_entry(uint8_t *buf, size_t buf_len, size_t offset, const table_entry &entry, size_t *size_out)
+{
+    if (buf == nullptr || size_out == nullptr || entry.transaction_sequence == 0 ||
+        !valid_name_bytes(entry.namespace_name, entry.namespace_size) || !valid_name_bytes(entry.key, entry.key_size) ||
+        (entry.value == nullptr && entry.value_size != 0) || entry.value_size > max_value_len ||
+        (entry.flags & ~table_entry_flag_tombstone) != 0 ||
+        (((entry.flags & table_entry_flag_tombstone) != 0) && entry.value_size != 0)) {
+        return false;
+    }
+    const uint32_t meaningful_size = table_entry_header_size + entry.namespace_size + entry.key_size + entry.value_size;
+    const uint32_t total_size = align_up_u32(meaningful_size, 8);
+    if (!is_range_valid(buf_len, offset, total_size)) {
+        return false;
+    }
+    memset(buf + offset, 0, total_size);
+    if (!write_u32_le(buf, buf_len, offset, total_size) || !write_u32_le(buf, buf_len, offset + 4, entry.value_size) ||
+        !write_u64_le(buf, buf_len, offset + 8, entry.transaction_sequence)) {
+        return false;
+    }
+    buf[offset + 16] = entry.namespace_size;
+    buf[offset + 17] = entry.key_size;
+    buf[offset + 18] = entry.type;
+    buf[offset + 19] = entry.flags;
+    memcpy(buf + offset + table_entry_header_size, entry.namespace_name, entry.namespace_size);
+    memcpy(buf + offset + table_entry_header_size + entry.namespace_size, entry.key, entry.key_size);
+    if (entry.value_size > 0) {
+        memcpy(buf + offset + table_entry_header_size + entry.namespace_size + entry.key_size, entry.value, entry.value_size);
+    }
+    *size_out = total_size;
+    return true;
+}
+
+on9kvdb_def::format_status on9kvdb_def::decode_table_entry(const uint8_t *buf, size_t buf_len, size_t offset,
+                                                           table_entry *entry_out)
+{
+    if (buf == nullptr || entry_out == nullptr) {
+        return format_status::invalid_argument;
+    }
+    if (!is_range_valid(buf_len, offset, table_entry_header_size)) {
+        return format_status::invalid_size;
+    }
+    table_entry entry = {};
+    if (!read_u32_le(buf, buf_len, offset, &entry.total_size) || !read_u32_le(buf, buf_len, offset + 4, &entry.value_size) ||
+        !read_u64_le(buf, buf_len, offset + 8, &entry.transaction_sequence)) {
+        return format_status::invalid_size;
+    }
+    entry.namespace_size = buf[offset + 16];
+    entry.key_size = buf[offset + 17];
+    entry.type = buf[offset + 18];
+    entry.flags = buf[offset + 19];
+    const uint32_t meaningful_size = table_entry_header_size + entry.namespace_size + entry.key_size + entry.value_size;
+    if (entry.transaction_sequence == 0 || entry.total_size < meaningful_size || entry.total_size % 8 != 0 ||
+        !is_range_valid(buf_len, offset, entry.total_size) || entry.value_size > max_value_len ||
+        (entry.flags & ~table_entry_flag_tombstone) != 0 ||
+        (((entry.flags & table_entry_flag_tombstone) != 0) && entry.value_size != 0) || !is_zero_range(buf, offset + 20, 4)) {
+        return format_status::corrupt;
+    }
+    entry.namespace_name = buf + offset + table_entry_header_size;
+    entry.key = entry.namespace_name + entry.namespace_size;
+    entry.value = entry.key + entry.key_size;
+    if (!valid_name_bytes(entry.namespace_name, entry.namespace_size) || !valid_name_bytes(entry.key, entry.key_size) ||
+        !is_zero_range(buf, offset + meaningful_size, entry.total_size - meaningful_size)) {
+        return format_status::corrupt;
+    }
+    *entry_out = entry;
+    return format_status::ok;
+}
+
+bool on9kvdb_def::encode_table_index_entry(uint8_t *buf, size_t buf_len, size_t offset, const table_index_entry &entry,
+                                           size_t *size_out)
+{
+    if (buf == nullptr || size_out == nullptr || entry.first_sequence == 0 ||
+        !valid_name_bytes(entry.namespace_name, entry.namespace_size) || !valid_name_bytes(entry.key, entry.key_size) ||
+        entry.block_offset < table_data_region_offset || entry.block_offset % format_alignment != 0) {
+        return false;
+    }
+    const uint32_t meaningful_size = table_index_entry_header_size + entry.namespace_size + entry.key_size;
+    const uint32_t total_size = align_up_u32(meaningful_size, 4);
+    if (!is_range_valid(buf_len, offset, total_size) || total_size > UINT16_MAX) {
+        return false;
+    }
+    memset(buf + offset, 0, total_size);
+    if (!write_u16_le(buf, buf_len, offset, static_cast<uint16_t>(total_size)) ||
+        !write_u32_le(buf, buf_len, offset + 4, entry.block_offset) ||
+        !write_u64_le(buf, buf_len, offset + 8, entry.first_sequence)) {
+        return false;
+    }
+    buf[offset + 2] = entry.namespace_size;
+    buf[offset + 3] = entry.key_size;
+    memcpy(buf + offset + table_index_entry_header_size, entry.namespace_name, entry.namespace_size);
+    memcpy(buf + offset + table_index_entry_header_size + entry.namespace_size, entry.key, entry.key_size);
+    *size_out = total_size;
+    return true;
+}
+
+on9kvdb_def::format_status on9kvdb_def::decode_table_index_entry(const uint8_t *buf, size_t buf_len, size_t offset,
+                                                                 table_index_entry *entry_out)
+{
+    if (buf == nullptr || entry_out == nullptr) {
+        return format_status::invalid_argument;
+    }
+    if (!is_range_valid(buf_len, offset, table_index_entry_header_size)) {
+        return format_status::invalid_size;
+    }
+    table_index_entry entry = {};
+    if (!read_u16_le(buf, buf_len, offset, &entry.total_size) || !read_u32_le(buf, buf_len, offset + 4, &entry.block_offset) ||
+        !read_u64_le(buf, buf_len, offset + 8, &entry.first_sequence)) {
+        return format_status::invalid_size;
+    }
+    entry.namespace_size = buf[offset + 2];
+    entry.key_size = buf[offset + 3];
+    const uint32_t meaningful_size = table_index_entry_header_size + entry.namespace_size + entry.key_size;
+    if (entry.total_size < meaningful_size || entry.total_size % 4 != 0 || !is_range_valid(buf_len, offset, entry.total_size) ||
+        entry.first_sequence == 0 || entry.block_offset < table_data_region_offset ||
+        entry.block_offset % format_alignment != 0) {
+        return format_status::corrupt;
+    }
+    entry.namespace_name = buf + offset + table_index_entry_header_size;
+    entry.key = entry.namespace_name + entry.namespace_size;
+    if (!valid_name_bytes(entry.namespace_name, entry.namespace_size) || !valid_name_bytes(entry.key, entry.key_size) ||
+        !is_zero_range(buf, offset + meaningful_size, entry.total_size - meaningful_size)) {
+        return format_status::corrupt;
+    }
+    *entry_out = entry;
     return format_status::ok;
 }

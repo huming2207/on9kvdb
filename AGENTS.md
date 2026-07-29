@@ -6,9 +6,9 @@ This file is the design and implementation plan for `on9kvdb`. No storage
 format or public API described as **proposed** below is approved merely by
 appearing in this plan.
 
-Phase 1 through Phase 3 are implemented. Phase 3 is a bounded WAL-only
-milestone; do not treat the current component as a complete key-value database
-until WAL recycling is protected by Phase 4 SSTables.
+Phase 1 through Phase 4 are implemented. Phase 4 adds immutable level-0
+SSTables and durable WAL checkpoints, but remains deliberately capacity
+limited because table and WAL reuse require the Phase 5 compaction policy.
 
 The intended component is a fixed-capacity, namespaced key-value database for
 ESP32-class devices. It should expose an API similar to ESP-IDF NVS while using
@@ -147,6 +147,9 @@ Match `components/on9ringstore`:
 - format every changed C++ source/header with the component's `.clang-format`
   file before verification, and run its dry-run check so the 130-column rule
   remains enforced in future phases;
+- add concise comments for non-obvious durability ordering, recovery
+  invariants, bounded-memory algorithms, and format constraints; do not
+  narrate routine control flow or make the source harder to audit;
 - `esp_err_t` error propagation and checked early returns;
 - fixed-width integer types and explicit casts;
 - `static const constexpr` constants;
@@ -335,9 +338,9 @@ the database identity, WAL generation, transaction sequence, frame index/count,
 payload bounds, transaction checksum, and frame checksum.
 
 Phase 3 appends to WAL slot 0, then publishes WAL slot 1 through the manifest
-when the next transaction no longer fits slot 0. It does not recycle either
-slot. When both slots are full it returns `ESP_ERR_NO_MEM`. Phase 4 may add
-recycling only after its SSTable checkpoint protocol is proven.
+when the next transaction no longer fits slot 0. Phase 4 checkpoints the
+memtable before that transition but does not recycle either slot. When both
+slots are full it returns `ESP_ERR_NO_MEM`. Recycling remains Phase 5 work.
 
 ### SSTable slots
 
@@ -835,6 +838,57 @@ Reviewed and approved on 2026-07-29:
   generations, and safe checkpoint sequence. V1 requires an exact match with
   the firmware's Kconfig logical limits.
 
+### Phase 4 immutable SSTable decisions
+
+Approved on 2026-07-29:
+
+- Phase 4 uses foreground synchronous flushing. It does not add a background
+  worker or second immutable memtable. Correctness is preferred over an
+  unmeasured flush-latency target; hardware qualification must measure the
+  resulting tail latency before release.
+- SSTable logical blocks are configurable and persisted, with a 12288-byte
+  default. The block size is a multiple of the 4096-byte format alignment and
+  is large enough for one maximum-size value plus maximum namespace/key names
+  and entry metadata without record fragmentation.
+- The default 596 KiB table layout is exactly: 8 KiB permanent identity,
+  8 KiB redundant generation headers, 47 12-KiB data blocks, one 12-KiB sparse
+  index block, and one 4-KiB footer slot.
+- One flush creates one immutable level-0 table in an unreferenced physical
+  slot. Phase 4 never reuses a referenced or formerly referenced table slot
+  and never recycles a WAL slot; safe reuse remains Phase 5 work.
+- Before writing a table, Phase 4 durably reserves its physical slot and
+  logical generation in the manifest's monotonic consumed-slot mask. A second
+  manifest publication makes the validated table active. This reservation
+  remains consumed after a reset or failed publication, so fallback to the
+  preceding manifest generation cannot make a formerly attempted slot
+  reusable.
+- FatFs `f_expand()` does not initialize newly allocated data sectors.
+  Provisioning therefore writes and syncs zeroed table header/footer marker
+  slots explicitly; the implementation never assumes preallocated contents
+  are zero.
+- A flush sorts 32-bit memtable record offsets with a bounded in-place
+  heapsort. The default scratch partition is one data block, one index block,
+  and 512 sortable offsets. It uses no STL, recursion, lambda, or heap
+  allocation.
+- Data blocks, the sparse index, footer, and both table headers are
+  checksummed. The complete authoritative table is synced, read back, and
+  validated before a manifest generation may reference it.
+- The manifest remains the sole publication point. Its table references bind
+  physical slot, logical generation, level, sequence range, entry/block
+  counts, content checksum, and full minimum/maximum composite keys.
+- To fit full key ranges and bounded descriptors in one 4096-byte manifest
+  slot, v1 supports at most 16 configured SSTable slots. The default remains
+  six.
+- The checkpoint advances only after the new table reference is durable in the
+  manifest. Recovery validates referenced tables before replaying WAL
+  transactions newer than the safe checkpoint.
+- Phase 4 preserves all tombstones. Tombstone removal requires Phase 5
+  compaction proof that no older value can remain reachable.
+- No compression, Bloom filter, generic read cache, or public manual-flush API
+  is added in Phase 4. Commit flushes automatically when the current memtable
+  cannot accept the complete transaction or when transitioning to the second
+  WAL slot.
+
 ### Corruption, reset, and integration policy
 
 - Corruption handling is fail-closed. Do not start services that require stored
@@ -878,10 +932,9 @@ These items do not reopen Phase 1, but they gate the phase that consumes them:
   journaling, and the descriptor allowance remain an explicit platform mount
   contract until ESP-IDF exposes a stable query API; do not couple the
   component to private VFS/FatFs context structures merely to inspect them.
-- Phases 4–5 must freeze the SSTable levels/size ratio, compaction reserve, and
-  the precise arena reuse between transaction staging, SSTable flush, and
-  compaction. Phase 3 has frozen its handle, namespace, staging, memtable, and
-  non-recycling WAL capacities above.
+- Phase 5 must freeze the SSTable level ratio, compaction reserve, slot-reuse
+  policy, and tombstone-drop proof. Phase 4 has frozen the immutable table
+  format, level-0 flush, exact scratch reuse, and non-recycling behavior.
 - Performance acceptance requires a measured NVS baseline rather than relying
   on recollection that some operations are `O(n)`.
 - Final SD power-loss qualification waits for the separately owned journal

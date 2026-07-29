@@ -157,10 +157,11 @@ private:
     struct mutation_slot {
         uint32_t value_offset;
         uint32_t value_size;
+        uint32_t previous_value_size;
         uint8_t key_size;
         uint8_t type;
         uint8_t kind;
-        uint8_t reserved;
+        uint8_t previous_state;
         char key[on9kvdb_def::max_name_len + 1];
     };
 
@@ -196,6 +197,7 @@ private:
 
     struct value_view {
         const uint8_t *value = nullptr;
+        uint64_t transaction_sequence = 0;
         uint32_t value_size = 0;
         on9kvdb_type type = on9kvdb_type::any;
         bool tombstone = false;
@@ -207,6 +209,21 @@ private:
         uint8_t *destination;
         uint32_t logical_offset;
         size_t copied;
+    };
+
+    struct table_build_state {
+        int file_fd = -1;
+        uint8_t *data_block = nullptr;
+        uint8_t *index_block = nullptr;
+        uint64_t generation = 0;
+        uint32_t slot = 0;
+        uint32_t data_block_count = 0;
+        uint32_t entry_count = 0;
+        uint32_t data_bytes = 0;
+        uint32_t data_payload_size = 0;
+        uint32_t index_payload_size = 0;
+        uint32_t content_crc = UINT32_MAX;
+        uint16_t data_block_entry_count = 0;
     };
 
 private:
@@ -260,6 +277,23 @@ private: // WAL
     esp_err_t parse_recovered_transaction_unsafe(const uint8_t *payload, size_t payload_size, uint16_t expected_mutation_count,
                                                  char namespace_name[on9kvdb_def::max_name_len + 1]);
 
+private: // Immutable SSTables
+    esp_err_t flush_memtable_unsafe();
+    esp_err_t recover_tables_unsafe();
+    esp_err_t validate_table_unsafe(const on9kvdb_def::table_reference &reference);
+    esp_err_t lookup_tables_unsafe(const char *namespace_name, const char *key, value_view *view_out) const;
+    esp_err_t lookup_table_unsafe(const on9kvdb_def::table_reference &reference, const on9kvdb_def::composite_key &key,
+                                  value_view *view_out) const;
+    esp_err_t lookup_committed_unsafe(const char *namespace_name, const char *key, value_view *view_out) const;
+    esp_err_t read_table_bytes_unsafe(uint32_t slot, uint64_t offset, uint8_t *destination, size_t size) const;
+    esp_err_t write_table_bytes_unsafe(uint32_t slot, uint64_t offset, const uint8_t *source, size_t size);
+    esp_err_t table_slot_available_unsafe(uint32_t slot, bool *available_out) const;
+    esp_err_t finish_table_data_block_unsafe(table_build_state *state);
+    int compare_memtable_records_unsafe(uint32_t lhs_offset, uint32_t rhs_offset) const;
+    void sift_memtable_offsets_unsafe(uint32_t *offsets, uint32_t count, uint32_t root) const;
+    void sort_memtable_offsets_unsafe(uint32_t *offsets, uint32_t count) const;
+    void reset_memtable_unsafe();
+
 private: // Memtable and namespace registry
     esp_err_t find_namespace_unsafe(const char *namespace_name, uint16_t *slot_index_out) const;
     esp_err_t ensure_namespace_capacity_unsafe(const char *namespace_name, uint16_t *slot_index_out, bool publish);
@@ -269,12 +303,12 @@ private: // Memtable and namespace registry
     esp_err_t lookup_memtable_unsafe(const char *namespace_name, const char *key, value_view *view_out) const;
     esp_err_t lookup_transaction_unsafe(const transaction_slot &transaction, const handle_slot &handle, const char *key,
                                         value_view *view_out) const;
-    esp_err_t preflight_memtable_transaction_unsafe(const transaction_slot &transaction, const char *namespace_name,
-                                                    uint16_t *namespace_slot_out) const;
+    esp_err_t preflight_memtable_transaction_unsafe(transaction_slot &transaction, const char *namespace_name,
+                                                    uint16_t *namespace_slot_out);
     void compact_memtable_unsafe();
     void remove_memtable_record_unsafe(uint32_t bucket_index);
-    void apply_transaction_to_memtable_unsafe(const transaction_slot &transaction, uint16_t namespace_slot_index,
-                                              uint64_t transaction_sequence);
+    esp_err_t apply_transaction_to_memtable_unsafe(const transaction_slot &transaction, uint16_t namespace_slot_index,
+                                                   uint64_t transaction_sequence);
     esp_err_t get_fixed_value_unsafe(const value_view &view, on9kvdb_type expected_type, void *value_out,
                                      size_t expected_size) const;
     esp_err_t get_variable_value_unsafe(const value_view &view, on9kvdb_type expected_type, void *value_out,

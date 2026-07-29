@@ -3,15 +3,21 @@
 `on9kvdb` is planned as a fixed-capacity, namespaced LSM key-value database
 over permanent contiguous files on a journaled FATFS volume.
 
-The component is currently at **Phase 3**. It has fixed-capacity namespace and
-transaction handles, typed staging, read-your-writes, a bounded committed
-memtable, and recoverable atomic WAL transactions. It also provisions and
-validates the complete permanent FATFS file set.
+## Development provenance
 
-This is a usable but deliberately capacity-limited WAL-only milestone. Phase 4
-must publish immutable SSTables before WAL files can be recycled. With the
-default geometry, Phase 3 accepts at least 120 minimum-size transactions across
-the two WAL files and then returns `ESP_ERR_NO_MEM`.
+This project is vibe-coded by GPT-5 Codex and reviewed by Kimi K3, tested by human (me).
+
+The component is currently at **Phase 4**. It has fixed-capacity namespace and
+transaction handles, typed staging, read-your-writes, recoverable atomic WAL
+transactions, automatic immutable SSTable flush, and committed lookup across
+the memtable and every published table.
+
+This remains a deliberately capacity-limited milestone. Phase 4 does not
+compact or reuse table/WAL slots. The default two WAL files hold 120
+minimum-frame transactions in total; a flush permanently consumes one of six
+table slots. Safe reuse and sustained operation require the approved Phase 5
+compaction policy. Capacity exhaustion returns `ESP_ERR_NO_MEM` without
+overwriting published state.
 
 ## Default fixed geometry
 
@@ -23,6 +29,7 @@ CONFIG_ON9KVDB_PROVISIONED_DATABASE_SIZE   4194304 bytes
 CONFIG_ON9KVDB_WAL_FILE_SIZE                262144 bytes
 CONFIG_ON9KVDB_SSTABLE_FILE_SIZE            610304 bytes
 CONFIG_ON9KVDB_SSTABLE_COUNT                     6
+CONFIG_ON9KVDB_SSTABLE_BLOCK_SIZE            12288 bytes
 ```
 
 The default file-size arithmetic is exact:
@@ -60,10 +67,12 @@ length is rounded up independently to the mounted cluster size. If the public
 free-byte check does not account for enough cluster-tail slack, contiguous
 creation fails with `ESP_ERR_NO_MEM` rather than changing the geometry.
 
-For 32-bit values, the final exact key count depends on the Phase 4 entry and
-index format. A current planning estimate is roughly 30,000–40,000 live pairs
-with short names, or roughly 19,000–21,000 when both namespace and key are at
-their 32-byte maxima. These are not format guarantees.
+The physical table format can hold far more data than one memtable flush, but
+Phase 4 intentionally writes one level-0 table per flush and never reuses it.
+With the defaults, one flush contains at most 512 distinct composite keys and
+the two unrecycled WALs contain at most 120 minimum-frame transactions. Do not
+use the 2 MiB live-data geometry as a Phase 4 sustained-capacity promise;
+compaction and reuse are Phase 5 requirements.
 
 ## Phase 2 file provisioning
 
@@ -180,10 +189,11 @@ PSRAM by default. Initialization returns `ESP_ERR_NOT_SUPPORTED` when
 `CONFIG_ON9KVDB_REQUIRE_PSRAM=y` but the application has not enabled PSRAM.
 It does not silently consume the arena from internal RAM.
 
-Default Phase 3 partitions include 64 namespaces, 8 open handles, one active
+Default runtime partitions include 64 namespaces, 8 open handles, one active
 transaction with 10 mutation slots and 24576 staged value bytes, a 512-bucket
-memtable index, and 36864 bytes of committed record storage. The v1
-configuration ceiling is 204799 bytes, strictly below 200 KiB.
+memtable index, 36864 bytes of committed record storage, two 12288-byte table
+blocks, and 512 sortable 32-bit record offsets. The v1 configuration ceiling
+is 204799 bytes, strictly below 200 KiB.
 
 Both mutation count and available staged bytes limit a transaction. Ten 8 KiB
 values are not promised to fit in the 100 KiB default because the component
@@ -194,10 +204,13 @@ compaction must not allocate heap memory.
 
 ## Durability and visibility contract
 
-The Phase 3 commit order is:
+The Phase 4 commit/flush order is:
 
 ```text
 validate/stage transaction
+    -> if required, reserve one table slot in a durable manifest
+    -> write, sync, and readback-validate the immutable table
+    -> publish the table and checkpoint in a durable manifest
     -> append WAL mutations and commit record
     -> fsync WAL
     -> publish transaction to committed memtable
@@ -239,9 +252,9 @@ WAL       "KVW9"
 SSTable   "KVT9"
 ```
 
-Phase 3 defines a 160-byte manifest record and a 56-byte permanent
+Phase 4 uses the complete 4096-byte manifest slot and a 56-byte permanent
 file-identity record. All fields are explicitly little-endian and both records
-have a second CRC covering the complete record.
+have a CRC covering the complete authoritative encoding.
 
 `manifest.db` contains two 4096-byte slots. The beginning of each slot is:
 
@@ -268,13 +281,17 @@ offset  size  field
 0x64       4  memtable data bytes
 0x68       4  maximum transaction mutations
 0x6c       4  transaction staging bytes
-0x70       4  active WAL slot
-0x74       4  reserved, zero
+0x70       4  SSTable logical block bytes
+0x74       4  active WAL slot
 0x78       8  WAL slot 0 generation
 0x80       8  WAL slot 1 generation
 0x88       8  safe checkpoint sequence
-0x90      12  reserved, zero
-0x9c       4  complete-record CRC-32
+0x90       8  next logical table generation
+0x98       4  active table count
+0x9c       4  monotonic consumed-table-slot mask
+0xa0    2944  sixteen fixed table-reference descriptors
+0xc20    988  reserved, zero
+0xffc      4  complete-record CRC-32
 ```
 
 The valid record with the greatest generation is selected, provided all valid
@@ -300,7 +317,29 @@ whole-frame CRCs. Multi-frame transactions carry a transaction-wide CRC and
 only the last frame carries the commit flag. Recovery publishes a transaction
 only after validating all frames and the transaction checksum.
 
-SSTable data remains a Phase 4 format decision.
+Each default 596 KiB SSTable has this fixed layout:
+
+```text
+offset       size  purpose
+0x00000      8192  two permanent file identities
+0x02000      8192  two redundant table headers
+0x04000    577536  47 fixed 12 KiB data-block positions
+0x91000     12288  sparse index block
+0x94000      4096  footer slot
+```
+
+Records are sorted by `(namespace bytes, key bytes)`. Each record carries its
+transaction sequence, type, tombstone flag, explicit lengths, and value. A
+record never spans blocks. Data blocks, the index, footer, and headers are
+checksummed; the manifest reference also binds their generation, physical
+slot, key/sequence ranges, counts, and aggregate content checksum.
+
+A flush first publishes a manifest generation that marks the selected physical
+slot consumed. It then writes and syncs data/index/footer/headers, reads the
+complete authoritative table back for validation, and finally publishes a
+second manifest generation that activates the table and advances the safe
+checkpoint. A failed or interrupted attempt leaves the slot consumed, so an
+older manifest copy can never make a formerly attempted table reusable.
 
 ## Minimal API flow
 
@@ -333,7 +372,7 @@ mismatch uses `ESP_ERR_INVALID_RESPONSE`, capacity exhaustion uses
 
 ## Tests
 
-Native Phase 1 through Phase 3 tests:
+Native Phase 1 through Phase 4 tests:
 
 ```sh
 cmake -S tests -B /tmp/on9kvdb-tests
@@ -346,4 +385,10 @@ unit-test application. The Phase 2 model injects a reset after every
 manifest/identity write and sync boundary. Phase 3 tests every interrupted byte
 prefix across single- and multi-frame WAL transactions and every single-byte
 corruption in a complete frame. They verify that recovery can recognize the
-whole transaction or no transaction, never a partial transaction.
+whole transaction or no transaction, never a partial transaction. Phase 4
+adds manifest table-reference/reservation, header/footer, data-entry, sparse
+index, padding, and corruption codec tests.
+
+## License
+
+`on9kvdb` is released under the [MIT License](LICENSE).

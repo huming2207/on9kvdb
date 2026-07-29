@@ -234,12 +234,14 @@ esp_err_t on9kvdb::activate_second_wal_unsafe()
         return ret;
     }
 
-    const on9kvdb_def::manifest_record old_manifest = manifest;
+    const uint32_t old_active_wal_slot = manifest.active_wal_slot;
+    const uint64_t old_wal_generation = manifest.wal_generation[1];
     manifest.active_wal_slot = 1;
     manifest.wal_generation[1] = new_generation;
     ret = write_manifest_copy(manifest.generation + 1U, on9kvdb_def::manifest_state_ready);
     if (ret != ESP_OK) {
-        manifest = old_manifest;
+        manifest.active_wal_slot = old_active_wal_slot;
+        manifest.wal_generation[1] = old_wal_generation;
         return ret;
     }
 
@@ -265,6 +267,17 @@ esp_err_t on9kvdb::append_transaction_unsafe(transaction_slot *transaction_state
     const uint64_t transaction_bytes = static_cast<uint64_t>(frame_count) * on9kvdb_def::wal_frame_size;
     uint32_t active_slot = manifest.active_wal_slot;
     if (transaction_bytes > manifest.geometry.wal_size - wal_tail[active_slot]) {
+        if (active_slot != 0) {
+            return ESP_ERR_NO_MEM;
+        }
+        // Checkpoint the committed memtable before moving to the second WAL. The current transaction is not included because
+        // its WAL record has not been written yet, so it remains recoverable solely from the newly active WAL.
+        if (memtable_entry_count > 0) {
+            ret = flush_memtable_unsafe();
+            if (ret != ESP_OK) {
+                return ret;
+            }
+        }
         ret = activate_second_wal_unsafe();
         if (ret != ESP_OK) {
             return ret;
@@ -507,23 +520,27 @@ esp_err_t on9kvdb::scan_wal_slot(uint32_t slot, uint64_t generation, uint64_t *e
             return ESP_OK;
         }
 
-        char namespace_name[on9kvdb_def::max_name_len + 1] = {};
-        ret = parse_recovered_transaction_unsafe(transaction_staging, payload_offset, first.mutation_count, namespace_name);
-        if (ret != ESP_OK) {
-            return ret;
-        }
+        if (*expected_sequence > manifest.safe_checkpoint_sequence) {
+            char namespace_name[on9kvdb_def::max_name_len + 1] = {};
+            ret = parse_recovered_transaction_unsafe(transaction_staging, payload_offset, first.mutation_count, namespace_name);
+            if (ret != ESP_OK) {
+                return ret;
+            }
 
-        compact_memtable_unsafe();
-        uint16_t namespace_index = 0;
-        ret = preflight_memtable_transaction_unsafe(*transaction, namespace_name, &namespace_index);
-        if (ret == ESP_OK) {
-            ret = ensure_namespace_capacity_unsafe(namespace_name, &namespace_index, true);
+            compact_memtable_unsafe();
+            uint16_t namespace_index = 0;
+            ret = preflight_memtable_transaction_unsafe(*transaction, namespace_name, &namespace_index);
+            if (ret == ESP_OK) {
+                ret = ensure_namespace_capacity_unsafe(namespace_name, &namespace_index, true);
+            }
+            if (ret == ESP_OK) {
+                ret = apply_transaction_to_memtable_unsafe(*transaction, namespace_index, *expected_sequence);
+            }
+            if (ret != ESP_OK) {
+                return ret;
+            }
+            clear_transaction_unsafe();
         }
-        if (ret != ESP_OK) {
-            return ret;
-        }
-        apply_transaction_to_memtable_unsafe(*transaction, namespace_index, *expected_sequence);
-        clear_transaction_unsafe();
 
         const uint32_t transaction_bytes = static_cast<uint32_t>(first.frame_count) * on9kvdb_def::wal_frame_size;
         offset += transaction_bytes;
@@ -547,15 +564,17 @@ esp_err_t on9kvdb::recover_wal()
 
     stats = {};
     namespace_count = 0;
-    memtable_data_used = 0;
-    memtable_entry_count = 0;
-    for (uint32_t idx = 0; idx < CONFIG_ON9KVDB_MEMTABLE_ENTRY_COUNT; idx += 1) {
-        memtable_index[idx] = {};
-        memtable_index[idx].record_offset = UINT32_MAX;
+    for (uint32_t idx = 0; idx < CONFIG_ON9KVDB_MAX_NAMESPACES; idx += 1) {
+        namespaces[idx] = {};
+    }
+    reset_memtable_unsafe();
+    esp_err_t ret = recover_tables_unsafe();
+    if (ret != ESP_OK) {
+        return ret;
     }
 
     uint64_t expected_sequence = 1;
-    esp_err_t ret = scan_wal_slot(0, manifest.wal_generation[0], &expected_sequence);
+    ret = scan_wal_slot(0, manifest.wal_generation[0], &expected_sequence);
     if (ret != ESP_OK) {
         return ret;
     }
@@ -575,6 +594,10 @@ esp_err_t on9kvdb::recover_wal()
         wal_tail[1] = on9kvdb_def::wal_record_region_offset;
     }
 
+    if (expected_sequence - 1U < manifest.safe_checkpoint_sequence) {
+        return ESP_ERR_INVALID_CRC;
+    }
     next_transaction_sequence = expected_sequence;
+    stats.committed_transaction_count = expected_sequence - 1U;
     return ESP_OK;
 }

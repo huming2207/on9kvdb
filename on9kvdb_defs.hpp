@@ -29,22 +29,43 @@ namespace on9kvdb_def
     static const constexpr uint32_t wal_frame_size = format_alignment;
     static const constexpr uint32_t wal_frame_header_size = 64;
     static const constexpr uint32_t wal_frame_payload_capacity = wal_frame_size - wal_frame_header_size;
+    static const constexpr uint32_t max_table_count = 16;
+    static const constexpr uint32_t table_header_slot_size = format_alignment;
+    static const constexpr uint32_t table_header_slot_count = 2;
+    static const constexpr uint32_t table_header_region_offset = identity_region_size;
+    static const constexpr uint32_t table_header_region_size = table_header_slot_size * table_header_slot_count;
+    static const constexpr uint32_t table_data_region_offset = table_header_region_offset + table_header_region_size;
+    static const constexpr uint32_t table_footer_slot_size = format_alignment;
+    static const constexpr uint32_t table_block_header_size = 64;
+    static const constexpr uint32_t table_index_header_size = 64;
+    static const constexpr uint32_t table_entry_header_size = 24;
+    static const constexpr uint32_t table_index_entry_header_size = 16;
 
-    static const constexpr uint16_t storage_revision = 2;
+    static const constexpr uint16_t storage_revision = 3;
     static const constexpr uint16_t geometry_revision = 1;
-    static const constexpr uint16_t logical_limits_revision = 1;
+    static const constexpr uint16_t logical_limits_revision = 2;
     static const constexpr uint16_t wal_header_revision = 1;
     static const constexpr uint16_t wal_frame_revision = 1;
-    static const constexpr uint32_t manifest_magic = 0x394d564bUL;   // "KVM9"
-    static const constexpr uint32_t wal_magic = 0x3957564bUL;        // "KVW9"
-    static const constexpr uint32_t table_magic = 0x3954564bUL;      // "KVT9"
-    static const constexpr uint32_t wal_header_magic = 0x3948574bUL; // "KWH9"
-    static const constexpr uint32_t wal_frame_magic = 0x3946574bUL;  // "KWF9"
+    static const constexpr uint16_t table_header_revision = 1;
+    static const constexpr uint16_t table_block_revision = 1;
+    static const constexpr uint16_t table_index_revision = 1;
+    static const constexpr uint16_t table_footer_revision = 1;
+    static const constexpr uint32_t manifest_magic = 0x394d564bUL;     // "KVM9"
+    static const constexpr uint32_t wal_magic = 0x3957564bUL;          // "KVW9"
+    static const constexpr uint32_t table_magic = 0x3954564bUL;        // "KVT9"
+    static const constexpr uint32_t wal_header_magic = 0x3948574bUL;   // "KWH9"
+    static const constexpr uint32_t wal_frame_magic = 0x3946574bUL;    // "KWF9"
+    static const constexpr uint32_t table_header_magic = 0x3948544bUL; // "KTH9"
+    static const constexpr uint32_t table_block_magic = 0x3942544bUL;  // "KTB9"
+    static const constexpr uint32_t table_index_magic = 0x3949544bUL;  // "KTI9"
+    static const constexpr uint32_t table_footer_magic = 0x3946544bUL; // "KTF9"
     static const constexpr uint16_t manifest_state_provisioning_owned = 0x7001;
     static const constexpr uint16_t manifest_state_ready = 0x7002;
     static const constexpr uint16_t file_prefix_flag_identity = 1U << 0;
     static const constexpr uint16_t wal_header_state_active = 0x7101;
     static const constexpr uint16_t wal_frame_flag_commit = 1U << 0;
+    static const constexpr uint8_t table_reference_flag_active = 1U << 0;
+    static const constexpr uint8_t table_entry_flag_tombstone = 1U << 0;
     static const constexpr uint8_t memtable_flag_tombstone = 1U << 0;
     static const constexpr uint8_t mutation_kind_set = 1;
     static const constexpr uint8_t mutation_kind_tombstone = 2;
@@ -115,6 +136,29 @@ namespace on9kvdb_def
         uint32_t memtable_data_bytes = 0;
         uint32_t max_transaction_mutations = 0;
         uint32_t transaction_staging_bytes = 0;
+        uint32_t sstable_block_bytes = 0;
+    };
+
+    struct composite_key {
+        uint8_t namespace_size = 0;
+        uint8_t key_size = 0;
+        char namespace_name[max_name_len + 1] = {};
+        char key[max_name_len + 1] = {};
+    };
+
+    struct table_reference {
+        bool active = false;
+        uint8_t level = 0;
+        uint32_t slot = 0;
+        uint32_t data_block_count = 0;
+        uint64_t generation = 0;
+        uint64_t min_sequence = 0;
+        uint64_t max_sequence = 0;
+        uint32_t entry_count = 0;
+        uint32_t data_bytes = 0;
+        uint32_t content_checksum = 0;
+        composite_key min_key = {};
+        composite_key max_key = {};
     };
 
     struct manifest_record {
@@ -126,6 +170,9 @@ namespace on9kvdb_def
         uint32_t active_wal_slot = 0;
         uint64_t wal_generation[wal_file_count] = {};
         uint64_t safe_checkpoint_sequence = 0;
+        uint64_t next_table_generation = 1;
+        uint32_t consumed_table_mask = 0;
+        table_reference tables[max_table_count] = {};
     };
 
     struct file_identity {
@@ -161,16 +208,80 @@ namespace on9kvdb_def
         uint32_t payload_checksum = 0;
     };
 
-    static const constexpr size_t manifest_record_size = 160;
-    static const constexpr size_t manifest_record_checksum_offset = 156;
+    struct table_metadata {
+        uint64_t database_id = 0;
+        uint64_t generation = 0;
+        uint64_t min_sequence = 0;
+        uint64_t max_sequence = 0;
+        uint32_t slot = 0;
+        uint32_t block_size = 0;
+        uint32_t data_region_start = 0;
+        uint32_t data_block_count = 0;
+        uint32_t index_offset = 0;
+        uint32_t footer_offset = 0;
+        uint32_t entry_count = 0;
+        uint32_t data_bytes = 0;
+        uint32_t content_checksum = 0;
+        uint8_t level = 0;
+        composite_key min_key = {};
+        composite_key max_key = {};
+    };
+
+    struct table_block_header {
+        uint64_t generation = 0;
+        uint32_t block_index = 0;
+        uint16_t entry_count = 0;
+        uint32_t payload_size = 0;
+    };
+
+    struct table_index_header {
+        uint64_t generation = 0;
+        uint32_t entry_count = 0;
+        uint32_t payload_size = 0;
+        uint32_t data_block_count = 0;
+    };
+
+    struct table_entry {
+        uint64_t transaction_sequence = 0;
+        uint32_t total_size = 0;
+        uint32_t value_size = 0;
+        uint8_t namespace_size = 0;
+        uint8_t key_size = 0;
+        uint8_t type = 0;
+        uint8_t flags = 0;
+        const uint8_t *namespace_name = nullptr;
+        const uint8_t *key = nullptr;
+        const uint8_t *value = nullptr;
+    };
+
+    struct table_index_entry {
+        uint64_t first_sequence = 0;
+        uint32_t block_offset = 0;
+        uint16_t total_size = 0;
+        uint8_t namespace_size = 0;
+        uint8_t key_size = 0;
+        const uint8_t *namespace_name = nullptr;
+        const uint8_t *key = nullptr;
+    };
+
+    static const constexpr size_t manifest_table_reference_size = 184;
+    static const constexpr size_t manifest_table_reference_offset = 160;
+    static const constexpr size_t manifest_record_size = manifest_slot_size;
+    static const constexpr size_t manifest_record_checksum_offset = manifest_record_size - sizeof(uint32_t);
     static const constexpr size_t file_identity_size = 56;
     static const constexpr size_t file_identity_checksum_offset = 52;
     static const constexpr size_t wal_header_size = 64;
     static const constexpr size_t wal_header_checksum_offset = 60;
     static const constexpr size_t wal_frame_checksum_offset = 60;
+    static const constexpr size_t table_metadata_size = 256;
+    static const constexpr size_t table_metadata_checksum_offset = 252;
+    static const constexpr size_t table_block_checksum_offset = 60;
+    static const constexpr size_t table_index_checksum_offset = 60;
 
     static_assert(wal_frame_header_size == 64);
     static_assert(wal_frame_payload_capacity == 4032);
+    static_assert(manifest_table_reference_offset + max_table_count * manifest_table_reference_size <
+                  manifest_record_checksum_offset);
 
     bool checked_add_size(size_t lhs, size_t rhs, size_t *result_out);
     bool checked_mul_size(size_t lhs, size_t rhs, size_t *result_out);
@@ -214,4 +325,19 @@ namespace on9kvdb_def
                           size_t payload_len);
     format_status decode_wal_frame(const uint8_t *frame, size_t frame_len, wal_frame_header *header_out,
                                    const uint8_t **payload_out);
+    bool composite_key_equal(const composite_key &lhs, const composite_key &rhs);
+    int compare_composite_key(const composite_key &lhs, const composite_key &rhs);
+    bool table_reference_equal(const table_reference &lhs, const table_reference &rhs);
+    bool encode_table_metadata(uint8_t *buf, size_t buf_len, uint32_t magic, const table_metadata &metadata);
+    format_status decode_table_metadata(const uint8_t *buf, size_t buf_len, uint32_t expected_magic,
+                                        table_metadata *metadata_out);
+    bool table_metadata_equal(const table_metadata &lhs, const table_metadata &rhs);
+    bool encode_table_block_header(uint8_t *block, size_t block_len, const table_block_header &header);
+    format_status decode_table_block_header(const uint8_t *block, size_t block_len, table_block_header *header_out);
+    bool encode_table_index_header(uint8_t *block, size_t block_len, const table_index_header &header);
+    format_status decode_table_index_header(const uint8_t *block, size_t block_len, table_index_header *header_out);
+    bool encode_table_entry(uint8_t *buf, size_t buf_len, size_t offset, const table_entry &entry, size_t *size_out);
+    format_status decode_table_entry(const uint8_t *buf, size_t buf_len, size_t offset, table_entry *entry_out);
+    bool encode_table_index_entry(uint8_t *buf, size_t buf_len, size_t offset, const table_index_entry &entry, size_t *size_out);
+    format_status decode_table_index_entry(const uint8_t *buf, size_t buf_len, size_t offset, table_index_entry *entry_out);
 }

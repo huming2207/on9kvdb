@@ -4,6 +4,10 @@
 
 namespace
 {
+    static const constexpr uint8_t previous_state_none = 0;
+    static const constexpr uint8_t previous_state_live = 1;
+    static const constexpr uint8_t previous_state_tombstone = 2;
+
     uint32_t align_record_size(uint32_t size)
     {
         return (size + 7U) & ~UINT32_C(7);
@@ -152,6 +156,7 @@ esp_err_t on9kvdb::lookup_memtable_unsafe(const char *namespace_name, const char
     const uint8_t *record_key = reinterpret_cast<const uint8_t *>(header + 1);
     value_view view = {};
     view.value = record_key + header->key_size;
+    view.transaction_sequence = header->transaction_sequence;
     view.value_size = header->value_size;
     view.type = static_cast<on9kvdb_type>(header->type);
     view.tombstone = (header->flags & on9kvdb_def::memtable_flag_tombstone) != 0;
@@ -200,7 +205,7 @@ esp_err_t on9kvdb::lookup_transaction_unsafe(const transaction_slot &transaction
         return ESP_OK;
     }
 
-    return lookup_memtable_unsafe(handle.namespace_name, key, view_out);
+    return lookup_committed_unsafe(handle.namespace_name, key, view_out);
 }
 
 void on9kvdb::compact_memtable_unsafe()
@@ -231,15 +236,15 @@ void on9kvdb::remove_memtable_record_unsafe(uint32_t bucket_index)
     bucket.record_size = 0;
 }
 
-esp_err_t on9kvdb::preflight_memtable_transaction_unsafe(const transaction_slot &transaction_state, const char *namespace_name,
-                                                         uint16_t *namespace_slot_out) const
+esp_err_t on9kvdb::preflight_memtable_transaction_unsafe(transaction_slot &transaction_state, const char *namespace_name,
+                                                         uint16_t *namespace_slot_out)
 {
     if (namespace_name == nullptr || namespace_slot_out == nullptr || transaction_state.mutation_count == 0) {
         return ESP_ERR_INVALID_ARG;
     }
 
     uint16_t namespace_index = 0;
-    esp_err_t ret = const_cast<on9kvdb *>(this)->ensure_namespace_capacity_unsafe(namespace_name, &namespace_index, false);
+    esp_err_t ret = ensure_namespace_capacity_unsafe(namespace_name, &namespace_index, false);
     if (ret != ESP_OK) {
         return ret;
     }
@@ -247,7 +252,9 @@ esp_err_t on9kvdb::preflight_memtable_transaction_unsafe(const transaction_slot 
     uint32_t final_bytes = memtable_data_used;
     uint32_t final_entries = memtable_entry_count;
     for (uint16_t idx = 0; idx < transaction_state.mutation_count; idx += 1) {
-        const mutation_slot &mutation = transaction_state.mutations[idx];
+        mutation_slot &mutation = transaction_state.mutations[idx];
+        mutation.previous_state = previous_state_none;
+        mutation.previous_value_size = 0;
         uint32_t bucket_index = 0;
         bool found = false;
         ret = find_memtable_bucket_unsafe(namespace_index, mutation.key, mutation.key_size, &bucket_index, &found);
@@ -256,7 +263,21 @@ esp_err_t on9kvdb::preflight_memtable_transaction_unsafe(const transaction_slot 
         }
         if (found) {
             final_bytes -= memtable_index[bucket_index].record_size;
+            const auto *old_header =
+                reinterpret_cast<const memtable_record_header *>(memtable_data + memtable_index[bucket_index].record_offset);
+            mutation.previous_state = (old_header->flags & on9kvdb_def::memtable_flag_tombstone) != 0
+                                          ? previous_state_tombstone
+                                          : previous_state_live;
+            mutation.previous_value_size = old_header->value_size;
         } else {
+            value_view old_table_value = {};
+            const esp_err_t table_ret = lookup_tables_unsafe(namespace_name, mutation.key, &old_table_value);
+            if (table_ret == ESP_OK) {
+                mutation.previous_state = old_table_value.tombstone ? previous_state_tombstone : previous_state_live;
+                mutation.previous_value_size = old_table_value.value_size;
+            } else if (table_ret != ESP_ERR_NOT_FOUND) {
+                return table_ret;
+            }
             final_entries += 1;
         }
 
@@ -276,8 +297,8 @@ esp_err_t on9kvdb::preflight_memtable_transaction_unsafe(const transaction_slot 
     return ESP_OK;
 }
 
-void on9kvdb::apply_transaction_to_memtable_unsafe(const transaction_slot &transaction_state, uint16_t namespace_slot_index,
-                                                   uint64_t transaction_sequence)
+esp_err_t on9kvdb::apply_transaction_to_memtable_unsafe(const transaction_slot &transaction_state, uint16_t namespace_slot_index,
+                                                        uint64_t transaction_sequence)
 {
     for (uint16_t idx = 0; idx < transaction_state.mutation_count; idx += 1) {
         const mutation_slot &mutation = transaction_state.mutations[idx];
@@ -286,7 +307,7 @@ void on9kvdb::apply_transaction_to_memtable_unsafe(const transaction_slot &trans
         const esp_err_t find_ret =
             find_memtable_bucket_unsafe(namespace_slot_index, mutation.key, mutation.key_size, &bucket_index, &found);
         if (find_ret != ESP_OK) {
-            return;
+            return find_ret;
         }
 
         if (found) {
@@ -301,6 +322,14 @@ void on9kvdb::apply_transaction_to_memtable_unsafe(const transaction_slot &trans
             }
             remove_memtable_record_unsafe(bucket_index);
         } else {
+            if (mutation.previous_state == previous_state_tombstone) {
+                stats.tombstone_count -= 1;
+            } else if (mutation.previous_state == previous_state_live) {
+                stats.live_key_count -= 1;
+                stats.logical_value_bytes -= mutation.previous_value_size;
+            } else if (mutation.previous_state != previous_state_none) {
+                return ESP_ERR_INVALID_STATE;
+            }
             memtable_entry_count += 1;
         }
 
@@ -342,6 +371,7 @@ void on9kvdb::apply_transaction_to_memtable_unsafe(const transaction_slot &trans
     }
 
     stats.committed_transaction_count += 1;
+    return ESP_OK;
 }
 
 esp_err_t on9kvdb::get_fixed_value_unsafe(const value_view &view, on9kvdb_type expected_type, void *value_out,
