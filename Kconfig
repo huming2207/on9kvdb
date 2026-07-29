@@ -54,4 +54,62 @@ menu "on9kvdb"
             No component-owned allocation is allowed during normal operations
             after initialization completes.
 
+    config ON9KVDB_REQUIRE_PSRAM
+        bool "Require PSRAM for the bulk runtime arena"
+        default y
+        help
+            Allocate the bounded bulk arena explicitly from PSRAM and fail
+            initialization with ESP_ERR_NOT_SUPPORTED if PSRAM is unavailable.
+            The 4096-byte I/O frame remains in internal DMA-capable RAM.
+
+    config ON9KVDB_MAX_NAMESPACES
+        int "Maximum durable namespaces"
+        default 64
+        range 1 1024
+        help
+            Maximum number of namespaces recoverable by this build. Existing
+            databases must match this value exactly.
+
+    config ON9KVDB_MAX_OPEN_HANDLES
+        int "Maximum simultaneously open namespace handles"
+        default 8
+        range 1 256
+        help
+            Fixed generation-checked handle-table capacity. Existing databases
+            must match this value exactly in v1.
+
+    config ON9KVDB_MEMTABLE_ENTRY_COUNT
+        int "Maximum Phase 3 memtable entries"
+        default 512
+        range 16 4096
+        help
+            Fixed open-addressed memtable index capacity. This must be a power
+            of two. Existing databases must match this value exactly.
+
+    config ON9KVDB_MEMTABLE_DATA_SIZE
+        int "Memtable record arena size in bytes"
+        default 36864
+        range 8192 131072
+        help
+            Fixed byte capacity for newest committed memtable records and
+            tombstones. This is a runtime arena limit, not total live database
+            size.
+
+    config ON9KVDB_TRANSACTION_STAGING_SIZE
+        int "Maximum staged value bytes per transaction"
+        default 24576
+        range 8192 131072
+        help
+            Sum of value bytes staged by the one active transaction. Replacing
+            the same key reclaims its previous staged bytes. Existing databases
+            must match this value exactly.
+
+    config ON9KVDB_MAX_TRANSACTION_MUTATIONS
+        int "Maximum distinct keys per transaction"
+        default 10
+        range 1 10
+        help
+            A repeated mutation of the same key counts once. Existing databases
+            must match this value exactly.
+
 endmenu

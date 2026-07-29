@@ -6,8 +6,9 @@ This file is the design and implementation plan for `on9kvdb`. No storage
 format or public API described as **proposed** below is approved merely by
 appearing in this plan.
 
-Phase 1 and Phase 2 are implemented. Phase 3 is the next implementation phase;
-do not treat the current component as a usable key-value database yet.
+Phase 1 through Phase 3 are implemented. Phase 3 is a bounded WAL-only
+milestone; do not treat the current component as a complete key-value database
+until WAL recycling is protected by Phase 4 SSTables.
 
 The intended component is a fixed-capacity, namespaced key-value database for
 ESP32-class devices. It should expose an API similar to ESP-IDF NVS while using
@@ -134,7 +135,18 @@ the database power-loss atomic.
 Match `components/on9ringstore`:
 
 - C++ source with lower-case snake-case class, method, member, and file names;
-- four-space indentation and the same brace/line-wrap style;
+- four-space indentation and the same brace style;
+- a 130-column default source width; keep related declarations, expressions,
+  conditions, and function arguments on one line when they fit, and avoid
+  narrow or eager line folding because it makes review harder;
+- wrap only when a line would exceed 130 columns or a deliberate multiline
+  layout materially improves clarity;
+- do not use lambda expressions, including local inline lambdas; use named
+  private member functions or private static helpers instead, and mark a
+  helper `inline` when its size and call frequency justify it;
+- format every changed C++ source/header with the component's `.clang-format`
+  file before verification, and run its dry-run check so the 130-column rule
+  remains enforced in future phases;
 - `esp_err_t` error propagation and checked early returns;
 - fixed-width integer types and explicit casts;
 - `static const constexpr` constants;
@@ -199,8 +211,9 @@ read-write modes, typed integer/string/blob accessors, erase operations,
 most 15 characters.
 
 `on9kvdb` should be source-familiar, not symbol-compatible or storage-format
-compatible. Use an `on9kvdb_` prefix and component-specific error codes so it
-can coexist with NVS.
+compatible. Use an `on9kvdb_` prefix so it can coexist with NVS. The public API
+uses only the standard `ESP_ERR_*` values from `esp_err.h`; it does not define
+an engine-specific error range.
 
 ## RAM cache and WAL decision
 
@@ -312,9 +325,19 @@ Before recycling a WAL slot:
 4. Only then initialize the old WAL physical slot with a new logical
    generation.
 
-The exact replicated-header protocol and whether records may wrap inside one
-slot are open design details that require fault-injection proof before format
-freeze.
+Phase 3 freezes two redundant 4096-byte WAL-generation header slots after the
+8192-byte file-identity region. Transaction data starts at offset 16384.
+Transactions occupy one or more complete 4096-byte frames and never wrap.
+Every frame is written once for the selected logical WAL generation; a later
+transaction never shares or rewrites a frame containing an acknowledged
+transaction. The final frame carries the commit flag, and every frame binds
+the database identity, WAL generation, transaction sequence, frame index/count,
+payload bounds, transaction checksum, and frame checksum.
+
+Phase 3 appends to WAL slot 0, then publishes WAL slot 1 through the manifest
+when the next transaction no longer fits slot 0. It does not recycle either
+slot. When both slots are full it returns `ESP_ERR_NO_MEM`. Phase 4 may add
+recycling only after its SSTable checkpoint protocol is proven.
 
 ### SSTable slots
 
@@ -442,10 +465,22 @@ setter independently, but it must be explicitly approved and documented.
 Stats, iterators, `find_key()`, namespace enumeration, secure purge, encryption,
 and a C wrapper are later phases unless selected as v1 requirements.
 
-Do not reuse `ESP_ERR_NVS_*` values for a different engine. Define stable
-component errors for at least invalid name/handle, not found, type mismatch,
-invalid length, not enough space, corruption, unsupported/newer format, and
-read-only/not allowed.
+Do not reuse `ESP_ERR_NVS_*` values for a different engine and do not define
+new component errors. V1 maps outcomes to existing values:
+
+- invalid name, handle, or null argument: `ESP_ERR_INVALID_ARG`;
+- type mismatch or structurally invalid decoded data:
+  `ESP_ERR_INVALID_RESPONSE`;
+- missing namespace or key: `ESP_ERR_NOT_FOUND`;
+- read-only mutation: `ESP_ERR_NOT_ALLOWED`;
+- value, transaction, geometry, or destination-buffer size mismatch:
+  `ESP_ERR_INVALID_SIZE`;
+- fixed RAM, memtable, namespace, or storage capacity exhausted:
+  `ESP_ERR_NO_MEM`;
+- checksum corruption: `ESP_ERR_INVALID_CRC`;
+- unsupported stored format revision: `ESP_ERR_INVALID_VERSION`; and
+- invalid lifecycle, busy handle, or sequence exhaustion:
+  `ESP_ERR_INVALID_STATE`.
 
 ## Provisioning and recovery
 
@@ -744,7 +779,7 @@ resources.
   only committed state.
 - Explicit transaction `close()` is an alias for commit and returns
   `esp_err_t`. A failed close leaves the transaction valid for retry or abort.
-- Namespace close returns `ESP_ERR_ON9KVDB_BUSY` while its transaction is
+- Namespace close returns `ESP_ERR_INVALID_STATE` while its transaction is
   active.
 - Destruction or abandonment aborts dirty transaction state rather than
   silently committing it.
@@ -752,6 +787,53 @@ resources.
   requirements.
 - General iteration, erase-all, secure purge, encryption, namespace
   enumeration, partition-like multiple stores, and the C wrapper are deferred.
+
+### Phase 3 handles, RAM, WAL, and namespace decisions
+
+Reviewed and approved on 2026-07-29:
+
+- A database supports 64 durable namespaces and eight simultaneously open
+  namespace handles by default. Both limits are Kconfig values. One
+  generation-checked handle selects one namespace.
+- V1 permits one active transaction globally. Other handles may continue to
+  read committed values. A transaction reads its own staged overlay.
+- A transaction contains at most ten distinct keys. Setting the same key again
+  replaces the staged mutation and still counts once. Replacement compacts the
+  fixed staging arena in place.
+- The default staged-value byte limit is 24576 bytes. A setter that would cross
+  the mutation or byte limit returns `ESP_ERR_INVALID_SIZE` without changing
+  any existing staged mutation. The transaction remains valid for commit,
+  retry, or abort.
+- The default memtable has 512 hash slots and a 36864-byte record arena.
+  Replacement and publication use bounded in-place compaction. Before any WAL
+  write, commit proves that the final memtable and namespace registry state
+  will fit. Capacity exhaustion returns `ESP_ERR_NO_MEM`.
+- A read-write open of a missing namespace creates only a volatile handle.
+  Its first successful non-empty transaction makes the namespace durable.
+  The namespace remains known after its last key is tombstoned. A read-only
+  open of an unknown namespace returns `ESP_ERR_NOT_FOUND`; an empty commit is
+  a no-op and does not create a namespace.
+- Bulk runtime arenas are allocated during `init()` and prefer/require PSRAM
+  by default. The intended build fails initialization with
+  `ESP_ERR_NOT_SUPPORTED` when PSRAM is required but unavailable; it never
+  silently consumes the default 100 KiB from internal RAM. One 4096-byte,
+  DMA-capable internal I/O frame is allocated at initialization.
+- The current demo `sdkconfig` does not yet enable `CONFIG_SPIRAM`; board/module
+  qualification and the matching PSRAM mode remain an application integration
+  task.
+- Production disables `CONFIG_FATFS_PER_FILE_CACHE` for this low-rate workload
+  so the permanent descriptor set does not also consume one 4096-byte cache
+  per file. The application should provide a preallocated SDMMC DMA bounce
+  buffer when its selected host cannot transfer the database's buffers
+  directly.
+- WAL transaction frames are exactly 4096 bytes even on a FATFS volume using
+  512-byte logical sectors. Each transaction begins and ends at a frame
+  boundary. Phase 3 has 240 KiB of frame area per default WAL file, or 120
+  minimum-size transactions across both slots before Phase 4 recycling.
+- The manifest persists the WAL frame size, namespace/handle limits, memtable
+  capacity, transaction mutation/byte limits, active WAL slot, referenced WAL
+  generations, and safe checkpoint sequence. V1 requires an exact match with
+  the firmware's Kconfig logical limits.
 
 ### Corruption, reset, and integration policy
 
@@ -765,7 +847,7 @@ resources.
   platform maintenance action.
 - V1 performs no geometry migration. If any persisted geometry differs from
   the running firmware's Kconfig, `init()` returns
-  `ESP_ERR_ON9KVDB_INCOMPATIBLE_GEOMETRY`. The component does not delete,
+  `ESP_ERR_INVALID_SIZE`. The component does not delete,
   resize, or recreate the database; the application/user must deliberately
   remove the complete database file set and provision a new database.
 - At-rest encryption is not a v1 requirement.
@@ -796,9 +878,10 @@ These items do not reopen Phase 1, but they gate the phase that consumes them:
   journaling, and the descriptor allowance remain an explicit platform mount
   contract until ESP-IDF exposes a stable query API; do not couple the
   component to private VFS/FatFs context structures merely to inspect them.
-- Phases 3–5 must freeze the arena split, memtable capacity, WAL capacity,
-  SSTable levels/size ratio, compaction reserve, and the behavior when a
-  transaction reaches its byte limit before ten mutations.
+- Phases 4–5 must freeze the SSTable levels/size ratio, compaction reserve, and
+  the precise arena reuse between transaction staging, SSTable flush, and
+  compaction. Phase 3 has frozen its handle, namespace, staging, memtable, and
+  non-recycling WAL capacities above.
 - Performance acceptance requires a measured NVS baseline rather than relying
   on recollection that some operations are `O(n)`.
 - Final SD power-loss qualification waits for the separately owned journal
@@ -818,7 +901,7 @@ on9kvdb_defs.hpp            fixed constants and persisted-format definitions
 on9kvdb.cpp                 lifecycle, locks, handles, public dispatch
 on9kvdb_io.cpp              bounded FATFS/POSIX I/O and provisioning
 on9kvdb_manifest.cpp        manifest publication and recovery
-on9kvdb_wal.cpp             WAL append, commit, scan, replay, recycling
+on9kvdb_wal.cpp             WAL append, commit, scan, replay, slot transition
 on9kvdb_memtable.cpp        bounded staging/memtable/index
 on9kvdb_table.cpp           SSTable build, validate, and lookup
 on9kvdb_compaction.cpp      merge and slot-reuse policy

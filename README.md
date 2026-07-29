@@ -3,12 +3,15 @@
 `on9kvdb` is planned as a fixed-capacity, namespaced LSM key-value database
 over permanent contiguous files on a journaled FATFS volume.
 
-The component is currently at **Phase 2**. It provisions and recovers the
-permanent FATFS file set, persists immutable geometry in redundant manifests,
-validates file identity/size/contiguity, and fails closed on incompatible or
-corrupt layouts. It does not yet implement handles, WAL transactions,
-memtables, SSTable contents, lookup, or compaction, so it is not yet a usable
-key-value database.
+The component is currently at **Phase 3**. It has fixed-capacity namespace and
+transaction handles, typed staging, read-your-writes, a bounded committed
+memtable, and recoverable atomic WAL transactions. It also provisions and
+validates the complete permanent FATFS file set.
+
+This is a usable but deliberately capacity-limited WAL-only milestone. Phase 4
+must publish immutable SSTables before WAL files can be recycled. With the
+default geometry, Phase 3 accepts at least 120 minimum-size transactions across
+the two WAL files and then returns `ESP_ERR_NO_MEM`.
 
 ## Default fixed geometry
 
@@ -39,11 +42,10 @@ cannot reserve its identity region.
 
 All geometry fields are persisted. V1 requires the persisted geometry to
 match the running firmware's Kconfig exactly. For example, a database created
-with three table slots fails with
-`ESP_ERR_ON9KVDB_INCOMPATIBLE_GEOMETRY` when opened by firmware configured
-for six. The component does not migrate, delete, resize, or recreate it. The
-application/user must deliberately remove the complete old database file set
-before provisioning a replacement.
+with three table slots fails with `ESP_ERR_INVALID_SIZE` when opened by
+firmware configured for six. The component does not migrate, delete, resize,
+or recreate it. The application/user must deliberately remove the complete
+old database file set before provisioning a replacement.
 
 `MAX_LIVE_DATA_SIZE` and `PROVISIONED_DATABASE_SIZE` mean different things:
 
@@ -56,8 +58,7 @@ The 4 MiB value is the exact sum of FATFS file lengths. FAT allocates complete
 clusters, so actual volume consumption can be slightly larger: each file's
 length is rounded up independently to the mounted cluster size. If the public
 free-byte check does not account for enough cluster-tail slack, contiguous
-creation fails with `ESP_ERR_ON9KVDB_NOT_ENOUGH_SPACE` rather than changing
-the geometry.
+creation fails with `ESP_ERR_NO_MEM` rather than changing the geometry.
 
 For 32-bit values, the final exact key count depends on the Phase 4 entry and
 index format. A current planning estimate is roughly 30,000–40,000 live pairs
@@ -91,6 +92,12 @@ initialization. The FATFS mount therefore needs at least
 `CONFIG_ON9KVDB_SSTABLE_COUNT + 3` file descriptors for one database, plus
 descriptors used by the application.
 
+For the intended low-write-rate production build, disable
+`CONFIG_FATFS_PER_FILE_CACHE`; otherwise FATFS may allocate one sector cache
+for every permanently open file. The current demo `sdkconfig` still enables
+that option and should be changed when the board/storage integration is
+qualified.
+
 Before new-store creation, canonical `manifest.db`, `wal_*.db`, and
 `table_*.db` collisions are rejected. A ready store fails closed on missing,
 extra canonical, wrongly sized, fragmented, wrong-identity, unsupported, or
@@ -106,7 +113,9 @@ Provisioning order is:
 4. Allocate every WAL/SSTable file and write two independently synced identity
    copies.
 5. Re-read and validate every identity.
-6. Publish and sync a newer `ready` manifest generation.
+6. Write and sync two WAL-generation header copies in WAL slot 0.
+7. Publish and sync a newer `ready` manifest generation that references WAL
+   generation 1.
 
 A reset before the first ownership sync leaves no durable ownership proof and
 fails closed. After either provisioning manifest is durable, recovery first
@@ -154,7 +163,7 @@ platform contract rather than a dependency on private FatFs/VFS structures.
 - Explicit transaction `close()` is an alias for commit and returns
   `esp_err_t`. A failed close leaves the transaction valid for retry or abort.
   Closing a namespace with an active transaction returns
-  `ESP_ERR_ON9KVDB_BUSY`. Abandonment or destruction aborts rather than
+  `ESP_ERR_INVALID_STATE`. Abandonment or destruction aborts rather than
   silently committing.
 - Stats and find-key are required. General iteration is deferred.
 - Corruption fails closed. The component never auto-formats.
@@ -165,10 +174,16 @@ non-tombstoned `(namespace, key)` pair.
 
 ## Memory budget
 
-The default component-owned runtime budget is 100 KiB, intended for PSRAM. The
-v1 configuration ceiling is 204799 bytes, strictly below 200 KiB. Phase 3 will
-partition this budget among handle tables, transaction staging, memtable
-storage, indexes, and compaction scratch space.
+The default component-owned runtime budget is 100 KiB. One 4096-byte
+DMA-capable I/O frame uses internal RAM; the remaining arena is allocated from
+PSRAM by default. Initialization returns `ESP_ERR_NOT_SUPPORTED` when
+`CONFIG_ON9KVDB_REQUIRE_PSRAM=y` but the application has not enabled PSRAM.
+It does not silently consume the arena from internal RAM.
+
+Default Phase 3 partitions include 64 namespaces, 8 open handles, one active
+transaction with 10 mutation slots and 24576 staged value bytes, a 512-bucket
+memtable index, and 36864 bytes of committed record storage. The v1
+configuration ceiling is 204799 bytes, strictly below 200 KiB.
 
 Both mutation count and available staged bytes limit a transaction. Ten 8 KiB
 values are not promised to fit in the 100 KiB default because the component
@@ -179,7 +194,7 @@ compaction must not allocate heap memory.
 
 ## Durability and visibility contract
 
-The future commit order is:
+The Phase 3 commit order is:
 
 ```text
 validate/stage transaction
@@ -224,7 +239,7 @@ WAL       "KVW9"
 SSTable   "KVT9"
 ```
 
-Phase 2 additionally defines a 96-byte manifest record and a 56-byte permanent
+Phase 3 defines a 160-byte manifest record and a 56-byte permanent
 file-identity record. All fields are explicitly little-endian and both records
 have a second CRC covering the complete record.
 
@@ -244,8 +259,22 @@ offset  size  field
 0x3c       4  SSTable file count
 0x40       8  maximum encoded live bytes
 0x48       8  total provisioned bytes
-0x50      12  reserved, zero in revision 1
-0x5c       4  complete-record CRC-32
+0x50       2  logical-limits revision
+0x52       2  reserved, zero
+0x54       4  WAL frame bytes
+0x58       4  maximum durable namespaces
+0x5c       4  maximum open handles
+0x60       4  memtable bucket count
+0x64       4  memtable data bytes
+0x68       4  maximum transaction mutations
+0x6c       4  transaction staging bytes
+0x70       4  active WAL slot
+0x74       4  reserved, zero
+0x78       8  WAL slot 0 generation
+0x80       8  WAL slot 1 generation
+0x88       8  safe checkpoint sequence
+0x90      12  reserved, zero
+0x9c       4  complete-record CRC-32
 ```
 
 The valid record with the greatest generation is selected, provided all valid
@@ -264,12 +293,47 @@ offset  size  field
 0x34       4  complete-record CRC-32
 ```
 
-Phase 3 WAL records and Phase 4 SSTable data begin after this 8192-byte
-identity region. Their formats are not frozen by Phase 2.
+Each WAL reserves two additional 4096-byte WAL-generation header slots after
+the identity region. Transaction frames start at byte 16384. Every frame is
+exactly 4096 bytes, has a 64-byte header, and is protected by payload and
+whole-frame CRCs. Multi-frame transactions carry a transaction-wide CRC and
+only the last frame carries the commit flag. Recovery publishes a transaction
+only after validating all frames and the transaction checksum.
+
+SSTable data remains a Phase 4 format decision.
+
+## Minimal API flow
+
+```cpp
+on9kvdb database("/sdcard/config", nullptr);
+ESP_ERROR_CHECK(database.init());
+
+on9kvdb_handle settings;
+ESP_ERROR_CHECK(database.open(
+    "settings", on9kvdb_open_mode::read_write, &settings));
+
+on9kvdb_transaction_handle transaction;
+ESP_ERROR_CHECK(database.begin(settings, &transaction));
+ESP_ERROR_CHECK(database.set_u32(transaction, "boot_count", 1));
+ESP_ERROR_CHECK(database.set_str(transaction, "mode", "normal"));
+ESP_ERROR_CHECK(database.commit(transaction));
+
+uint32_t boot_count = 0;
+ESP_ERROR_CHECK(database.get_u32(
+    settings, "boot_count", &boot_count));
+ESP_ERROR_CHECK(database.close(settings));
+ESP_ERROR_CHECK(database.deinit());
+```
+
+Only standard ESP-IDF errors are returned. In particular, missing data uses
+`ESP_ERR_NOT_FOUND`, invalid handles/names use `ESP_ERR_INVALID_ARG`, type
+mismatch uses `ESP_ERR_INVALID_RESPONSE`, capacity exhaustion uses
+`ESP_ERR_NO_MEM`, and corrupt or unsupported storage uses
+`ESP_ERR_INVALID_CRC` or `ESP_ERR_INVALID_VERSION`.
 
 ## Tests
 
-Native Phase 1 and Phase 2 tests:
+Native Phase 1 through Phase 3 tests:
 
 ```sh
 cmake -S tests -B /tmp/on9kvdb-tests
@@ -278,7 +342,8 @@ ctest --test-dir /tmp/on9kvdb-tests --output-on-failure
 ```
 
 ESP-IDF Unity test registration is under `test/` for integration into an IDF
-unit-test application. The native Phase 2 model injects a reset after every
-manifest/identity write and sync boundary. It verifies fail-closed behavior
-before durable ownership and successful resumable provisioning after durable
-ownership.
+unit-test application. The Phase 2 model injects a reset after every
+manifest/identity write and sync boundary. Phase 3 tests every interrupted byte
+prefix across single- and multi-frame WAL transactions and every single-byte
+corruption in a complete frame. They verify that recovery can recognize the
+whole transaction or no transaction, never a partial transaction.
