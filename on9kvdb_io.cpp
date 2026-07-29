@@ -235,13 +235,15 @@ esp_err_t on9kvdb::provision_contiguous_file(const char *path, uint64_t size, bo
         return ESP_ERR_NO_MEM;
     }
 
+    errno = 0;
     ret = esp_vfs_fat_create_contiguous_file(file_path, path, size, true);
     if (ret != ESP_OK) {
+        const int create_errno = errno;
         ESP_LOGE(TAG,
                  "File: contiguous create failed for %s: "
                  "ret=0x%x errno=%d",
-                 path, ret, errno);
-        return errno == ENOSPC ? ESP_ERR_NO_MEM : ret;
+                 path, ret, create_errno);
+        return create_errno == ENOSPC ? ESP_ERR_NO_MEM : ret;
     }
 
     *created_out = true;

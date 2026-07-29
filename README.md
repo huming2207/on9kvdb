@@ -105,9 +105,7 @@ descriptors used by the application.
 
 For the intended low-write-rate production build, disable
 `CONFIG_FATFS_PER_FILE_CACHE`; otherwise FATFS may allocate one sector cache
-for every permanently open file. The current demo `sdkconfig` still enables
-that option and should be changed when the board/storage integration is
-qualified.
+for every permanently open file. The current demo disables that option.
 
 Before new-store creation, canonical `manifest.db`, `wal_*.db`, and
 `table_*.db` collisions are rejected. A ready store fails closed on missing,
@@ -129,10 +127,13 @@ Provisioning order is:
    generation 1.
 
 A reset before the first ownership sync leaves no durable ownership proof and
-fails closed. After either provisioning manifest is durable, recovery first
-restores two durable provisioning copies, then safely resumes missing
-WAL/SSTable identity writes. A torn `ready` publication selects the older
-provisioning generation and resumes; a valid `ready` publication is
+fails closed. If the reset interrupted allocation of `manifest.db` itself and
+left a nonzero partial canonical file, maintenance must remove the incomplete
+database file set while the component is closed; the component cannot safely
+infer ownership and truncate it. After either provisioning manifest is
+durable, recovery first restores two durable provisioning copies, then safely
+resumes missing WAL/SSTable identity writes. A torn `ready` publication selects
+the older provisioning generation and resumes; a valid `ready` publication is
 authoritative.
 
 ## FATFS platform contract
@@ -159,6 +160,10 @@ platform contract rather than a dependency on private FatFs/VFS structures.
 ## Approved v1 behavior
 
 - One namespace handle selects one namespace.
+- Opaque handles keep their 32-bit ABI but use nine slot-token bits and a
+  non-wrapping 23-bit generation. Exhausting a generation counter returns
+  `ESP_ERR_INVALID_STATE` rather than aliasing an old handle; the default
+  workload would take more than a millennium to reach that boundary.
 - Namespace and key names contain 1 through 32 bytes, excluding the C-string
   terminator.
 - Integers, strings, and blobs follow an NVS-familiar typed API.
@@ -231,6 +236,28 @@ recover as committed; an incomplete commit must recover as uncommitted.
 Filesystem journaling is supplied by the application/platform. Database-level
 atomicity still comes from the WAL, manifest, checksums, and copy-on-write
 SSTable publication.
+
+### Performance model
+
+Every non-empty commit appends at least one complete 4096-byte WAL frame and
+calls `fsync()` before publishing the mutations in RAM. A one-byte set and an
+erase tombstone therefore have almost the same fixed write cost. On SPI NOR
+behind FATFS and wear levelling, that path is expected to be much slower than
+NVS appending a compact entry directly to its partition.
+
+The default 256 KiB WAL has 240 KiB of frame space, or 60 one-frame
+transactions. WAL rotation can synchronously flush or compact tables and
+publish manifests, producing the multi-second tail-latency samples seen in the
+demo. After records move out of the memtable, reads may also scan SSTables
+because v1 deliberately has no Bloom filter or data-block cache.
+
+Without weakening durability or changing storage revision 4, applications can
+amortize the fixed WAL sync by grouping up to ten related mutations in one
+transaction. A smaller WAL frame, deferred/group commit, a raw-partition WAL,
+or a bounded table cache are possible future performance designs, but each
+changes the current format, durability, backend, or RAM contract and requires
+separate measurement and approval. Removing `fsync()` is not a valid
+optimization for durable commits.
 
 ## Common persisted prefix
 

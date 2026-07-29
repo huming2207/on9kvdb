@@ -169,6 +169,27 @@ namespace
                                static_cast<uint64_t>(odd.table_count) * odd.table_size;
         EXPECT_TRUE(!on9kvdb_def::validate_compaction_capacity(odd, limits));
 
+        on9kvdb_def::storage_geometry short_wal = make_geometry(512U * 1024U);
+        short_wal.wal_size = on9kvdb_def::wal_record_region_offset;
+        short_wal.provisioned_size = short_wal.manifest_size + static_cast<uint64_t>(short_wal.wal_count) * short_wal.wal_size +
+                                     static_cast<uint64_t>(short_wal.table_count) * short_wal.table_size;
+        EXPECT_TRUE(!on9kvdb_def::validate_storage_geometry(short_wal));
+        short_wal.wal_size += on9kvdb_def::wal_frame_size;
+        short_wal.provisioned_size = short_wal.manifest_size + static_cast<uint64_t>(short_wal.wal_count) * short_wal.wal_size +
+                                     static_cast<uint64_t>(short_wal.table_count) * short_wal.table_size;
+        EXPECT_TRUE(on9kvdb_def::validate_storage_geometry(short_wal));
+
+        on9kvdb_def::storage_geometry excessive_index = make_geometry(64U * 1024U);
+        static const constexpr uint32_t data_block_count = 1000;
+        excessive_index.table_size = on9kvdb_def::table_data_region_offset +
+                                     (data_block_count + 1U) * limits.sstable_block_bytes + on9kvdb_def::table_footer_slot_size;
+        excessive_index.provisioned_size = excessive_index.manifest_size +
+                                           static_cast<uint64_t>(excessive_index.wal_count) * excessive_index.wal_size +
+                                           static_cast<uint64_t>(excessive_index.table_count) * excessive_index.table_size;
+        EXPECT_TRUE(on9kvdb_def::validate_storage_geometry(excessive_index));
+        EXPECT_TRUE(on9kvdb_def::validate_logical_limits(limits));
+        EXPECT_TRUE(!on9kvdb_def::validate_compaction_capacity(excessive_index, limits));
+
         EXPECT_TRUE(next_fit_block_count(768U * 1024U) <= 3U * 47U);
         EXPECT_TRUE(next_fit_block_count(1024U * 1024U) > 3U * 47U);
     }

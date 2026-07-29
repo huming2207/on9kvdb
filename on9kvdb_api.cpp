@@ -1,4 +1,7 @@
+#include <inttypes.h>
 #include <cstring>
+
+#include <esp_log.h>
 
 #include "on9kvdb.hpp"
 
@@ -19,7 +22,7 @@ esp_err_t on9kvdb::get_handle_slot_unsafe(on9kvdb_handle handle, const handle_sl
     }
 
     uint16_t slot_index = 0;
-    uint16_t generation = 0;
+    uint32_t generation = 0;
     if (!on9kvdb_def::decode_handle_value(handle.raw, &slot_index, &generation) ||
         slot_index >= CONFIG_ON9KVDB_MAX_OPEN_HANDLES) {
         return ESP_ERR_INVALID_ARG;
@@ -54,7 +57,7 @@ esp_err_t on9kvdb::get_transaction_unsafe(on9kvdb_transaction_handle transaction
     }
 
     uint16_t slot_index = 0;
-    uint16_t generation = 0;
+    uint32_t generation = 0;
     if (!on9kvdb_def::decode_handle_value(transaction_handle.raw, &slot_index, &generation) || slot_index != 0 ||
         transaction == nullptr || !transaction->active || transaction->generation != generation) {
         return ESP_ERR_INVALID_ARG;
@@ -78,7 +81,7 @@ void on9kvdb::clear_transaction_unsafe()
         return;
     }
 
-    const uint16_t generation = transaction->generation;
+    const uint32_t generation = transaction->generation;
     if (transaction->active && transaction->handle_slot_index < CONFIG_ON9KVDB_MAX_OPEN_HANDLES) {
         handle_slot &handle = handles[transaction->handle_slot_index];
         if (handle.used && handle.generation == transaction->handle_generation) {
@@ -122,10 +125,12 @@ esp_err_t on9kvdb::open(const char *namespace_name, on9kvdb_open_mode mode, on9k
             continue;
         }
 
-        uint16_t generation = static_cast<uint16_t>(slot.generation + 1U);
-        if (generation == 0) {
-            generation = 1;
+        if (handle_generation_counter == 0) {
+            release_operation_lock();
+            return ESP_ERR_INVALID_STATE;
         }
+        const uint32_t generation = handle_generation_counter;
+        handle_generation_counter = generation == on9kvdb_def::max_handle_generation ? 0 : handle_generation_counter + 1U;
         slot = {};
         slot.generation = generation;
         slot.used = true;
@@ -154,7 +159,7 @@ esp_err_t on9kvdb::close(on9kvdb_handle handle)
         ret = ESP_ERR_INVALID_STATE;
     }
     if (ret == ESP_OK) {
-        const uint16_t generation = slot->generation;
+        const uint32_t generation = slot->generation;
         *slot = {};
         slot->generation = generation;
     }
@@ -184,17 +189,20 @@ esp_err_t on9kvdb::begin(on9kvdb_handle handle, on9kvdb_transaction_handle *tran
         ret = ESP_ERR_INVALID_STATE;
     }
     if (ret == ESP_OK) {
-        uint16_t generation = static_cast<uint16_t>(transaction->generation + 1U);
-        if (generation == 0) {
-            generation = 1;
+        if (transaction_generation_counter == 0) {
+            ret = ESP_ERR_INVALID_STATE;
+        } else {
+            const uint32_t generation = transaction_generation_counter;
+            transaction_generation_counter =
+                generation == on9kvdb_def::max_handle_generation ? 0 : transaction_generation_counter + 1U;
+            *transaction = {};
+            transaction->generation = generation;
+            transaction->handle_slot_index = handle_index;
+            transaction->handle_generation = handle_state->generation;
+            transaction->active = true;
+            handle_state->transaction_active = true;
+            *transaction_out = on9kvdb_transaction_handle(on9kvdb_def::make_handle_value(0, generation));
         }
-        *transaction = {};
-        transaction->generation = generation;
-        transaction->handle_slot_index = handle_index;
-        transaction->handle_generation = handle_state->generation;
-        transaction->active = true;
-        handle_state->transaction_active = true;
-        *transaction_out = on9kvdb_transaction_handle(on9kvdb_def::make_handle_value(0, generation));
     }
 
     release_operation_lock();
@@ -389,8 +397,10 @@ esp_err_t on9kvdb::commit(on9kvdb_transaction_handle transaction_handle)
             ret = preflight_memtable_transaction_unsafe(*transaction_state, handle.namespace_name, &namespace_index);
         }
     }
+    bool wal_durable = false;
     if (ret == ESP_OK) {
         ret = append_transaction_unsafe(transaction_state, handle);
+        wal_durable = ret == ESP_OK;
     }
     if (ret == ESP_OK) {
         ret = ensure_namespace_capacity_unsafe(handle.namespace_name, &namespace_index, true);
@@ -401,6 +411,14 @@ esp_err_t on9kvdb::commit(on9kvdb_transaction_handle transaction_handle)
             next_transaction_sequence += 1U;
             clear_transaction_unsafe();
         }
+    }
+    if (wal_durable && ret != ESP_OK) {
+        // The transaction is already durable, so retrying it with the same sequence would create a duplicate WAL record.
+        // Latch the fault and require recovery to publish the durable transaction into a fresh memtable.
+        ESP_LOGE(TAG, "Commit: post-WAL publication invariant failed: ret=%s, sequence=%" PRIu64, esp_err_to_name(ret),
+                 next_transaction_sequence);
+        storage_faulted = true;
+        clear_transaction_unsafe();
     }
 
     release_operation_lock();

@@ -256,24 +256,24 @@ bool on9kvdb_def::validate_name(const char *name, size_t *length_out)
     return true;
 }
 
-uint32_t on9kvdb_def::make_handle_value(uint16_t slot, uint16_t generation)
+uint32_t on9kvdb_def::make_handle_value(uint16_t slot, uint32_t generation)
 {
-    if (slot == UINT16_MAX || generation == 0) {
+    if (slot >= handle_slot_capacity || generation == 0 || generation > max_handle_generation) {
         return 0;
     }
 
-    return (static_cast<uint32_t>(generation) << 16U) | (static_cast<uint32_t>(slot) + 1U);
+    return (generation << handle_slot_bits) | (static_cast<uint32_t>(slot) + 1U);
 }
 
-bool on9kvdb_def::decode_handle_value(uint32_t value, uint16_t *slot_out, uint16_t *generation_out)
+bool on9kvdb_def::decode_handle_value(uint32_t value, uint16_t *slot_out, uint32_t *generation_out)
 {
     if (slot_out == nullptr || generation_out == nullptr) {
         return false;
     }
 
-    const uint16_t slot_token = static_cast<uint16_t>(value & UINT16_MAX);
-    const uint16_t generation = static_cast<uint16_t>(value >> 16U);
-    if (slot_token == 0 || generation == 0) {
+    const uint32_t slot_token = value & handle_slot_mask;
+    const uint32_t generation = value >> handle_slot_bits;
+    if (slot_token == 0 || slot_token > handle_slot_capacity || generation == 0) {
         return false;
     }
 
@@ -282,7 +282,7 @@ bool on9kvdb_def::decode_handle_value(uint32_t value, uint16_t *slot_out, uint16
     return true;
 }
 
-bool on9kvdb_def::is_handle_value(uint32_t value, uint16_t slot, uint16_t generation)
+bool on9kvdb_def::is_handle_value(uint32_t value, uint16_t slot, uint32_t generation)
 {
     return value != 0 && value == make_handle_value(slot, generation);
 }
@@ -334,6 +334,9 @@ on9kvdb_def::format_status on9kvdb_def::decode_file_prefix(const uint8_t *buf, s
         return format_status::invalid_size;
     }
 
+    if (checksum != calc_file_prefix_crc(buf)) {
+        return format_status::corrupt;
+    }
     if (magic != expected_magic) {
         return format_status::invalid_magic;
     }
@@ -352,9 +355,6 @@ on9kvdb_def::format_status on9kvdb_def::decode_file_prefix(const uint8_t *buf, s
     if (generation == 0) {
         return format_status::invalid_generation;
     }
-    if (checksum != calc_file_prefix_crc(buf)) {
-        return format_status::corrupt;
-    }
 
     decoded_file_prefix prefix = {};
     prefix.magic = magic;
@@ -371,7 +371,7 @@ on9kvdb_def::format_status on9kvdb_def::decode_file_prefix(const uint8_t *buf, s
 bool on9kvdb_def::validate_storage_geometry(const storage_geometry &geometry)
 {
     if (geometry.provisioned_size == 0 || geometry.max_live_bytes == 0 || geometry.max_live_bytes > geometry.provisioned_size ||
-        geometry.manifest_size != manifest_file_size || geometry.wal_size <= identity_region_size ||
+        geometry.manifest_size != manifest_file_size || geometry.wal_size < wal_record_region_offset + wal_frame_size ||
         geometry.wal_count != wal_file_count || geometry.table_size <= identity_region_size || geometry.table_count < 4 ||
         geometry.table_count > max_table_count || (geometry.table_count & 1U) != 0 || geometry.alignment != format_alignment ||
         geometry.manifest_size % format_alignment != 0 || geometry.wal_size % format_alignment != 0 ||
@@ -423,7 +423,14 @@ bool on9kvdb_def::validate_compaction_capacity(const storage_geometry &geometry,
     }
 
     const uint64_t data_blocks_per_table = data_region_bytes / limits.sstable_block_bytes;
-    const uint64_t bank_block_count = data_blocks_per_table * (geometry.table_count / 2U);
+    uint64_t bank_block_count = 0;
+    uint64_t maximum_index_bytes = 0;
+    const uint64_t maximum_index_entry_size = (table_index_entry_header_size + 2U * max_name_len + 3U) & ~UINT64_C(3);
+    if (!checked_mul_u64(data_blocks_per_table, geometry.table_count / 2U, &bank_block_count) ||
+        !checked_mul_u64(data_blocks_per_table, maximum_index_entry_size, &maximum_index_bytes) ||
+        maximum_index_bytes > limits.sstable_block_bytes - table_index_header_size) {
+        return false;
+    }
     const uint64_t block_payload_bytes = limits.sstable_block_bytes - table_block_header_size;
 
     // Next-fit block packing guarantees that every completed pair of blocks contains more than one block of encoded records.
@@ -632,6 +639,7 @@ bool on9kvdb_def::encode_manifest_record(uint8_t *buf, size_t buf_len, const man
 
     if (buf == nullptr || buf_len < manifest_record_size || record.generation == 0 || record.database_id == 0 ||
         (record.state != manifest_state_provisioning_owned && record.state != manifest_state_ready) ||
+        (record.state == manifest_state_ready && record.generation < 3) ||
         !validate_compaction_capacity(record.geometry, record.limits) || record.active_wal_slot >= wal_file_count ||
         record.next_table_generation == 0 || !table_references_valid ||
         greatest_table_generation >= record.next_table_generation || greatest_table_sequence != record.safe_checkpoint_sequence ||
@@ -905,6 +913,9 @@ on9kvdb_def::format_status on9kvdb_def::decode_wal_header(const uint8_t *buf, si
     if (!decoded) {
         return format_status::invalid_size;
     }
+    if (checksum != calc_record_crc(buf, wal_header_size, wal_header_checksum_offset)) {
+        return format_status::corrupt;
+    }
     if (magic != wal_header_magic) {
         return format_status::invalid_magic;
     }
@@ -922,9 +933,6 @@ on9kvdb_def::format_status on9kvdb_def::decode_wal_header(const uint8_t *buf, si
         header.record_region_start != wal_record_region_offset || header.record_region_end <= header.record_region_start ||
         header.record_region_end % wal_frame_size != 0 || header.frame_size != wal_frame_size || reserved16 != 0 ||
         !is_zero_range(buf, 44, 4) || !is_zero_range(buf, 56, 4)) {
-        return format_status::corrupt;
-    }
-    if (checksum != calc_record_crc(buf, wal_header_size, wal_header_checksum_offset)) {
         return format_status::corrupt;
     }
 
@@ -1009,6 +1017,9 @@ on9kvdb_def::format_status on9kvdb_def::decode_wal_frame(const uint8_t *frame, s
     if (!decoded) {
         return format_status::invalid_size;
     }
+    if (frame_checksum != calc_record_crc(frame, wal_frame_size, wal_frame_checksum_offset)) {
+        return format_status::corrupt;
+    }
     if (magic != wal_frame_magic) {
         return format_status::invalid_magic;
     }
@@ -1033,8 +1044,7 @@ on9kvdb_def::format_status on9kvdb_def::decode_wal_frame(const uint8_t *frame, s
     }
 
     const uint8_t *payload = frame + wal_frame_header_size;
-    if (header.payload_checksum != calc_crc32(payload, header.payload_size) ||
-        frame_checksum != calc_record_crc(frame, wal_frame_size, wal_frame_checksum_offset)) {
+    if (header.payload_checksum != calc_crc32(payload, header.payload_size)) {
         return format_status::corrupt;
     }
 
@@ -1060,16 +1070,24 @@ namespace
 
     bool valid_table_metadata(const on9kvdb_def::table_metadata &metadata)
     {
+        uint64_t data_blocks_bytes = 0;
+        uint64_t data_region_end = 0;
+        uint64_t index_region_end = 0;
+        if (!on9kvdb_def::checked_mul_u64(metadata.data_block_count, metadata.block_size, &data_blocks_bytes) ||
+            !on9kvdb_def::checked_add_u64(metadata.data_region_start, data_blocks_bytes, &data_region_end) ||
+            !on9kvdb_def::checked_add_u64(metadata.index_offset, metadata.block_size, &index_region_end)) {
+            return false;
+        }
+
         return metadata.database_id != 0 && metadata.generation != 0 && metadata.min_sequence != 0 &&
                metadata.max_sequence >= metadata.min_sequence && metadata.slot < on9kvdb_def::max_table_count &&
                metadata.level == 0 && metadata.block_size > on9kvdb_def::table_block_header_size &&
                metadata.block_size % on9kvdb_def::format_alignment == 0 &&
                metadata.data_region_start == on9kvdb_def::table_data_region_offset && metadata.data_block_count > 0 &&
-               metadata.index_offset >= metadata.data_region_start + metadata.data_block_count * metadata.block_size &&
+               metadata.index_offset >= data_region_end &&
                (metadata.index_offset - metadata.data_region_start) % metadata.block_size == 0 &&
-               metadata.footer_offset == metadata.index_offset + metadata.block_size &&
-               metadata.footer_offset % on9kvdb_def::format_alignment == 0 && metadata.entry_count > 0 &&
-               metadata.data_block_count <= metadata.entry_count && metadata.data_bytes > 0 &&
+               metadata.footer_offset == index_region_end && metadata.footer_offset % on9kvdb_def::format_alignment == 0 &&
+               metadata.entry_count > 0 && metadata.data_block_count <= metadata.entry_count && metadata.data_bytes > 0 &&
                valid_composite_key(metadata.min_key) && valid_composite_key(metadata.max_key) &&
                on9kvdb_def::compare_composite_key(metadata.min_key, metadata.max_key) <= 0;
     }
@@ -1152,6 +1170,9 @@ on9kvdb_def::format_status on9kvdb_def::decode_table_metadata(const uint8_t *buf
     if (!decoded) {
         return format_status::invalid_size;
     }
+    if (checksum != calc_record_crc(buf, table_metadata_size, table_metadata_checksum_offset)) {
+        return format_status::corrupt;
+    }
     if (magic != expected_magic) {
         return format_status::invalid_magic;
     }
@@ -1189,8 +1210,7 @@ on9kvdb_def::format_status on9kvdb_def::decode_table_metadata(const uint8_t *buf
         !is_zero_range(buf, 120 + metadata.min_key.key_size, max_name_len - metadata.min_key.key_size) ||
         !is_zero_range(buf, 152 + metadata.max_key.namespace_size, max_name_len - metadata.max_key.namespace_size) ||
         !is_zero_range(buf, 184 + metadata.max_key.key_size, max_name_len - metadata.max_key.key_size) ||
-        !valid_table_metadata(metadata) ||
-        checksum != calc_record_crc(buf, table_metadata_size, table_metadata_checksum_offset)) {
+        !valid_table_metadata(metadata)) {
         return format_status::corrupt;
     }
 
@@ -1249,6 +1269,9 @@ on9kvdb_def::format_status on9kvdb_def::decode_table_block_header(const uint8_t 
     if (!decoded) {
         return format_status::invalid_size;
     }
+    if (checksum != calc_record_crc(block, block_len, table_block_checksum_offset)) {
+        return format_status::corrupt;
+    }
     if (magic != table_block_magic) {
         return format_status::invalid_magic;
     }
@@ -1264,8 +1287,7 @@ on9kvdb_def::format_status on9kvdb_def::decode_table_block_header(const uint8_t 
     if (header.generation == 0 || header.entry_count == 0 || header.payload_size == 0 || reserved != 0 ||
         !is_zero_range(block, 28, 32) ||
         !is_zero_range(block, table_block_header_size + header.payload_size,
-                       block_len - table_block_header_size - header.payload_size) ||
-        checksum != calc_record_crc(block, block_len, table_block_checksum_offset)) {
+                       block_len - table_block_header_size - header.payload_size)) {
         return format_status::corrupt;
     }
     *header_out = header;
@@ -1314,6 +1336,9 @@ on9kvdb_def::format_status on9kvdb_def::decode_table_index_header(const uint8_t 
     if (!decoded) {
         return format_status::invalid_size;
     }
+    if (checksum != calc_record_crc(block, block_len, table_index_checksum_offset)) {
+        return format_status::corrupt;
+    }
     if (magic != table_index_magic) {
         return format_status::invalid_magic;
     }
@@ -1329,8 +1354,7 @@ on9kvdb_def::format_status on9kvdb_def::decode_table_index_header(const uint8_t 
     if (header.generation == 0 || header.entry_count == 0 || header.payload_size == 0 || header.data_block_count == 0 ||
         header.entry_count != header.data_block_count || !is_zero_range(block, 28, 32) ||
         !is_zero_range(block, table_index_header_size + header.payload_size,
-                       block_len - table_index_header_size - header.payload_size) ||
-        checksum != calc_record_crc(block, block_len, table_index_checksum_offset)) {
+                       block_len - table_index_header_size - header.payload_size)) {
         return format_status::corrupt;
     }
     *header_out = header;

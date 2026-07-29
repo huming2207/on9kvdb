@@ -614,8 +614,9 @@ esp_err_t on9kvdb::compact_tables_unsafe()
             break;
         }
         processed_entries += 1U;
-        if ((processed_entries & UINT32_C(63)) == 0) {
-            taskYIELD();
+        if ((processed_entries & UINT32_C(15)) == 0) {
+            // taskYIELD() only offers the CPU to equal-priority tasks; block for one tick so IDLE can feed the task WDT.
+            vTaskDelay(1);
         }
     }
 

@@ -276,6 +276,9 @@ namespace
         record.wal_generation[0] = 1;
 
         uint8_t encoded[on9kvdb_def::manifest_record_size] = {};
+        record.generation = 2;
+        EXPECT_TRUE(!on9kvdb_def::encode_manifest_record(encoded, sizeof(encoded), record));
+        record.generation = 7;
         EXPECT_TRUE(on9kvdb_def::encode_manifest_record(encoded, sizeof(encoded), record));
         on9kvdb_def::manifest_record decoded = {};
         EXPECT_EQ(on9kvdb_def::format_status::ok, on9kvdb_def::decode_manifest_record(encoded, sizeof(encoded), &decoded));

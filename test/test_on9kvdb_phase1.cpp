@@ -40,6 +40,14 @@ TEST_CASE("on9kvdb Phase 1 file prefix detects corruption", "[on9kvdb]")
                       static_cast<int>(on9kvdb_def::decode_file_prefix(encoded, sizeof(encoded), on9kvdb_def::manifest_magic,
                                                                        on9kvdb_def::file_kind::manifest, &decoded)));
 
+    encoded[4] = 0xff;
+    encoded[5] = 0xff;
+    TEST_ASSERT_EQUAL(static_cast<int>(on9kvdb_def::format_status::corrupt),
+                      static_cast<int>(on9kvdb_def::decode_file_prefix(encoded, sizeof(encoded), on9kvdb_def::manifest_magic,
+                                                                       on9kvdb_def::file_kind::manifest, &decoded)));
+    encoded[4] = static_cast<uint8_t>(on9kvdb_def::storage_revision);
+    encoded[5] = 0;
+
     encoded[20] ^= 0x01;
     TEST_ASSERT_EQUAL(static_cast<int>(on9kvdb_def::format_status::corrupt),
                       static_cast<int>(on9kvdb_def::decode_file_prefix(encoded, sizeof(encoded), on9kvdb_def::manifest_magic,

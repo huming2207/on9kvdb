@@ -2,8 +2,12 @@
 
 #include "on9kvdb.hpp"
 
+#include <freertos/task.h>
+
 namespace
 {
+    static const constexpr uint32_t recovery_entry_delay_interval = 8;
+
     uint32_t align_table_entry_size(uint32_t size)
     {
         return (size + 7U) & ~UINT32_C(7);
@@ -255,10 +259,24 @@ esp_err_t on9kvdb::flush_memtable_unsafe()
     uint8_t *index_block = data_block + manifest.limits.sstable_block_bytes;
     uint32_t offset_count = 0;
     for (uint32_t bucket = 0; bucket < CONFIG_ON9KVDB_MEMTABLE_ENTRY_COUNT; bucket += 1) {
-        if (memtable_index[bucket].record_offset != UINT32_MAX) {
-            offsets[offset_count] = memtable_index[bucket].record_offset;
-            offset_count += 1U;
+        const memtable_bucket &entry = memtable_index[bucket];
+        if (entry.record_offset == UINT32_MAX) {
+            continue;
         }
+        if (entry.record_size < sizeof(memtable_record_header) || entry.record_size > CONFIG_ON9KVDB_MEMTABLE_DATA_SIZE ||
+            entry.record_offset > CONFIG_ON9KVDB_MEMTABLE_DATA_SIZE - entry.record_size) {
+            return ESP_ERR_INVALID_STATE;
+        }
+        const auto *record = reinterpret_cast<const memtable_record_header *>(memtable_data + entry.record_offset);
+        const uint32_t record_header_bytes = static_cast<uint32_t>(sizeof(memtable_record_header));
+        if (record->total_size != entry.record_size || record->key_size == 0 || record->key_size > on9kvdb_def::max_name_len ||
+            record->value_size > entry.record_size - record_header_bytes ||
+            record->key_size > entry.record_size - record_header_bytes - record->value_size ||
+            record->namespace_slot_index >= CONFIG_ON9KVDB_MAX_NAMESPACES || !namespaces[record->namespace_slot_index].used) {
+            return ESP_ERR_INVALID_STATE;
+        }
+        offsets[offset_count] = entry.record_offset;
+        offset_count += 1U;
     }
     if (offset_count != memtable_entry_count) {
         return ESP_ERR_INVALID_STATE;
@@ -290,9 +308,6 @@ esp_err_t on9kvdb::flush_memtable_unsafe()
 
     for (uint32_t idx = 0; idx < offset_count; idx += 1) {
         const auto *record = reinterpret_cast<const memtable_record_header *>(memtable_data + offsets[idx]);
-        if (record->namespace_slot_index >= CONFIG_ON9KVDB_MAX_NAMESPACES || !namespaces[record->namespace_slot_index].used) {
-            return ESP_ERR_INVALID_STATE;
-        }
         const namespace_slot &record_namespace = namespaces[record->namespace_slot_index];
         const uint8_t *record_key = reinterpret_cast<const uint8_t *>(record + 1);
         const uint8_t *record_value = record_key + record->key_size;
@@ -734,12 +749,15 @@ esp_err_t on9kvdb::recover_tables_unsafe()
         stats.table_bytes_used += on9kvdb_def::table_header_region_size +
                                   static_cast<uint64_t>(reference.data_block_count + 1U) * manifest.limits.sstable_block_bytes +
                                   on9kvdb_def::table_footer_slot_size;
+        // A yield does not allow the lower-priority idle task to run while recovery remains ready.
+        vTaskDelay(1);
     }
 
     // Rebuild namespace and logical statistics from immutable records. The bounded implementation deliberately accepts a
     // slower startup here: each record is counted only when no newer table contains the same composite key.
     const size_t sort_bytes = static_cast<size_t>(CONFIG_ON9KVDB_MEMTABLE_ENTRY_COUNT) * sizeof(uint32_t);
     uint8_t *data_block = future_scratch + sort_bytes;
+    uint32_t entries_since_delay = 0;
     for (uint32_t slot = 0; slot < manifest.geometry.table_count; slot += 1) {
         const on9kvdb_def::table_reference &reference = manifest.tables[slot];
         if (!reference.active) {
@@ -798,6 +816,16 @@ esp_err_t on9kvdb::recover_tables_unsafe()
                         return ret;
                     }
                 }
+
+                entries_since_delay += 1U;
+                if (entries_since_delay >= recovery_entry_delay_interval) {
+                    vTaskDelay(1);
+                    entries_since_delay = 0;
+                }
+            }
+            if (entries_since_delay != 0) {
+                vTaskDelay(1);
+                entries_since_delay = 0;
             }
         }
     }

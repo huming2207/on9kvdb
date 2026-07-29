@@ -103,15 +103,21 @@ esp_err_t on9kvdb::find_memtable_bucket_unsafe(uint16_t namespace_slot_index, co
             *found_out = false;
             return ESP_OK;
         }
-        if (bucket.hash != hash || bucket.record_size < sizeof(memtable_record_header) ||
-            bucket.record_offset > CONFIG_ON9KVDB_MEMTABLE_DATA_SIZE - bucket.record_size) {
+        if (bucket.hash != hash) {
             continue;
+        }
+        if (bucket.record_size < sizeof(memtable_record_header) || bucket.record_size > CONFIG_ON9KVDB_MEMTABLE_DATA_SIZE ||
+            bucket.record_offset > CONFIG_ON9KVDB_MEMTABLE_DATA_SIZE - bucket.record_size) {
+            return ESP_ERR_INVALID_STATE;
         }
 
         const auto *header = reinterpret_cast<const memtable_record_header *>(memtable_data + bucket.record_offset);
         if (header->total_size != bucket.record_size || header->key_size == 0 || header->key_size > on9kvdb_def::max_name_len ||
-            header->namespace_slot_index != namespace_slot_index) {
+            header->namespace_slot_index >= CONFIG_ON9KVDB_MAX_NAMESPACES || !namespaces[header->namespace_slot_index].used) {
             return ESP_ERR_INVALID_STATE;
+        }
+        if (header->namespace_slot_index != namespace_slot_index) {
+            continue;
         }
         const char *record_key = reinterpret_cast<const char *>(header + 1);
         if (header->key_size == key_size && memcmp(record_key, key, key_size) == 0) {
@@ -121,7 +127,10 @@ esp_err_t on9kvdb::find_memtable_bucket_unsafe(uint16_t namespace_slot_index, co
         }
     }
 
-    return ESP_ERR_NO_MEM;
+    // A full probe is a normal lookup miss. Callers that intend to insert distinguish it by the sentinel bucket index.
+    *bucket_index_out = UINT32_MAX;
+    *found_out = false;
+    return ESP_OK;
 }
 
 esp_err_t on9kvdb::lookup_memtable_unsafe(const char *namespace_name, const char *key, value_view *view_out) const
@@ -323,6 +332,9 @@ esp_err_t on9kvdb::apply_transaction_to_memtable_unsafe(const transaction_slot &
             find_memtable_bucket_unsafe(namespace_slot_index, mutation.key, mutation.key_size, &bucket_index, &found);
         if (find_ret != ESP_OK) {
             return find_ret;
+        }
+        if (!found && bucket_index == UINT32_MAX) {
+            return ESP_ERR_NO_MEM;
         }
 
         if (found) {

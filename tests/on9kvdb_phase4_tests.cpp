@@ -228,7 +228,26 @@ namespace
                   on9kvdb_def::decode_table_metadata(encoded, sizeof(encoded), on9kvdb_def::table_header_magic, &decoded));
         EXPECT_TRUE(on9kvdb_def::table_metadata_equal(metadata, decoded));
 
+        encoded[4] = 0xff;
+        encoded[5] = 0xff;
+        EXPECT_EQ(on9kvdb_def::format_status::corrupt,
+                  on9kvdb_def::decode_table_metadata(encoded, sizeof(encoded), on9kvdb_def::table_header_magic, &decoded));
+        encoded[4] = static_cast<uint8_t>(on9kvdb_def::table_header_revision);
+        encoded[5] = 0;
+
         encoded[56] ^= 1U;
+        EXPECT_EQ(on9kvdb_def::format_status::corrupt,
+                  on9kvdb_def::decode_table_metadata(encoded, sizeof(encoded), on9kvdb_def::table_header_magic, &decoded));
+
+        EXPECT_TRUE(on9kvdb_def::encode_table_metadata(encoded, sizeof(encoded), on9kvdb_def::table_header_magic, metadata));
+        EXPECT_TRUE(on9kvdb_def::write_u32_le(encoded, sizeof(encoded), 32, 4096));
+        EXPECT_TRUE(on9kvdb_def::write_u32_le(encoded, sizeof(encoded), 40, UINT32_C(1048572)));
+        EXPECT_TRUE(on9kvdb_def::write_u32_le(encoded, sizeof(encoded), 44, UINT32_C(0xffffc000)));
+        EXPECT_TRUE(on9kvdb_def::write_u32_le(encoded, sizeof(encoded), 48, UINT32_C(0xffffd000)));
+        EXPECT_TRUE(on9kvdb_def::write_u32_le(encoded, sizeof(encoded), 52, UINT32_MAX));
+        EXPECT_TRUE(on9kvdb_def::write_u32_le(encoded, sizeof(encoded), on9kvdb_def::table_metadata_checksum_offset, 0));
+        EXPECT_TRUE(on9kvdb_def::write_u32_le(encoded, sizeof(encoded), on9kvdb_def::table_metadata_checksum_offset,
+                                              on9kvdb_def::calc_crc32(encoded, sizeof(encoded))));
         EXPECT_EQ(on9kvdb_def::format_status::corrupt,
                   on9kvdb_def::decode_table_metadata(encoded, sizeof(encoded), on9kvdb_def::table_header_magic, &decoded));
     }
@@ -264,6 +283,14 @@ namespace
         on9kvdb_def::table_block_header decoded_header = {};
         EXPECT_EQ(on9kvdb_def::format_status::ok,
                   on9kvdb_def::decode_table_block_header(data_block, sizeof(data_block), &decoded_header));
+
+        data_block[4] = 0xff;
+        data_block[5] = 0xff;
+        EXPECT_EQ(on9kvdb_def::format_status::corrupt,
+                  on9kvdb_def::decode_table_block_header(data_block, sizeof(data_block), &decoded_header));
+        data_block[4] = static_cast<uint8_t>(on9kvdb_def::table_block_revision);
+        data_block[5] = 0;
+
         on9kvdb_def::table_entry decoded_entry = {};
         EXPECT_EQ(on9kvdb_def::format_status::ok,
                   on9kvdb_def::decode_table_entry(data_block, sizeof(data_block), on9kvdb_def::table_block_header_size,
@@ -290,6 +317,11 @@ namespace
         index_header.data_block_count = 1;
         EXPECT_TRUE(on9kvdb_def::encode_table_index_header(index_block, sizeof(index_block), index_header));
         EXPECT_EQ(on9kvdb_def::format_status::ok,
+                  on9kvdb_def::decode_table_index_header(index_block, sizeof(index_block), &index_header));
+
+        index_block[4] = 0xff;
+        index_block[5] = 0xff;
+        EXPECT_EQ(on9kvdb_def::format_status::corrupt,
                   on9kvdb_def::decode_table_index_header(index_block, sizeof(index_block), &index_header));
 
         data_block[on9kvdb_def::table_block_header_size + entry_size] = 1;

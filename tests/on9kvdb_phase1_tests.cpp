@@ -246,13 +246,19 @@ namespace
         EXPECT_TRUE(value != 0);
 
         uint16_t slot = 0;
-        uint16_t generation = 0;
+        uint32_t generation = 0;
         EXPECT_TRUE(on9kvdb_def::decode_handle_value(value, &slot, &generation));
         EXPECT_EQ(static_cast<uint16_t>(7), slot);
-        EXPECT_EQ(static_cast<uint16_t>(9), generation);
+        EXPECT_EQ(UINT32_C(9), generation);
         EXPECT_TRUE(on9kvdb_def::is_handle_value(value, 7, 9));
         EXPECT_TRUE(!on9kvdb_def::is_handle_value(value, 7, 10));
         EXPECT_EQ(UINT32_C(0), on9kvdb_def::make_handle_value(UINT16_MAX, 1));
+        const uint32_t maximum = on9kvdb_def::make_handle_value(255, on9kvdb_def::max_handle_generation);
+        EXPECT_TRUE(on9kvdb_def::decode_handle_value(maximum, &slot, &generation));
+        EXPECT_EQ(static_cast<uint16_t>(255), slot);
+        EXPECT_EQ(on9kvdb_def::max_handle_generation, generation);
+        EXPECT_EQ(UINT32_C(0), on9kvdb_def::make_handle_value(256, 1));
+        EXPECT_EQ(UINT32_C(0), on9kvdb_def::make_handle_value(0, on9kvdb_def::max_handle_generation + 1U));
         EXPECT_EQ(UINT32_C(0), on9kvdb_def::make_handle_value(0, 0));
         EXPECT_TRUE(!on9kvdb_def::decode_handle_value(0, &slot, &generation));
     }
@@ -277,6 +283,24 @@ namespace
         EXPECT_EQ(UINT32_C(0x11223344), decoded.payload_size);
         EXPECT_EQ(static_cast<uint16_t>(0x1234), decoded.flags);
 
+        encoded[4] = 0xff;
+        encoded[5] = 0xff;
+        EXPECT_EQ(on9kvdb_def::format_status::corrupt,
+                  on9kvdb_def::decode_file_prefix(encoded, sizeof(encoded), on9kvdb_def::wal_magic, on9kvdb_def::file_kind::wal,
+                                                  &decoded));
+        encoded[4] = static_cast<uint8_t>(on9kvdb_def::storage_revision);
+        encoded[5] = 0;
+
+        EXPECT_TRUE(on9kvdb_def::write_u16_le(encoded, sizeof(encoded), 4, on9kvdb_def::storage_revision + 1U));
+        EXPECT_TRUE(on9kvdb_def::write_u32_le(encoded, sizeof(encoded), on9kvdb_def::file_prefix_checksum_offset, 0));
+        EXPECT_TRUE(on9kvdb_def::write_u32_le(encoded, sizeof(encoded), on9kvdb_def::file_prefix_checksum_offset,
+                                              on9kvdb_def::calc_crc32(encoded, sizeof(encoded))));
+        EXPECT_EQ(on9kvdb_def::format_status::new_version,
+                  on9kvdb_def::decode_file_prefix(encoded, sizeof(encoded), on9kvdb_def::wal_magic, on9kvdb_def::file_kind::wal,
+                                                  &decoded));
+
+        EXPECT_TRUE(on9kvdb_def::encode_file_prefix(encoded, sizeof(encoded), on9kvdb_def::wal_magic, on9kvdb_def::file_kind::wal,
+                                                    0x1234, UINT64_C(0x0102030405060708), UINT32_C(0x11223344)));
         encoded[20] ^= 0x01;
         EXPECT_EQ(on9kvdb_def::format_status::corrupt,
                   on9kvdb_def::decode_file_prefix(encoded, sizeof(encoded), on9kvdb_def::wal_magic, on9kvdb_def::file_kind::wal,

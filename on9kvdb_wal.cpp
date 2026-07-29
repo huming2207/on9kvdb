@@ -5,10 +5,14 @@
 
 #include "on9kvdb.hpp"
 
+#include <freertos/task.h>
+
 namespace
 {
     static const constexpr uint32_t transaction_header_size = 8;
     static const constexpr uint32_t mutation_header_size = 8;
+    static const constexpr uint32_t recovery_frame_delay_interval = 8;
+    static const constexpr uint32_t recovery_transaction_delay_interval = 8;
     static const constexpr uint32_t max_transaction_payload_size =
         CONFIG_ON9KVDB_TRANSACTION_STAGING_SIZE + transaction_header_size + on9kvdb_def::max_name_len +
         CONFIG_ON9KVDB_MAX_TRANSACTION_MUTATIONS * (mutation_header_size + on9kvdb_def::max_name_len);
@@ -376,6 +380,9 @@ esp_err_t on9kvdb::parse_recovered_transaction_unsafe(const uint8_t *payload, si
         return ESP_ERR_INVALID_RESPONSE;
     }
 
+    if (memchr(payload + transaction_header_size, '\0', namespace_size) != nullptr) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
     memcpy(namespace_name, payload + transaction_header_size, namespace_size);
     namespace_name[namespace_size] = '\0';
     if (!on9kvdb_def::validate_name(namespace_name)) {
@@ -406,6 +413,9 @@ esp_err_t on9kvdb::parse_recovered_transaction_unsafe(const uint8_t *payload, si
             return ESP_ERR_INVALID_RESPONSE;
         }
 
+        if (memchr(payload + offset, '\0', key_size) != nullptr) {
+            return ESP_ERR_INVALID_RESPONSE;
+        }
         memcpy(mutation.key, payload + offset, key_size);
         mutation.key[key_size] = '\0';
         mutation.key_size = static_cast<uint8_t>(key_size);
@@ -463,6 +473,7 @@ esp_err_t on9kvdb::scan_wal_slot(uint32_t slot, uint64_t generation, uint64_t *e
 
     const int wal_fd = storage_fds[descriptor_index(on9kvdb_def::file_kind::wal, slot)];
     uint32_t offset = wal_header.record_region_start;
+    uint32_t transactions_since_delay = 0;
     while (offset <= wal_header.record_region_end - on9kvdb_def::wal_frame_size) {
         ret = read_exact_fd(wal_fd, manifest.geometry.wal_size, offset, io_frame, on9kvdb_def::wal_frame_size);
         if (ret != ESP_OK) {
@@ -473,26 +484,16 @@ esp_err_t on9kvdb::scan_wal_slot(uint32_t slot, uint64_t generation, uint64_t *e
         const uint8_t *first_payload = nullptr;
         const on9kvdb_def::format_status first_status =
             on9kvdb_def::decode_wal_frame(io_frame, on9kvdb_def::wal_frame_size, &first, &first_payload);
-        if (first_status == on9kvdb_def::format_status::new_version) {
+        if (first_status == on9kvdb_def::format_status::new_version ||
+            first_status == on9kvdb_def::format_status::invalid_revision) {
             return ESP_ERR_INVALID_VERSION;
         }
         if (first_status != on9kvdb_def::format_status::ok) {
             bool later_valid = false;
-            for (uint32_t later = offset + on9kvdb_def::wal_frame_size;
-                 later <= wal_header.record_region_end - on9kvdb_def::wal_frame_size; later += on9kvdb_def::wal_frame_size) {
-                ret = read_exact_fd(wal_fd, manifest.geometry.wal_size, later, io_frame, on9kvdb_def::wal_frame_size);
-                if (ret != ESP_OK) {
-                    return ret;
-                }
-                on9kvdb_def::wal_frame_header candidate = {};
-                const uint8_t *candidate_payload = nullptr;
-                if (on9kvdb_def::decode_wal_frame(io_frame, on9kvdb_def::wal_frame_size, &candidate, &candidate_payload) ==
-                        on9kvdb_def::format_status::ok &&
-                    candidate.database_id == manifest.database_id && candidate.wal_generation == generation &&
-                    candidate.transaction_sequence >= *expected_sequence) {
-                    later_valid = true;
-                    break;
-                }
+            ret = find_later_wal_frame_unsafe(wal_fd, offset + on9kvdb_def::wal_frame_size, wal_header.record_region_end,
+                                              generation, *expected_sequence, &later_valid);
+            if (ret != ESP_OK) {
+                return ret;
             }
             if (later_valid) {
                 return ESP_ERR_INVALID_CRC;
@@ -505,21 +506,10 @@ esp_err_t on9kvdb::scan_wal_slot(uint32_t slot, uint64_t generation, uint64_t *e
             // A valid frame from an older generation therefore marks the new generation's tail unless a later new-generation
             // frame proves that a hole exists.
             bool later_valid = false;
-            for (uint32_t later = offset + on9kvdb_def::wal_frame_size;
-                 later <= wal_header.record_region_end - on9kvdb_def::wal_frame_size; later += on9kvdb_def::wal_frame_size) {
-                ret = read_exact_fd(wal_fd, manifest.geometry.wal_size, later, io_frame, on9kvdb_def::wal_frame_size);
-                if (ret != ESP_OK) {
-                    return ret;
-                }
-                on9kvdb_def::wal_frame_header candidate = {};
-                const uint8_t *candidate_payload = nullptr;
-                if (on9kvdb_def::decode_wal_frame(io_frame, on9kvdb_def::wal_frame_size, &candidate, &candidate_payload) ==
-                        on9kvdb_def::format_status::ok &&
-                    candidate.database_id == manifest.database_id && candidate.wal_generation == generation &&
-                    candidate.transaction_sequence >= *expected_sequence) {
-                    later_valid = true;
-                    break;
-                }
+            ret = find_later_wal_frame_unsafe(wal_fd, offset + on9kvdb_def::wal_frame_size, wal_header.record_region_end,
+                                              generation, *expected_sequence, &later_valid);
+            if (ret != ESP_OK) {
+                return ret;
             }
             if (later_valid) {
                 return ESP_ERR_INVALID_CRC;
@@ -547,6 +537,9 @@ esp_err_t on9kvdb::scan_wal_slot(uint32_t slot, uint64_t generation, uint64_t *e
             const uint8_t *payload_part = nullptr;
             const on9kvdb_def::format_status status =
                 on9kvdb_def::decode_wal_frame(io_frame, on9kvdb_def::wal_frame_size, &frame, &payload_part);
+            if (status == on9kvdb_def::format_status::new_version || status == on9kvdb_def::format_status::invalid_revision) {
+                return ESP_ERR_INVALID_VERSION;
+            }
             if (status != on9kvdb_def::format_status::ok || frame.database_id != first.database_id ||
                 frame.wal_generation != first.wal_generation || frame.transaction_sequence != first.transaction_sequence ||
                 frame.frame_index != frame_index || frame.frame_count != first.frame_count ||
@@ -554,6 +547,16 @@ esp_err_t on9kvdb::scan_wal_slot(uint32_t slot, uint64_t generation, uint64_t *e
                 frame.transaction_payload_size != first.transaction_payload_size ||
                 frame.transaction_checksum != first.transaction_checksum ||
                 frame.payload_size > first.transaction_payload_size - payload_offset) {
+                bool later_valid = false;
+                const uint32_t later_offset = offset + (static_cast<uint32_t>(frame_index) + 1U) * on9kvdb_def::wal_frame_size;
+                ret = find_later_wal_frame_unsafe(wal_fd, later_offset, wal_header.record_region_end, generation,
+                                                  *expected_sequence, &later_valid);
+                if (ret != ESP_OK) {
+                    return ret;
+                }
+                if (later_valid) {
+                    return ESP_ERR_INVALID_CRC;
+                }
                 wal_tail[slot] = offset;
                 return ESP_OK;
             }
@@ -564,6 +567,16 @@ esp_err_t on9kvdb::scan_wal_slot(uint32_t slot, uint64_t generation, uint64_t *e
         }
 
         if (payload_offset != first.transaction_payload_size || ~transaction_crc != first.transaction_checksum) {
+            bool later_valid = false;
+            const uint32_t later_offset = offset + static_cast<uint32_t>(first.frame_count) * on9kvdb_def::wal_frame_size;
+            ret = find_later_wal_frame_unsafe(wal_fd, later_offset, wal_header.record_region_end, generation, *expected_sequence,
+                                              &later_valid);
+            if (ret != ESP_OK) {
+                return ret;
+            }
+            if (later_valid) {
+                return ESP_ERR_INVALID_CRC;
+            }
             wal_tail[slot] = offset;
             return ESP_OK;
         }
@@ -597,9 +610,51 @@ esp_err_t on9kvdb::scan_wal_slot(uint32_t slot, uint64_t generation, uint64_t *e
         if (*expected_sequence == 0) {
             return ESP_ERR_INVALID_STATE;
         }
+        transactions_since_delay += 1U;
+        if (transactions_since_delay >= recovery_transaction_delay_interval) {
+            vTaskDelay(1);
+            transactions_since_delay = 0;
+        }
     }
 
     wal_tail[slot] = offset;
+    return ESP_OK;
+}
+
+esp_err_t on9kvdb::find_later_wal_frame_unsafe(int wal_fd, uint32_t start_offset, uint32_t region_end, uint64_t generation,
+                                               uint64_t minimum_sequence, bool *found_out)
+{
+    if (wal_fd < 0 || start_offset > region_end || generation == 0 || minimum_sequence == 0 || found_out == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *found_out = false;
+    uint32_t frames_since_delay = 0;
+    for (uint32_t offset = start_offset; offset <= region_end - on9kvdb_def::wal_frame_size;
+         offset += on9kvdb_def::wal_frame_size) {
+        esp_err_t ret = read_exact_fd(wal_fd, manifest.geometry.wal_size, offset, io_frame, on9kvdb_def::wal_frame_size);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+
+        on9kvdb_def::wal_frame_header candidate = {};
+        const uint8_t *candidate_payload = nullptr;
+        const on9kvdb_def::format_status status =
+            on9kvdb_def::decode_wal_frame(io_frame, on9kvdb_def::wal_frame_size, &candidate, &candidate_payload);
+        if (status == on9kvdb_def::format_status::new_version || status == on9kvdb_def::format_status::invalid_revision) {
+            return ESP_ERR_INVALID_VERSION;
+        }
+        if (status == on9kvdb_def::format_status::ok && candidate.database_id == manifest.database_id &&
+            candidate.wal_generation == generation && candidate.transaction_sequence >= minimum_sequence) {
+            *found_out = true;
+            break;
+        }
+        frames_since_delay += 1U;
+        if (frames_since_delay >= recovery_frame_delay_interval) {
+            vTaskDelay(1);
+            frames_since_delay = 0;
+        }
+    }
     return ESP_OK;
 }
 

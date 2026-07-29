@@ -17,7 +17,7 @@ static_assert(CONFIG_ON9KVDB_MAX_TRANSACTION_MUTATIONS <= on9kvdb_def::max_trans
 static_assert(CONFIG_ON9KVDB_MAX_NAMESPACES >= 1);
 static_assert(CONFIG_ON9KVDB_MAX_NAMESPACES <= UINT16_MAX);
 static_assert(CONFIG_ON9KVDB_MAX_OPEN_HANDLES >= 1);
-static_assert(CONFIG_ON9KVDB_MAX_OPEN_HANDLES <= UINT16_MAX);
+static_assert(CONFIG_ON9KVDB_MAX_OPEN_HANDLES <= on9kvdb_def::handle_slot_capacity);
 static_assert(CONFIG_ON9KVDB_MEMTABLE_ENTRY_COUNT >= 16);
 static_assert((CONFIG_ON9KVDB_MEMTABLE_ENTRY_COUNT & (CONFIG_ON9KVDB_MEMTABLE_ENTRY_COUNT - 1)) == 0);
 static_assert(CONFIG_ON9KVDB_MEMTABLE_DATA_SIZE >= on9kvdb_def::max_value_len);
@@ -27,7 +27,7 @@ static_assert(CONFIG_ON9KVDB_RUNTIME_MEMORY_BUDGET <= on9kvdb_def::runtime_memor
 static_assert(on9kvdb_def::runtime_memory_budget_default <= on9kvdb_def::runtime_memory_budget_max);
 static_assert(CONFIG_ON9KVDB_MAX_LIVE_DATA_SIZE > 0);
 static_assert(CONFIG_ON9KVDB_PROVISIONED_DATABASE_SIZE > 0);
-static_assert(CONFIG_ON9KVDB_WAL_FILE_SIZE > on9kvdb_def::wal_record_region_offset);
+static_assert(CONFIG_ON9KVDB_WAL_FILE_SIZE >= on9kvdb_def::wal_record_region_offset + on9kvdb_def::wal_frame_size);
 static_assert(CONFIG_ON9KVDB_SSTABLE_FILE_SIZE > on9kvdb_def::identity_region_size);
 static_assert(CONFIG_ON9KVDB_WAL_FILE_SIZE % on9kvdb_def::format_alignment == 0);
 static_assert(CONFIG_ON9KVDB_SSTABLE_FILE_SIZE % on9kvdb_def::format_alignment == 0);
@@ -41,6 +41,11 @@ static_assert((CONFIG_ON9KVDB_SSTABLE_FILE_SIZE - on9kvdb_def::table_data_region
                on9kvdb_def::table_footer_slot_size) %
                   CONFIG_ON9KVDB_SSTABLE_BLOCK_SIZE ==
               0);
+static_assert(static_cast<uint64_t>((CONFIG_ON9KVDB_SSTABLE_FILE_SIZE - on9kvdb_def::table_data_region_offset -
+                                     CONFIG_ON9KVDB_SSTABLE_BLOCK_SIZE - on9kvdb_def::table_footer_slot_size) /
+                                    CONFIG_ON9KVDB_SSTABLE_BLOCK_SIZE) *
+                  ((on9kvdb_def::table_index_entry_header_size + 2U * on9kvdb_def::max_name_len + 3U) & ~UINT64_C(3)) <=
+              CONFIG_ON9KVDB_SSTABLE_BLOCK_SIZE - on9kvdb_def::table_index_header_size);
 static_assert(static_cast<uint64_t>(CONFIG_ON9KVDB_MAX_LIVE_DATA_SIZE) <=
               (static_cast<uint64_t>(CONFIG_ON9KVDB_SSTABLE_COUNT / 2U) *
                ((CONFIG_ON9KVDB_SSTABLE_FILE_SIZE - on9kvdb_def::table_data_region_offset - CONFIG_ON9KVDB_SSTABLE_BLOCK_SIZE -
@@ -63,8 +68,6 @@ namespace
     static const constexpr size_t table_sort_bytes = CONFIG_ON9KVDB_MEMTABLE_ENTRY_COUNT * sizeof(uint32_t);
     static const constexpr size_t table_scratch_bytes = table_sort_bytes + 2U * CONFIG_ON9KVDB_SSTABLE_BLOCK_SIZE;
     static const constexpr size_t manifest_scratch_bytes = 2U * sizeof(on9kvdb_def::manifest_record);
-    static const constexpr size_t minimum_future_scratch_bytes =
-        table_scratch_bytes > manifest_scratch_bytes ? table_scratch_bytes : manifest_scratch_bytes;
     static const constexpr size_t transaction_recovery_overhead =
         8U + on9kvdb_def::max_name_len + on9kvdb_def::max_transaction_mutations * (8U + on9kvdb_def::max_name_len);
 
@@ -152,31 +155,70 @@ size_t on9kvdb::minimum_future_scratch_size()
     return compaction_bytes > manifest_scratch_bytes ? compaction_bytes : manifest_scratch_bytes;
 }
 
+size_t on9kvdb::minimum_runtime_memory_budget()
+{
+    // Each carve may consume up to alignment - 1 bytes. Include that padding so validation and allocation agree even when
+    // configurable partition sizes leave the next carve unaligned.
+    const size_t arena_bytes =
+        (alignof(namespace_slot) - 1U) + sizeof(namespace_slot) * CONFIG_ON9KVDB_MAX_NAMESPACES + (alignof(handle_slot) - 1U) +
+        sizeof(handle_slot) * CONFIG_ON9KVDB_MAX_OPEN_HANDLES + (alignof(transaction_slot) - 1U) + sizeof(transaction_slot) +
+        (alignof(memtable_bucket) - 1U) + sizeof(memtable_bucket) * CONFIG_ON9KVDB_MEMTABLE_ENTRY_COUNT +
+        (alignof(uint64_t) - 1U) + CONFIG_ON9KVDB_TRANSACTION_STAGING_SIZE + transaction_recovery_overhead +
+        (alignof(uint64_t) - 1U) + CONFIG_ON9KVDB_MEMTABLE_DATA_SIZE + (alignof(uint64_t) - 1U) + minimum_future_scratch_size();
+    return internal_io_bytes + arena_bytes;
+}
+
 esp_err_t on9kvdb::create_locks()
 {
+    taskENTER_CRITICAL(&lock_creation_mux);
+    const bool locks_ready = lifecycle_lock != nullptr && operation_lock != nullptr;
+    taskEXIT_CRITICAL(&lock_creation_mux);
+    if (locks_ready) {
+        return ESP_OK;
+    }
+
+    SemaphoreHandle_t new_lifecycle_lock = xSemaphoreCreateMutex();
+    if (new_lifecycle_lock == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    SemaphoreHandle_t new_operation_lock = xSemaphoreCreateMutex();
+    if (new_operation_lock == nullptr) {
+        vSemaphoreDelete(new_lifecycle_lock);
+        return ESP_ERR_NO_MEM;
+    }
+
+    // Mutex allocation cannot run in a critical section. Install a complete pair atomically and discard a pair lost to a
+    // concurrent first init().
+    taskENTER_CRITICAL(&lock_creation_mux);
     if (lifecycle_lock == nullptr) {
-        lifecycle_lock = xSemaphoreCreateMutex();
-        if (lifecycle_lock == nullptr) {
-            return ESP_ERR_NO_MEM;
-        }
+        lifecycle_lock = new_lifecycle_lock;
+        new_lifecycle_lock = nullptr;
     }
-
     if (operation_lock == nullptr) {
-        operation_lock = xSemaphoreCreateMutex();
-        if (operation_lock == nullptr) {
-            return ESP_ERR_NO_MEM;
-        }
+        operation_lock = new_operation_lock;
+        new_operation_lock = nullptr;
+    }
+    const bool installed = lifecycle_lock != nullptr && operation_lock != nullptr;
+    taskEXIT_CRITICAL(&lock_creation_mux);
+
+    if (new_lifecycle_lock != nullptr) {
+        vSemaphoreDelete(new_lifecycle_lock);
+    }
+    if (new_operation_lock != nullptr) {
+        vSemaphoreDelete(new_operation_lock);
     }
 
-    return ESP_OK;
+    return installed ? ESP_OK : ESP_ERR_NO_MEM;
 }
 
 esp_err_t on9kvdb::validate_init_args() const
 {
-    if (file_path == nullptr || file_path[0] != '/' ||
-        cfg.runtime_memory_budget < internal_io_bytes + minimum_future_scratch_bytes ||
-        cfg.runtime_memory_budget > on9kvdb_def::runtime_memory_budget_max) {
+    if (file_path == nullptr || file_path[0] != '/') {
         return ESP_ERR_INVALID_ARG;
+    }
+    if (cfg.runtime_memory_budget < minimum_runtime_memory_budget() ||
+        cfg.runtime_memory_budget > on9kvdb_def::runtime_memory_budget_max) {
+        return ESP_ERR_INVALID_SIZE;
     }
 
     const on9kvdb_def::storage_geometry geometry = get_build_geometry();
@@ -258,12 +300,15 @@ esp_err_t on9kvdb::allocate_runtime_memory()
     all_carved =
         all_carved && carve_arena(&cursor, &remaining, alignof(uint64_t), CONFIG_ON9KVDB_MEMTABLE_DATA_SIZE, &allocation);
     memtable_data = static_cast<uint8_t *>(allocation);
+    allocation = nullptr;
+
+    all_carved = all_carved && carve_arena(&cursor, &remaining, alignof(uint64_t), 0, &allocation);
     if (!all_carved || remaining < minimum_future_scratch_size()) {
         reset_runtime_state_unsafe();
         return ESP_ERR_INVALID_SIZE;
     }
 
-    future_scratch = cursor;
+    future_scratch = static_cast<uint8_t *>(allocation);
     future_scratch_size = remaining;
     for (uint32_t idx = 0; idx < CONFIG_ON9KVDB_MAX_NAMESPACES; idx += 1) {
         new (&namespaces[idx]) namespace_slot{};
@@ -350,7 +395,10 @@ esp_err_t on9kvdb::init()
 
 esp_err_t on9kvdb::acquire_operation_lock_internal(bool allow_storage_fault) const
 {
-    if (lifecycle_lock == nullptr || xSemaphoreTake(lifecycle_lock, portMAX_DELAY) != pdTRUE) {
+    if (lifecycle_lock == nullptr) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (xSemaphoreTake(lifecycle_lock, portMAX_DELAY) != pdTRUE) {
         return ESP_ERR_TIMEOUT;
     }
     if (!initialized || shutting_down || operation_lock == nullptr) {

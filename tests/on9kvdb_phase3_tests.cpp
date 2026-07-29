@@ -107,6 +107,12 @@ namespace
         EXPECT_EQ(on9kvdb_def::format_status::ok, on9kvdb_def::decode_wal_header(encoded, sizeof(encoded), &decoded));
         EXPECT_TRUE(on9kvdb_def::wal_header_equal(header, decoded));
 
+        encoded[4] = 0xff;
+        encoded[5] = 0xff;
+        EXPECT_EQ(on9kvdb_def::format_status::corrupt, on9kvdb_def::decode_wal_header(encoded, sizeof(encoded), &decoded));
+        encoded[4] = static_cast<uint8_t>(on9kvdb_def::wal_header_revision);
+        encoded[5] = 0;
+
         for (size_t idx = 0; idx < sizeof(encoded); idx += 1) {
             encoded[idx] ^= 1U;
             EXPECT_TRUE(on9kvdb_def::decode_wal_header(encoded, sizeof(encoded), &decoded) != on9kvdb_def::format_status::ok);
@@ -129,6 +135,13 @@ namespace
         EXPECT_EQ(on9kvdb_def::format_status::ok,
                   on9kvdb_def::decode_wal_frame(valid, sizeof(valid), &decoded, &decoded_payload));
         EXPECT_EQ(0, memcmp(payload, decoded_payload, sizeof(payload)));
+
+        valid[4] = 0xff;
+        valid[5] = 0xff;
+        EXPECT_EQ(on9kvdb_def::format_status::corrupt,
+                  on9kvdb_def::decode_wal_frame(valid, sizeof(valid), &decoded, &decoded_payload));
+        valid[4] = static_cast<uint8_t>(on9kvdb_def::wal_frame_revision);
+        valid[5] = 0;
 
         uint8_t interrupted[on9kvdb_def::wal_frame_size] = {};
         for (size_t cut = 0; cut < sizeof(valid); cut += 1) {

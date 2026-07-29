@@ -12,6 +12,10 @@ namespace on9kvdb_def
     static const constexpr size_t max_transaction_mutations = 10;
     static const constexpr size_t runtime_memory_budget_default = 100U * 1024U;
     static const constexpr size_t runtime_memory_budget_max = 200U * 1024U - 1U;
+    static const constexpr uint32_t handle_slot_capacity = 256;
+    static const constexpr uint32_t handle_slot_bits = 9;
+    static const constexpr uint32_t handle_slot_mask = (UINT32_C(1) << handle_slot_bits) - 1U;
+    static const constexpr uint32_t max_handle_generation = UINT32_MAX >> handle_slot_bits;
     static const constexpr uint64_t max_fat32_file_size = UINT32_MAX;
     static const constexpr uint32_t format_alignment = 4096;
     static const constexpr uint32_t manifest_slot_size = format_alignment;
@@ -301,9 +305,9 @@ namespace on9kvdb_def
 
     bool validate_name(const char *name, size_t *length_out = nullptr);
 
-    uint32_t make_handle_value(uint16_t slot, uint16_t generation);
-    bool decode_handle_value(uint32_t value, uint16_t *slot_out, uint16_t *generation_out);
-    bool is_handle_value(uint32_t value, uint16_t slot, uint16_t generation);
+    uint32_t make_handle_value(uint16_t slot, uint32_t generation);
+    bool decode_handle_value(uint32_t value, uint16_t *slot_out, uint32_t *generation_out);
+    bool is_handle_value(uint32_t value, uint16_t slot, uint32_t generation);
 
     bool encode_file_prefix(uint8_t *buf, size_t buf_len, uint32_t magic, file_kind kind, uint16_t flags, uint64_t generation,
                             uint32_t payload_size);

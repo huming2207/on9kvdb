@@ -166,7 +166,7 @@ private:
     };
 
     struct handle_slot {
-        uint16_t generation;
+        uint32_t generation;
         bool used;
         bool transaction_active;
         on9kvdb_open_mode mode;
@@ -186,9 +186,9 @@ private:
     };
 
     struct transaction_slot {
-        uint16_t generation;
+        uint32_t generation;
         uint16_t handle_slot_index;
-        uint16_t handle_generation;
+        uint32_t handle_generation;
         uint16_t mutation_count;
         uint32_t staged_value_bytes;
         bool active;
@@ -271,6 +271,7 @@ private:
 
 private:
     static size_t minimum_future_scratch_size();
+    static size_t minimum_runtime_memory_budget();
     esp_err_t create_locks();
     esp_err_t validate_init_args() const;
     esp_err_t allocate_runtime_memory();
@@ -314,6 +315,8 @@ private: // WAL
     esp_err_t load_wal_header(uint32_t slot, uint64_t expected_generation, on9kvdb_def::wal_header *header_out) const;
     esp_err_t recover_wal();
     esp_err_t scan_wal_slot(uint32_t slot, uint64_t generation, uint64_t *expected_sequence);
+    esp_err_t find_later_wal_frame_unsafe(int wal_fd, uint32_t start_offset, uint32_t region_end, uint64_t generation,
+                                          uint64_t minimum_sequence, bool *found_out);
     esp_err_t rotate_wal_unsafe();
     esp_err_t append_transaction_unsafe(transaction_slot *transaction, const handle_slot &handle);
     esp_err_t calculate_transaction_payload_unsafe(const transaction_slot &transaction, const handle_slot &handle,
@@ -398,6 +401,7 @@ private:
     uint32_t manifest_slot = 0;
     uint32_t manifest_valid_copy_count = 0;
     bool manifest_stabilization_required = false;
+    portMUX_TYPE lock_creation_mux = portMUX_INITIALIZER_UNLOCKED;
     SemaphoreHandle_t lifecycle_lock = nullptr;
     SemaphoreHandle_t operation_lock = nullptr;
 
@@ -417,6 +421,8 @@ private:
     uint32_t memtable_entry_count = 0;
     uint32_t wal_tail[on9kvdb_def::wal_file_count] = {};
     uint64_t next_transaction_sequence = 1;
+    uint32_t handle_generation_counter = 1;
+    uint32_t transaction_generation_counter = 1;
     on9kvdb_stats stats = {};
     bool initialized = false;
     bool shutting_down = false;
