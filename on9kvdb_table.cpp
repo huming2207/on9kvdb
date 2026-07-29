@@ -76,8 +76,11 @@ esp_err_t on9kvdb::read_table_bytes_unsafe(uint32_t slot, uint64_t offset, uint8
     }
 
     const int file_fd = storage_fds[descriptor_index(on9kvdb_def::file_kind::table, slot)];
-    if (destination == io_frame) {
-        return size <= on9kvdb_def::wal_frame_size
+    const uintptr_t frame_start = reinterpret_cast<uintptr_t>(io_frame);
+    const uintptr_t frame_end = frame_start + on9kvdb_def::wal_frame_size;
+    const uintptr_t destination_start = reinterpret_cast<uintptr_t>(destination);
+    if (destination_start >= frame_start && destination_start < frame_end) {
+        return size <= frame_end - destination_start
                    ? read_exact_fd(file_fd, manifest.geometry.table_size, offset, destination, size)
                    : ESP_ERR_INVALID_SIZE;
     }
@@ -101,9 +104,12 @@ esp_err_t on9kvdb::write_table_bytes_unsafe(uint32_t slot, uint64_t offset, cons
     }
 
     const int file_fd = storage_fds[descriptor_index(on9kvdb_def::file_kind::table, slot)];
-    if (source == io_frame) {
-        return size <= on9kvdb_def::wal_frame_size ? write_exact_fd(file_fd, manifest.geometry.table_size, offset, source, size)
-                                                   : ESP_ERR_INVALID_SIZE;
+    const uintptr_t frame_start = reinterpret_cast<uintptr_t>(io_frame);
+    const uintptr_t frame_end = frame_start + on9kvdb_def::wal_frame_size;
+    const uintptr_t source_start = reinterpret_cast<uintptr_t>(source);
+    if (source_start >= frame_start && source_start < frame_end) {
+        return size <= frame_end - source_start ? write_exact_fd(file_fd, manifest.geometry.table_size, offset, source, size)
+                                                : ESP_ERR_INVALID_SIZE;
     }
     size_t copied = 0;
     while (copied < size) {

@@ -284,17 +284,24 @@ esp_err_t on9kvdb::append_transaction_unsafe(transaction_slot *transaction_state
         if (manifest.wal_generation[target_slot] != 0) {
             ret = compact_tables_unsafe();
             if (ret != ESP_OK) {
+                ESP_LOGE(TAG,
+                         "WAL: compaction before rotation failed: ret=%s, sequence=%" PRIu64 ", active=%" PRIu32
+                         ", target=%" PRIu32,
+                         esp_err_to_name(ret), next_transaction_sequence, active_slot, target_slot);
                 return ret;
             }
         } else if (memtable_entry_count > 0) {
             // The current transaction is not included because its WAL record has not been written yet.
             ret = flush_memtable_unsafe();
             if (ret != ESP_OK) {
+                ESP_LOGE(TAG, "WAL: memtable flush before rotation failed: ret=%s, sequence=%" PRIu64, esp_err_to_name(ret),
+                         next_transaction_sequence);
                 return ret;
             }
         }
         ret = rotate_wal_unsafe();
         if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "WAL: rotation failed: ret=%s, sequence=%" PRIu64, esp_err_to_name(ret), next_transaction_sequence);
             return ret;
         }
         active_slot = manifest.active_wal_slot;
@@ -493,8 +500,34 @@ esp_err_t on9kvdb::scan_wal_slot(uint32_t slot, uint64_t generation, uint64_t *e
             break;
         }
 
-        if (first.database_id != manifest.database_id || first.wal_generation != generation ||
-            first.transaction_sequence != *expected_sequence || first.frame_index != 0 || first.frame_count == 0 ||
+        if (first.database_id != manifest.database_id || first.wal_generation != generation) {
+            // Reusing a WAL slot overwrites committed frames from the beginning without erasing its remaining record region.
+            // A valid frame from an older generation therefore marks the new generation's tail unless a later new-generation
+            // frame proves that a hole exists.
+            bool later_valid = false;
+            for (uint32_t later = offset + on9kvdb_def::wal_frame_size;
+                 later <= wal_header.record_region_end - on9kvdb_def::wal_frame_size; later += on9kvdb_def::wal_frame_size) {
+                ret = read_exact_fd(wal_fd, manifest.geometry.wal_size, later, io_frame, on9kvdb_def::wal_frame_size);
+                if (ret != ESP_OK) {
+                    return ret;
+                }
+                on9kvdb_def::wal_frame_header candidate = {};
+                const uint8_t *candidate_payload = nullptr;
+                if (on9kvdb_def::decode_wal_frame(io_frame, on9kvdb_def::wal_frame_size, &candidate, &candidate_payload) ==
+                        on9kvdb_def::format_status::ok &&
+                    candidate.database_id == manifest.database_id && candidate.wal_generation == generation &&
+                    candidate.transaction_sequence >= *expected_sequence) {
+                    later_valid = true;
+                    break;
+                }
+            }
+            if (later_valid) {
+                return ESP_ERR_INVALID_CRC;
+            }
+            break;
+        }
+
+        if (first.transaction_sequence != *expected_sequence || first.frame_index != 0 || first.frame_count == 0 ||
             first.transaction_payload_size > max_transaction_payload_size ||
             static_cast<uint64_t>(first.frame_count) * on9kvdb_def::wal_frame_size > wal_header.record_region_end - offset) {
             return ESP_ERR_INVALID_CRC;
@@ -585,6 +618,7 @@ esp_err_t on9kvdb::recover_wal()
     reset_memtable_unsafe();
     esp_err_t ret = recover_tables_unsafe();
     if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Recovery: SSTable recovery failed: %s", esp_err_to_name(ret));
         return ret;
     }
 
@@ -592,26 +626,33 @@ esp_err_t on9kvdb::recover_wal()
     uint32_t first_slot = manifest.wal_generation[older_slot] != 0 ? older_slot : manifest.active_wal_slot;
     if (manifest.wal_generation[older_slot] != 0 &&
         manifest.wal_generation[older_slot] >= manifest.wal_generation[manifest.active_wal_slot]) {
+        ESP_LOGE(TAG, "Recovery: invalid WAL generation order");
         return ESP_ERR_INVALID_CRC;
     }
 
     on9kvdb_def::wal_header first_header = {};
     ret = load_wal_header(first_slot, manifest.wal_generation[first_slot], &first_header);
     if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Recovery: WAL header failed: slot=%" PRIu32 ", ret=%s", first_slot, esp_err_to_name(ret));
         return ret;
     }
     if (manifest.safe_checkpoint_sequence == UINT64_MAX ||
         first_header.first_transaction_sequence > manifest.safe_checkpoint_sequence + 1U) {
+        ESP_LOGE(TAG, "Recovery: WAL starts after checkpoint: first=%" PRIu64 ", checkpoint=%" PRIu64,
+                 first_header.first_transaction_sequence, manifest.safe_checkpoint_sequence);
         return ESP_ERR_INVALID_CRC;
     }
     uint64_t expected_sequence = first_header.first_transaction_sequence;
     ret = scan_wal_slot(first_slot, manifest.wal_generation[first_slot], &expected_sequence);
     if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Recovery: WAL scan failed: slot=%" PRIu32 ", ret=%s", first_slot, esp_err_to_name(ret));
         return ret;
     }
     if (first_slot != manifest.active_wal_slot) {
         ret = scan_wal_slot(manifest.active_wal_slot, manifest.wal_generation[manifest.active_wal_slot], &expected_sequence);
         if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Recovery: active WAL scan failed: slot=%" PRIu32 ", ret=%s", manifest.active_wal_slot,
+                     esp_err_to_name(ret));
             return ret;
         }
     } else {
@@ -619,6 +660,8 @@ esp_err_t on9kvdb::recover_wal()
     }
 
     if (expected_sequence - 1U < manifest.safe_checkpoint_sequence) {
+        ESP_LOGE(TAG, "Recovery: WAL ends before checkpoint: last=%" PRIu64 ", checkpoint=%" PRIu64, expected_sequence - 1U,
+                 manifest.safe_checkpoint_sequence);
         return ESP_ERR_INVALID_CRC;
     }
     next_transaction_sequence = expected_sequence;
