@@ -27,6 +27,7 @@ No requirement became optional merely because it moved to another file.
 | [`API_AND_RECOVERY.md`](API_AND_RECOVERY.md) | Logical-key model, public API and errors, provisioning, recovery, locks and visibility | Public APIs, lifecycle, handles, replay, concurrency |
 | [`DESIGN_DECISIONS.md`](DESIGN_DECISIONS.md) | Approved capacities, workload, memory, transaction, table-bank, corruption and integration policies | Kconfig, budgets, format policy, feature scope |
 | [`IMPLEMENTATION_AND_TESTING.md`](IMPLEMENTATION_AND_TESTING.md) | Phase record, fault model, invariants, acceptance criteria and source ownership | Tests, qualification, release claims, refactors |
+| [`PERFORMANCE_COMPARISON.md`](PERFORMANCE_COMPARISON.md) | Complexity model, measured NVS comparison, RAM breakdown and qualification limits | Performance claims, algorithm analysis and benchmark interpretation |
 | [`NEXT_STEPS.md`](NEXT_STEPS.md) | Measured baseline, completed performance work and future experiments | Performance work and benchmark interpretation |
 
 ## Suggested audit order
@@ -39,7 +40,8 @@ No requirement became optional merely because it moved to another file.
 4. Compare implementation choices with `DESIGN_DECISIONS.md`.
 5. Use `IMPLEMENTATION_AND_TESTING.md` as the fault-injection and release
    checklist.
-6. Treat `NEXT_STEPS.md` separately so performance proposals are not confused
+6. Use `PERFORMANCE_COMPARISON.md` for the measured baseline and scaling model.
+7. Treat `NEXT_STEPS.md` separately so performance proposals are not confused
    with approved durability behavior.
 
 ## Review discipline
@@ -54,4 +56,3 @@ No requirement became optional merely because it moved to another file.
   overflow handling, and the exact failure code.
 - For every optimization, compare ordinary latency, tail latency, recovery
   cost, memory cost, and write amplification; do not rely on averages alone.
-

@@ -85,10 +85,13 @@ resources.
   minutes. Long scans must yield or otherwise integrate with task-watchdog
   policy; disabling safety checks globally is not an acceptable shortcut.
 - Foreground synchronous flush and compaction are accepted for v1.
-- Commit/flush performance should improve on ESP-IDF NVS, but that target is
-  not yet quantified. Before making a performance claim, benchmark both engines
-  with the same logical workload and report initialization, get, set/commit,
-  compaction, and tail latency.
+- Commit/flush performance was intended to improve on ESP-IDF NVS. Performance
+  claims must benchmark both engines with the same logical workload and report
+  initialization, get, set/commit, compaction, and tail latency.
+- The 2026-07-30 ESP32-S3/NOR baseline did not meet that write-latency target:
+  see [`PERFORMANCE_COMPARISON.md`](PERFORMANCE_COMPARISON.md). It remains a
+  design goal rather than a current performance claim, and ESP32-P4/SDMMC
+  results are still pending.
 
 ## API and transaction semantics
 

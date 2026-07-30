@@ -32,6 +32,8 @@ The audit-oriented engineering contract is split by topic under
   choices.
 - [`doc/IMPLEMENTATION_AND_TESTING.md`](doc/IMPLEMENTATION_AND_TESTING.md)
   records invariants and qualification requirements.
+- [`doc/PERFORMANCE_COMPARISON.md`](doc/PERFORMANCE_COMPARISON.md) records
+  complexity, the measured ESP-IDF NVS comparison, and bounded RAM usage.
 - [`doc/NEXT_STEPS.md`](doc/NEXT_STEPS.md) separates performance follow-up
   work from the approved durability contract.
 

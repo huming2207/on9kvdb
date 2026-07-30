@@ -6,6 +6,10 @@ This document records proposed performance work following ESP32-S3 hardware
 measurements on 2026-07-30. It is a roadmap, not an approved change to the
 durability contract or persistent format.
 
+See [`PERFORMANCE_COMPARISON.md`](PERFORMANCE_COMPARISON.md) for the
+audit-oriented complexity analysis, complete measured NVS comparison,
+interpretation limits, and current runtime-memory breakdown.
+
 Implemented on 2026-07-30, pending hardware remeasurement:
 
 - The demo now uses two 1 MiB WAL files and an 8 MiB FAT partition.
@@ -131,17 +135,17 @@ the scalar type.
 The same cost affects commits: transaction preflight looks up the previous
 committed state of each distinct key before appending the WAL record.
 
-### Recovery amplification
+### Historical recovery amplification
 
-Recovery first validates every active table. It then visits every table record
-and calls `lookup_tables_unsafe()` to decide whether the record is the newest
-version. The lookup reuses the source block buffer, so recovery reloads that
-block before decoding the next record.
+Before the 2026-07-30 linear-merge change, recovery validated every active
+table, visited every table record, and called `lookup_tables_unsafe()` to
+decide whether that record was the newest version. Shared scratch buffers also
+caused source blocks to be reloaded during the scan.
 
-The resulting work is approximately proportional to records multiplied by
-active tables, with repeated random filesystem reads. The cooperative
-`vTaskDelay(1)` calls prevent watchdog starvation but do not address this
-algorithmic cost.
+That repeated-random-lookup path has been replaced by the bounded multiway
+merge described below. The remaining work is to measure the new recovery
+constant on ESP32-P4/SDMMC and split table validation, statistics rebuilding,
+and WAL replay in the benchmark output.
 
 ## Recommended implementation order
 

@@ -54,5 +54,7 @@ approved.
 - [`doc/IMPLEMENTATION_AND_TESTING.md`](doc/IMPLEMENTATION_AND_TESTING.md):
   phases, verification requirements, invariants, acceptance criteria, and
   source ownership.
+- [`doc/PERFORMANCE_COMPARISON.md`](doc/PERFORMANCE_COMPARISON.md): algorithmic
+  complexity, measured ESP-IDF NVS comparison, and bounded-memory context.
 - [`doc/NEXT_STEPS.md`](doc/NEXT_STEPS.md): performance measurements,
   completed optimizations, and unapproved follow-up proposals.
