@@ -347,8 +347,8 @@ private: // WAL
 private: // Immutable SSTables
     esp_err_t flush_memtable_unsafe();
     esp_err_t compact_tables_unsafe();
-    esp_err_t load_compaction_cursor_unsafe(compaction_cursor *cursor);
-    esp_err_t advance_compaction_cursor_unsafe(compaction_cursor *cursor);
+    esp_err_t load_compaction_cursor_unsafe(compaction_cursor *cursor, uint8_t *block_validation_buffer);
+    esp_err_t advance_compaction_cursor_unsafe(compaction_cursor *cursor, uint8_t *block_validation_buffer);
     esp_err_t start_compaction_output_unsafe(compaction_output *output, uint32_t slot, uint64_t generation, uint8_t *data_block,
                                              uint8_t *index_block);
     esp_err_t append_compaction_entry_unsafe(compaction_output *output, const compaction_cursor *table_cursor,

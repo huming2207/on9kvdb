@@ -15,6 +15,9 @@ Implemented on 2026-07-30, pending hardware remeasurement:
 - Unreachable SSTable contents and redundant metadata now share one
   pre-publication file sync. Redundant headers for an unreachable new WAL
   generation are also synchronized together.
+- Recovery rebuilds namespaces and logical statistics with a bounded multiway
+  merge over the sorted active SSTables instead of performing one cross-table
+  lookup per immutable record.
 
 Unless a section explicitly says otherwise, every optimization must preserve
 these existing invariants:
@@ -232,6 +235,8 @@ change; maintaining checked in-memory filters built during recovery is not.
 
 ### 5. Replace per-record recovery lookups with a linear merge
 
+Implemented on 2026-07-30, pending ESP32-P4 SD-card remeasurement.
+
 Active SSTables are sorted. Rebuild namespaces and logical statistics using
 one cursor per table:
 
@@ -401,7 +406,7 @@ stress workload but not as a type-to-type latency comparison.
 3. Re-measure the implemented consolidated table/WAL-header `fsync()`
    boundaries.
 4. Re-measure the implemented optional index and stable-result cache.
-5. Implement linear merged recovery statistics.
+5. Re-measure the implemented linear merged recovery statistics rebuild.
 6. Compare the new 1 MiB WAL geometry with the recorded 256 KiB baseline.
 7. Evaluate a larger memtable after the new WAL/cache results are available.
 8. Prototype background flush and compaction if tail latency remains

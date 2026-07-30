@@ -111,6 +111,14 @@ Additional demo integration completed on 2026-07-30:
 - SD-card hardware behavior, latency, endurance, removal handling, and
   power-loss behavior remain unqualified.
 
+Additional recovery optimization completed on 2026-07-30:
+
+- Namespace and logical-statistics reconstruction uses a bounded multiway
+  merge over validated sorted SSTables. It no longer performs a cross-table
+  lookup for every immutable record.
+- The demo functional recovery check compares logical counts and byte totals
+  before and after reinitialization.
+
 These checks do not replace Phase 7. The complete database has not yet been
 qualified on mounted NOR/SD FATFS with the intended journal, physical reset
 injection, endurance media, watchdog policy, or measured latency/write

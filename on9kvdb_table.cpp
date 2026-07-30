@@ -1,4 +1,5 @@
 #include <cstring>
+#include <new>
 
 #include "on9kvdb.hpp"
 
@@ -611,7 +612,7 @@ esp_err_t on9kvdb::cache_table_index_unsafe(const on9kvdb_def::table_reference &
     }
 
     table_index_cache_slot &cached = table_index_cache[reference.slot];
-    memset(&cached, 0, sizeof(cached));
+    cached = {};
     on9kvdb_def::table_index_header header = {};
     if (on9kvdb_def::decode_table_index_header(index_block, manifest.limits.sstable_block_bytes, &header) !=
             on9kvdb_def::format_status::ok ||
@@ -645,7 +646,7 @@ esp_err_t on9kvdb::cache_table_index_unsafe(const on9kvdb_def::table_reference &
 void on9kvdb::invalidate_table_index_cache_unsafe(uint32_t slot)
 {
     if (table_index_cache != nullptr && slot < manifest.geometry.table_count) {
-        memset(&table_index_cache[slot], 0, sizeof(table_index_cache[slot]));
+        table_index_cache[slot] = {};
     }
 }
 
@@ -836,81 +837,116 @@ esp_err_t on9kvdb::recover_tables_unsafe()
         vTaskDelay(1);
     }
 
-    // Rebuild namespace and logical statistics from immutable records. The bounded implementation deliberately accepts a
-    // slower startup here: each record is counted only when no newer table contains the same composite key.
+    // Every active table is sorted by composite key and was fully validated above. Merge one bounded cursor per table,
+    // count only the greatest-sequence version of each key, and advance every cursor carrying that key. This avoids a
+    // random lookup across all tables for every immutable record.
     const size_t sort_bytes = static_cast<size_t>(CONFIG_ON9KVDB_MEMTABLE_ENTRY_COUNT) * sizeof(uint32_t);
-    uint8_t *data_block = future_scratch + sort_bytes;
-    uint32_t entries_since_delay = 0;
-    for (uint32_t slot = 0; slot < manifest.geometry.table_count; slot += 1) {
-        const on9kvdb_def::table_reference &reference = manifest.tables[slot];
-        if (!reference.active) {
+    const size_t cursor_offset = sort_bytes + 2U * manifest.limits.sstable_block_bytes;
+    const uint32_t maximum_cursor_count = manifest.geometry.table_count / 2U;
+    const size_t required_scratch = cursor_offset + static_cast<size_t>(maximum_cursor_count) * sizeof(compaction_cursor);
+    if (future_scratch == nullptr || future_scratch_size < required_scratch) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    uint8_t *block_validation_buffer = future_scratch + sort_bytes;
+    auto *cursors = reinterpret_cast<compaction_cursor *>(future_scratch + cursor_offset);
+    uint32_t cursor_count = 0;
+    for (uint32_t slot = 0; slot < manifest.geometry.table_count; slot += 1U) {
+        if (!manifest.tables[slot].active) {
             continue;
         }
-        for (uint32_t block = 0; block < reference.data_block_count; block += 1) {
-            const uint32_t block_offset = on9kvdb_def::table_data_region_offset + block * manifest.limits.sstable_block_bytes;
-            esp_err_t ret = read_table_bytes_unsafe(slot, block_offset, data_block, manifest.limits.sstable_block_bytes);
-            if (ret != ESP_OK) {
-                return ret;
-            }
-            on9kvdb_def::table_block_header header = {};
-            if (on9kvdb_def::decode_table_block_header(data_block, manifest.limits.sstable_block_bytes, &header) !=
-                on9kvdb_def::format_status::ok) {
-                return ESP_ERR_INVALID_CRC;
-            }
+        if (cursor_count >= maximum_cursor_count) {
+            return ESP_ERR_INVALID_CRC;
+        }
+        new (&cursors[cursor_count]) compaction_cursor{};
+        cursors[cursor_count].source_slot = slot;
+        const esp_err_t ret = load_compaction_cursor_unsafe(&cursors[cursor_count], block_validation_buffer);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+        if (!cursors[cursor_count].active) {
+            return ESP_ERR_INVALID_CRC;
+        }
+        cursor_count += 1U;
+    }
 
-            uint32_t entry_offset = on9kvdb_def::table_block_header_size;
-            for (uint16_t entry_index = 0; entry_index < header.entry_count; entry_index += 1) {
-                on9kvdb_def::table_entry entry = {};
-                if (on9kvdb_def::decode_table_entry(data_block, manifest.limits.sstable_block_bytes, entry_offset, &entry) !=
-                    on9kvdb_def::format_status::ok) {
-                    return ESP_ERR_INVALID_CRC;
-                }
-                char namespace_name[on9kvdb_def::max_name_len + 1] = {};
-                char key[on9kvdb_def::max_name_len + 1] = {};
-                memcpy(namespace_name, entry.namespace_name, entry.namespace_size);
-                memcpy(key, entry.key, entry.key_size);
-                uint16_t namespace_index = 0;
-                ret = ensure_namespace_capacity_unsafe(namespace_name, &namespace_index, true);
-                if (ret != ESP_OK) {
-                    return ret;
-                }
-
-                value_view newest = {};
-                ret = lookup_tables_unsafe(namespace_name, key, &newest);
-                if (ret != ESP_OK) {
-                    return ret;
-                }
-                if (newest.transaction_sequence == entry.transaction_sequence) {
-                    stats.logical_state_bytes += align_table_entry_size(
-                        on9kvdb_def::table_entry_header_size + entry.namespace_size + entry.key_size + newest.value_size);
-                    if (newest.tombstone) {
-                        stats.tombstone_count += 1U;
-                    } else {
-                        stats.live_key_count += 1U;
-                        stats.logical_value_bytes += newest.value_size;
-                    }
-                }
-                entry_offset += entry.total_size;
-
-                // lookup_tables_unsafe reuses data_block, so reload the source block before decoding its next record.
-                if (entry_index + 1U < header.entry_count) {
-                    ret = read_table_bytes_unsafe(slot, block_offset, data_block, manifest.limits.sstable_block_bytes);
-                    if (ret != ESP_OK) {
-                        return ret;
-                    }
-                }
-
-                entries_since_delay += 1U;
-                if (entries_since_delay >= recovery_entry_delay_interval) {
-                    vTaskDelay(1);
-                    entries_since_delay = 0;
-                }
-            }
-            if (entries_since_delay != 0) {
-                vTaskDelay(1);
-                entries_since_delay = 0;
+    uint32_t entries_since_delay = 0;
+    while (cursor_count > 0) {
+        bool found = false;
+        on9kvdb_def::composite_key smallest = {};
+        for (uint32_t cursor_index = 0; cursor_index < cursor_count; cursor_index += 1U) {
+            if (cursors[cursor_index].active &&
+                (!found || on9kvdb_def::compare_composite_key(cursors[cursor_index].key, smallest) < 0)) {
+                smallest = cursors[cursor_index].key;
+                found = true;
             }
         }
+        if (!found) {
+            return ESP_ERR_INVALID_CRC;
+        }
+
+        const compaction_cursor *winner = nullptr;
+        uint64_t winner_sequence = 0;
+        uint32_t matching_cursor_count = 0;
+        for (uint32_t cursor_index = 0; cursor_index < cursor_count; cursor_index += 1U) {
+            compaction_cursor &candidate = cursors[cursor_index];
+            if (!candidate.active || !on9kvdb_def::composite_key_equal(candidate.key, smallest)) {
+                continue;
+            }
+            for (uint32_t previous_index = 0; previous_index < cursor_index; previous_index += 1U) {
+                const compaction_cursor &previous = cursors[previous_index];
+                if (previous.active && previous.transaction_sequence == candidate.transaction_sequence &&
+                    on9kvdb_def::composite_key_equal(previous.key, smallest)) {
+                    return ESP_ERR_INVALID_CRC;
+                }
+            }
+            matching_cursor_count += 1U;
+            if (winner == nullptr || candidate.transaction_sequence > winner_sequence) {
+                winner = &candidate;
+                winner_sequence = candidate.transaction_sequence;
+            }
+        }
+        if (winner == nullptr || matching_cursor_count == 0) {
+            return ESP_ERR_INVALID_CRC;
+        }
+
+        uint16_t namespace_index = 0;
+        esp_err_t ret = ensure_namespace_capacity_unsafe(winner->key.namespace_name, &namespace_index, true);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+        if (stats.logical_state_bytes > manifest.geometry.max_live_bytes ||
+            winner->total_size > manifest.geometry.max_live_bytes - stats.logical_state_bytes) {
+            return ESP_ERR_INVALID_CRC;
+        }
+        stats.logical_state_bytes += winner->total_size;
+        if ((winner->flags & on9kvdb_def::table_entry_flag_tombstone) != 0) {
+            stats.tombstone_count += 1U;
+        } else {
+            stats.live_key_count += 1U;
+            stats.logical_value_bytes += winner->value_size;
+        }
+
+        for (uint32_t cursor_index = 0; cursor_index < cursor_count; cursor_index += 1U) {
+            if (cursors[cursor_index].active && on9kvdb_def::composite_key_equal(cursors[cursor_index].key, smallest)) {
+                ret = advance_compaction_cursor_unsafe(&cursors[cursor_index], block_validation_buffer);
+                if (ret != ESP_OK) {
+                    return ret;
+                }
+            }
+        }
+        while (cursor_count > 0 && !cursors[cursor_count - 1U].active) {
+            cursor_count -= 1U;
+        }
+
+        entries_since_delay += matching_cursor_count;
+        if (entries_since_delay >= recovery_entry_delay_interval) {
+            vTaskDelay(1);
+            entries_since_delay = 0;
+        }
+    }
+    if (entries_since_delay != 0) {
+        vTaskDelay(1);
     }
     return ESP_OK;
 }

@@ -58,7 +58,7 @@ namespace
     }
 }
 
-esp_err_t on9kvdb::load_compaction_cursor_unsafe(compaction_cursor *cursor)
+esp_err_t on9kvdb::load_compaction_cursor_unsafe(compaction_cursor *cursor, uint8_t *block_validation_buffer)
 {
     if (cursor == nullptr || cursor->source_slot >= manifest.geometry.table_count ||
         !manifest.tables[cursor->source_slot].active) {
@@ -76,33 +76,49 @@ esp_err_t on9kvdb::load_compaction_cursor_unsafe(compaction_cursor *cursor)
 
         const uint32_t block_offset =
             on9kvdb_def::table_data_region_offset + cursor->block_index * manifest.limits.sstable_block_bytes;
-        esp_err_t ret =
-            read_table_bytes_unsafe(cursor->source_slot, block_offset, io_frame, on9kvdb_def::table_block_header_size);
-        if (ret != ESP_OK) {
-            return ret;
-        }
-
-        uint32_t magic = 0;
-        uint16_t revision = 0;
-        uint16_t header_size = 0;
-        uint64_t generation = 0;
-        uint32_t encoded_block_index = 0;
         uint16_t entry_count = 0;
-        uint16_t reserved = 0;
         uint32_t payload_size = 0;
-        if (!on9kvdb_def::read_u32_le(io_frame, on9kvdb_def::table_block_header_size, 0, &magic) ||
-            !on9kvdb_def::read_u16_le(io_frame, on9kvdb_def::table_block_header_size, 4, &revision) ||
-            !on9kvdb_def::read_u16_le(io_frame, on9kvdb_def::table_block_header_size, 6, &header_size) ||
-            !on9kvdb_def::read_u64_le(io_frame, on9kvdb_def::table_block_header_size, 8, &generation) ||
-            !on9kvdb_def::read_u32_le(io_frame, on9kvdb_def::table_block_header_size, 16, &encoded_block_index) ||
-            !on9kvdb_def::read_u16_le(io_frame, on9kvdb_def::table_block_header_size, 20, &entry_count) ||
-            !on9kvdb_def::read_u16_le(io_frame, on9kvdb_def::table_block_header_size, 22, &reserved) ||
-            !on9kvdb_def::read_u32_le(io_frame, on9kvdb_def::table_block_header_size, 24, &payload_size) ||
-            magic != on9kvdb_def::table_block_magic || revision != on9kvdb_def::table_block_revision ||
-            header_size != on9kvdb_def::table_block_header_size || generation != reference.generation ||
-            encoded_block_index != cursor->block_index || entry_count == 0 || reserved != 0 || payload_size == 0 ||
-            payload_size > manifest.limits.sstable_block_bytes - on9kvdb_def::table_block_header_size) {
-            return ESP_ERR_INVALID_CRC;
+        if (block_validation_buffer != nullptr) {
+            esp_err_t ret = read_table_bytes_unsafe(cursor->source_slot, block_offset, block_validation_buffer,
+                                                    manifest.limits.sstable_block_bytes);
+            if (ret != ESP_OK) {
+                return ret;
+            }
+            on9kvdb_def::table_block_header header = {};
+            if (on9kvdb_def::decode_table_block_header(block_validation_buffer, manifest.limits.sstable_block_bytes, &header) !=
+                    on9kvdb_def::format_status::ok ||
+                header.generation != reference.generation || header.block_index != cursor->block_index) {
+                return ESP_ERR_INVALID_CRC;
+            }
+            entry_count = header.entry_count;
+            payload_size = header.payload_size;
+        } else {
+            esp_err_t ret =
+                read_table_bytes_unsafe(cursor->source_slot, block_offset, io_frame, on9kvdb_def::table_block_header_size);
+            if (ret != ESP_OK) {
+                return ret;
+            }
+
+            uint32_t magic = 0;
+            uint16_t revision = 0;
+            uint16_t header_size = 0;
+            uint64_t generation = 0;
+            uint32_t encoded_block_index = 0;
+            uint16_t reserved = 0;
+            if (!on9kvdb_def::read_u32_le(io_frame, on9kvdb_def::table_block_header_size, 0, &magic) ||
+                !on9kvdb_def::read_u16_le(io_frame, on9kvdb_def::table_block_header_size, 4, &revision) ||
+                !on9kvdb_def::read_u16_le(io_frame, on9kvdb_def::table_block_header_size, 6, &header_size) ||
+                !on9kvdb_def::read_u64_le(io_frame, on9kvdb_def::table_block_header_size, 8, &generation) ||
+                !on9kvdb_def::read_u32_le(io_frame, on9kvdb_def::table_block_header_size, 16, &encoded_block_index) ||
+                !on9kvdb_def::read_u16_le(io_frame, on9kvdb_def::table_block_header_size, 20, &entry_count) ||
+                !on9kvdb_def::read_u16_le(io_frame, on9kvdb_def::table_block_header_size, 22, &reserved) ||
+                !on9kvdb_def::read_u32_le(io_frame, on9kvdb_def::table_block_header_size, 24, &payload_size) ||
+                magic != on9kvdb_def::table_block_magic || revision != on9kvdb_def::table_block_revision ||
+                header_size != on9kvdb_def::table_block_header_size || generation != reference.generation ||
+                encoded_block_index != cursor->block_index || entry_count == 0 || reserved != 0 || payload_size == 0 ||
+                payload_size > manifest.limits.sstable_block_bytes - on9kvdb_def::table_block_header_size) {
+                return ESP_ERR_INVALID_CRC;
+            }
         }
 
         cursor->entry_index = 0;
@@ -163,7 +179,7 @@ esp_err_t on9kvdb::load_compaction_cursor_unsafe(compaction_cursor *cursor)
     return ESP_OK;
 }
 
-esp_err_t on9kvdb::advance_compaction_cursor_unsafe(compaction_cursor *cursor)
+esp_err_t on9kvdb::advance_compaction_cursor_unsafe(compaction_cursor *cursor, uint8_t *block_validation_buffer)
 {
     if (cursor == nullptr || !cursor->active || cursor->entry_index >= cursor->block_entry_count) {
         return ESP_ERR_INVALID_ARG;
@@ -178,7 +194,7 @@ esp_err_t on9kvdb::advance_compaction_cursor_unsafe(compaction_cursor *cursor)
         cursor->block_index += 1U;
         cursor->block_entry_count = 0;
     }
-    return load_compaction_cursor_unsafe(cursor);
+    return load_compaction_cursor_unsafe(cursor, block_validation_buffer);
 }
 
 esp_err_t on9kvdb::start_compaction_output_unsafe(compaction_output *output, uint32_t slot, uint64_t generation,
@@ -461,7 +477,7 @@ esp_err_t on9kvdb::compact_tables_unsafe()
         }
         new (&cursors[cursor_count]) compaction_cursor{};
         cursors[cursor_count].source_slot = slot;
-        const esp_err_t ret = load_compaction_cursor_unsafe(&cursors[cursor_count]);
+        const esp_err_t ret = load_compaction_cursor_unsafe(&cursors[cursor_count], nullptr);
         if (ret != ESP_OK) {
             return ret;
         }
@@ -599,7 +615,7 @@ esp_err_t on9kvdb::compact_tables_unsafe()
         }
         for (uint32_t cursor_index = 0; cursor_index < cursor_count; cursor_index += 1) {
             if (cursors[cursor_index].active && on9kvdb_def::composite_key_equal(cursors[cursor_index].key, smallest)) {
-                ret = advance_compaction_cursor_unsafe(&cursors[cursor_index]);
+                ret = advance_compaction_cursor_unsafe(&cursors[cursor_index], nullptr);
                 if (ret != ESP_OK) {
                     break;
                 }
