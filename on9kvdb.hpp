@@ -223,6 +223,23 @@ private:
         bool tombstone = false;
     };
 
+    static const constexpr uint32_t maximum_table_data_blocks =
+        (CONFIG_ON9KVDB_SSTABLE_FILE_SIZE - on9kvdb_def::table_data_region_offset - CONFIG_ON9KVDB_SSTABLE_BLOCK_SIZE -
+         on9kvdb_def::table_footer_slot_size) /
+        CONFIG_ON9KVDB_SSTABLE_BLOCK_SIZE;
+
+    struct table_index_cache_entry {
+        on9kvdb_def::composite_key first_key = {};
+        uint32_t block_offset = 0;
+    };
+
+    struct table_index_cache_slot {
+        uint64_t generation = 0;
+        uint32_t entry_count = 0;
+        bool valid = false;
+        table_index_cache_entry entries[maximum_table_data_blocks] = {};
+    };
+
     struct wal_payload_copy_state {
         uint32_t stream_offset;
         size_t request_size;
@@ -340,6 +357,8 @@ private: // Immutable SSTables
     esp_err_t finish_compaction_output_unsafe(compaction_output *output, on9kvdb_def::table_reference *reference_out);
     esp_err_t recover_tables_unsafe();
     esp_err_t validate_table_unsafe(const on9kvdb_def::table_reference &reference);
+    esp_err_t cache_table_index_unsafe(const on9kvdb_def::table_reference &reference, const uint8_t *index_block);
+    void invalidate_table_index_cache_unsafe(uint32_t slot);
     esp_err_t lookup_tables_unsafe(const char *namespace_name, const char *key, value_view *view_out) const;
     esp_err_t lookup_table_unsafe(const on9kvdb_def::table_reference &reference, const on9kvdb_def::composite_key &key,
                                   value_view *view_out) const;
@@ -414,6 +433,8 @@ private:
     memtable_bucket *memtable_index = nullptr;
     uint8_t *transaction_staging = nullptr;
     uint8_t *memtable_data = nullptr;
+    table_index_cache_slot *table_index_cache = nullptr;
+    uint8_t *table_lookup_value = nullptr;
     uint8_t *future_scratch = nullptr;
     size_t future_scratch_size = 0;
     uint32_t namespace_count = 0;

@@ -190,6 +190,7 @@ esp_err_t on9kvdb::start_compaction_output_unsafe(compaction_output *output, uin
     }
 
     *output = {};
+    invalidate_table_index_cache_unsafe(slot);
     output->build.file_fd = storage_fds[descriptor_index(on9kvdb_def::file_kind::table, slot)];
     output->build.data_block = data_block;
     output->build.index_block = index_block;
@@ -355,18 +356,14 @@ esp_err_t on9kvdb::finish_compaction_output_unsafe(compaction_output *output, on
     output->metadata.data_bytes = output->build.data_bytes;
     output->metadata.content_checksum = ~output->build.content_crc;
 
-    ret = sync_fd(output->build.file_fd);
     memset(io_frame, 0, on9kvdb_def::wal_frame_size);
-    if (ret == ESP_OK && !on9kvdb_def::encode_table_metadata(io_frame, on9kvdb_def::wal_frame_size,
-                                                             on9kvdb_def::table_footer_magic, output->metadata)) {
+    if (!on9kvdb_def::encode_table_metadata(io_frame, on9kvdb_def::wal_frame_size, on9kvdb_def::table_footer_magic,
+                                            output->metadata)) {
         ret = ESP_ERR_INVALID_STATE;
     }
     if (ret == ESP_OK) {
         ret = write_exact_fd(output->build.file_fd, manifest.geometry.table_size, output->metadata.footer_offset, io_frame,
                              on9kvdb_def::table_footer_slot_size);
-    }
-    if (ret == ESP_OK) {
-        ret = sync_fd(output->build.file_fd);
     }
     for (uint32_t copy = 0; ret == ESP_OK && copy < on9kvdb_def::table_header_slot_count; copy += 1) {
         memset(io_frame, 0, on9kvdb_def::wal_frame_size);
@@ -379,9 +376,10 @@ esp_err_t on9kvdb::finish_compaction_output_unsafe(compaction_output *output, on
             on9kvdb_def::table_header_region_offset + static_cast<uint64_t>(copy) * on9kvdb_def::table_header_slot_size;
         ret = write_exact_fd(output->build.file_fd, manifest.geometry.table_size, header_offset, io_frame,
                              on9kvdb_def::table_header_slot_size);
-        if (ret == ESP_OK) {
-            ret = sync_fd(output->build.file_fd);
-        }
+    }
+    if (ret == ESP_OK) {
+        // The output remains unreachable until the later manifest bank swap, so one sync can publish the complete file.
+        ret = sync_fd(output->build.file_fd);
     }
     if (ret != ESP_OK) {
         return ret;

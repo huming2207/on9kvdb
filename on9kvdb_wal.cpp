@@ -61,6 +61,7 @@ esp_err_t on9kvdb::ensure_wal_header(uint32_t slot, uint64_t generation, uint64_
     header.state = on9kvdb_def::wal_header_state_active;
 
     const int wal_fd = storage_fds[descriptor_index(on9kvdb_def::file_kind::wal, slot)];
+    esp_err_t ret = ESP_OK;
     for (uint32_t copy_slot = 0; copy_slot < on9kvdb_def::wal_header_slot_count; copy_slot += 1) {
         memset(io_frame, 0, on9kvdb_def::wal_header_slot_size);
         if (!on9kvdb_def::encode_wal_header(io_frame, on9kvdb_def::wal_header_slot_size, header)) {
@@ -69,15 +70,13 @@ esp_err_t on9kvdb::ensure_wal_header(uint32_t slot, uint64_t generation, uint64_
 
         const uint64_t offset =
             on9kvdb_def::wal_header_region_offset + static_cast<uint64_t>(copy_slot) * on9kvdb_def::wal_header_slot_size;
-        esp_err_t ret = write_exact_fd(wal_fd, manifest.geometry.wal_size, offset, io_frame, on9kvdb_def::wal_header_slot_size);
-        if (ret == ESP_OK) {
-            ret = sync_fd(wal_fd);
-        }
+        ret = write_exact_fd(wal_fd, manifest.geometry.wal_size, offset, io_frame, on9kvdb_def::wal_header_slot_size);
         if (ret != ESP_OK) {
             return ret;
         }
     }
-    return ESP_OK;
+    // The generation remains unreachable until its manifest publication. Make both redundant headers durable together.
+    return sync_fd(wal_fd);
 }
 
 esp_err_t on9kvdb::initialise_first_wal()

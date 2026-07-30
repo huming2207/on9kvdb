@@ -302,6 +302,28 @@ esp_err_t on9kvdb::allocate_runtime_memory()
     memtable_data = static_cast<uint8_t *>(allocation);
     allocation = nullptr;
 
+    // The approved default budget remains 100 KiB. A caller can opt into the fixed SSTable index cache and a stable lookup
+    // value buffer by supplying enough additional arena space; otherwise lookup retains its checked on-disk fallback.
+    uint8_t *optional_cursor = cursor;
+    size_t optional_remaining = remaining;
+    void *optional_cache = nullptr;
+    void *optional_value = nullptr;
+    const bool optional_carved =
+        carve_arena(&optional_cursor, &optional_remaining, alignof(table_index_cache_slot),
+                    sizeof(table_index_cache_slot) * CONFIG_ON9KVDB_SSTABLE_COUNT, &optional_cache) &&
+        carve_arena(&optional_cursor, &optional_remaining, alignof(uint64_t), on9kvdb_def::max_value_len, &optional_value) &&
+        optional_remaining >= minimum_future_scratch_size();
+    if (optional_carved) {
+        cursor = optional_cursor;
+        remaining = optional_remaining;
+        table_index_cache = static_cast<table_index_cache_slot *>(optional_cache);
+        table_lookup_value = static_cast<uint8_t *>(optional_value);
+        for (uint32_t slot = 0; slot < CONFIG_ON9KVDB_SSTABLE_COUNT; slot += 1U) {
+            new (&table_index_cache[slot]) table_index_cache_slot{};
+        }
+        memset(table_lookup_value, 0, on9kvdb_def::max_value_len);
+    }
+
     all_carved = all_carved && carve_arena(&cursor, &remaining, alignof(uint64_t), 0, &allocation);
     if (!all_carved || remaining < minimum_future_scratch_size()) {
         reset_runtime_state_unsafe();
@@ -385,6 +407,8 @@ esp_err_t on9kvdb::init()
         ESP_LOGI(TAG, "Init: bytes=%" PRIu64 ", live=%" PRIu64 ", WAL=%" PRIu32 "x%" PRIu32 ", tables=%" PRIu32 "x%" PRIu32,
                  manifest.geometry.provisioned_size, manifest.geometry.max_live_bytes, manifest.geometry.wal_count,
                  manifest.geometry.wal_size, manifest.geometry.table_count, manifest.geometry.table_size);
+        ESP_LOGI(TAG, "Runtime: bytes=%u, scratch=%u, SSTable index cache=%s", static_cast<unsigned>(cfg.runtime_memory_budget),
+                 static_cast<unsigned>(future_scratch_size), table_index_cache == nullptr ? "disabled" : "enabled");
     } else {
         close_storage_unsafe();
     }
@@ -452,6 +476,8 @@ void on9kvdb::reset_runtime_state_unsafe()
     memtable_index = nullptr;
     transaction_staging = nullptr;
     memtable_data = nullptr;
+    table_index_cache = nullptr;
+    table_lookup_value = nullptr;
     future_scratch = nullptr;
     future_scratch_size = 0;
     namespace_count = 0;

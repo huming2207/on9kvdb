@@ -18,6 +18,26 @@ inactive bank before atomically selecting it through the manifest; the old
 bank is not reusable until both redundant manifest copies no longer reference
 it.
 
+## Engineering documentation
+
+The audit-oriented engineering contract is split by topic under
+[`doc/`](doc/):
+
+- [`doc/REQUIREMENTS.md`](doc/REQUIREMENTS.md) records mandatory constraints.
+- [`doc/STORAGE_FORMAT.md`](doc/STORAGE_FORMAT.md) records persistent layout
+  and durability ordering.
+- [`doc/API_AND_RECOVERY.md`](doc/API_AND_RECOVERY.md) records public behavior
+  and recovery.
+- [`doc/DESIGN_DECISIONS.md`](doc/DESIGN_DECISIONS.md) records approved design
+  choices.
+- [`doc/IMPLEMENTATION_AND_TESTING.md`](doc/IMPLEMENTATION_AND_TESTING.md)
+  records invariants and qualification requirements.
+- [`doc/NEXT_STEPS.md`](doc/NEXT_STEPS.md) separates performance follow-up
+  work from the approved durability contract.
+
+Start with [`doc/AGENTS.md`](doc/AGENTS.md) for the audit order and authority
+rules.
+
 ## Default fixed geometry
 
 New databases use build-time Kconfig geometry:
@@ -248,16 +268,28 @@ NVS appending a compact entry directly to its partition.
 The default 256 KiB WAL has 240 KiB of frame space, or 60 one-frame
 transactions. WAL rotation can synchronously flush or compact tables and
 publish manifests, producing the multi-second tail-latency samples seen in the
-demo. After records move out of the memtable, reads may also scan SSTables
-because v1 deliberately has no Bloom filter or data-block cache.
+demo. Applications can select larger persisted WAL geometry; the performance
+demo uses two 1 MiB WALs.
+
+After records move out of the memtable, reads may also scan SSTables. A caller
+that supplies enough arena space beyond the approved 100 KiB default gets a
+bounded decoded sparse-index cache for every physical table slot and a stable
+maximum-value-sized lookup buffer. The checked disk-index and winning-table
+reread path remains available when the optional arena partition does not fit.
+The cache never replaces block CRC verification and is rebuilt only from a
+fully validated table.
 
 Without weakening durability or changing storage revision 4, applications can
 amortize the fixed WAL sync by grouping up to ten related mutations in one
-transaction. A smaller WAL frame, deferred/group commit, a raw-partition WAL,
-or a bounded table cache are possible future performance designs, but each
-changes the current format, durability, backend, or RAM contract and requires
-separate measurement and approval. Removing `fsync()` is not a valid
-optimization for durable commits.
+transaction. SSTable bodies and both redundant metadata copies are written
+while unreachable, synchronized once as a complete file, validated, and only
+then published by a separately synchronized manifest. Redundant headers for a
+new unreachable WAL generation are likewise synchronized together.
+
+A smaller WAL frame, deferred/group commit, or a raw-partition WAL remains a
+future design requiring separate measurement and approval. Removing the WAL
+or manifest durability `fsync()` is not a valid optimization for durable
+commits.
 
 ## Common persisted prefix
 

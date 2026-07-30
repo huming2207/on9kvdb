@@ -244,6 +244,7 @@ esp_err_t on9kvdb::flush_memtable_unsafe()
     if (table_slot == bank_end) {
         return compact_tables_unsafe();
     }
+    invalidate_table_index_cache_unsafe(table_slot);
 
     const size_t sort_bytes = static_cast<size_t>(CONFIG_ON9KVDB_MEMTABLE_ENTRY_COUNT) * sizeof(uint32_t);
     const size_t required_scratch = sort_bytes + 2U * manifest.limits.sstable_block_bytes;
@@ -404,20 +405,15 @@ esp_err_t on9kvdb::flush_memtable_unsafe()
     metadata.data_bytes = state.data_bytes;
     metadata.content_checksum = ~state.content_crc;
 
-    // The table body and footer become durable before either header. The manifest is published last, so recovery can never
-    // observe a referenced table whose complete contents were not already synced and read back successfully.
-    ret = sync_fd(state.file_fd);
+    // The table remains unreachable until the final manifest publication. Write its complete body and redundant metadata,
+    // then make all of it durable with one file sync before validation and publication.
     memset(io_frame, 0, on9kvdb_def::wal_frame_size);
-    if (ret == ESP_OK &&
-        !on9kvdb_def::encode_table_metadata(io_frame, on9kvdb_def::wal_frame_size, on9kvdb_def::table_footer_magic, metadata)) {
+    if (!on9kvdb_def::encode_table_metadata(io_frame, on9kvdb_def::wal_frame_size, on9kvdb_def::table_footer_magic, metadata)) {
         ret = ESP_ERR_INVALID_STATE;
     }
     if (ret == ESP_OK) {
         ret = write_exact_fd(state.file_fd, manifest.geometry.table_size, footer_offset, io_frame,
                              on9kvdb_def::table_footer_slot_size);
-    }
-    if (ret == ESP_OK) {
-        ret = sync_fd(state.file_fd);
     }
     for (uint32_t copy = 0; ret == ESP_OK && copy < on9kvdb_def::table_header_slot_count; copy += 1) {
         memset(io_frame, 0, on9kvdb_def::wal_frame_size);
@@ -430,9 +426,9 @@ esp_err_t on9kvdb::flush_memtable_unsafe()
             on9kvdb_def::table_header_region_offset + static_cast<uint64_t>(copy) * on9kvdb_def::table_header_slot_size;
         ret = write_exact_fd(state.file_fd, manifest.geometry.table_size, header_offset, io_frame,
                              on9kvdb_def::table_header_slot_size);
-        if (ret == ESP_OK) {
-            ret = sync_fd(state.file_fd);
-        }
+    }
+    if (ret == ESP_OK) {
+        ret = sync_fd(state.file_fd);
     }
     if (ret != ESP_OK) {
         return ret;
@@ -471,6 +467,7 @@ esp_err_t on9kvdb::validate_table_unsafe(const on9kvdb_def::table_reference &ref
         future_scratch_size < sort_bytes + 2U * manifest.limits.sstable_block_bytes) {
         return ESP_ERR_INVALID_ARG;
     }
+    invalidate_table_index_cache_unsafe(reference.slot);
 
     uint8_t *data_block = future_scratch + sort_bytes;
     uint8_t *index_block = data_block + manifest.limits.sstable_block_bytes;
@@ -598,7 +595,58 @@ esp_err_t on9kvdb::validate_table_unsafe(const on9kvdb_def::table_reference &ref
         !on9kvdb_def::composite_key_equal(previous_key, reference.max_key)) {
         return ESP_ERR_INVALID_CRC;
     }
+    return cache_table_index_unsafe(reference, index_block);
+}
+
+esp_err_t on9kvdb::cache_table_index_unsafe(const on9kvdb_def::table_reference &reference, const uint8_t *index_block)
+{
+    if (!reference.active || reference.slot >= manifest.geometry.table_count || index_block == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (table_index_cache == nullptr) {
+        return ESP_OK;
+    }
+    if (reference.data_block_count == 0 || reference.data_block_count > maximum_table_data_blocks) {
+        return ESP_ERR_INVALID_CRC;
+    }
+
+    table_index_cache_slot &cached = table_index_cache[reference.slot];
+    memset(&cached, 0, sizeof(cached));
+    on9kvdb_def::table_index_header header = {};
+    if (on9kvdb_def::decode_table_index_header(index_block, manifest.limits.sstable_block_bytes, &header) !=
+            on9kvdb_def::format_status::ok ||
+        header.generation != reference.generation || header.entry_count != reference.data_block_count ||
+        header.data_block_count != reference.data_block_count) {
+        return ESP_ERR_INVALID_CRC;
+    }
+
+    uint32_t offset = on9kvdb_def::table_index_header_size;
+    for (uint32_t idx = 0; idx < header.entry_count; idx += 1U) {
+        on9kvdb_def::table_index_entry entry = {};
+        if (on9kvdb_def::decode_table_index_entry(index_block, manifest.limits.sstable_block_bytes, offset, &entry) !=
+            on9kvdb_def::format_status::ok) {
+            return ESP_ERR_INVALID_CRC;
+        }
+        table_index_cache_entry &destination = cached.entries[idx];
+        copy_composite_key(&destination.first_key, entry.namespace_name, entry.namespace_size, entry.key, entry.key_size);
+        destination.block_offset = entry.block_offset;
+        offset += entry.total_size;
+    }
+    if (offset != on9kvdb_def::table_index_header_size + header.payload_size) {
+        return ESP_ERR_INVALID_CRC;
+    }
+
+    cached.generation = reference.generation;
+    cached.entry_count = header.entry_count;
+    cached.valid = true;
     return ESP_OK;
+}
+
+void on9kvdb::invalidate_table_index_cache_unsafe(uint32_t slot)
+{
+    if (table_index_cache != nullptr && slot < manifest.geometry.table_count) {
+        memset(&table_index_cache[slot], 0, sizeof(table_index_cache[slot]));
+    }
 }
 
 esp_err_t on9kvdb::lookup_table_unsafe(const on9kvdb_def::table_reference &reference, const on9kvdb_def::composite_key &key,
@@ -611,41 +659,59 @@ esp_err_t on9kvdb::lookup_table_unsafe(const on9kvdb_def::table_reference &refer
     const size_t sort_bytes = static_cast<size_t>(CONFIG_ON9KVDB_MEMTABLE_ENTRY_COUNT) * sizeof(uint32_t);
     uint8_t *data_block = future_scratch + sort_bytes;
     uint8_t *index_block = data_block + manifest.limits.sstable_block_bytes;
-    const uint32_t footer_offset = manifest.geometry.table_size - on9kvdb_def::table_footer_slot_size;
-    const uint32_t index_offset = footer_offset - manifest.limits.sstable_block_bytes;
-    esp_err_t ret = read_table_bytes_unsafe(reference.slot, index_offset, index_block, manifest.limits.sstable_block_bytes);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-    on9kvdb_def::table_index_header index_header = {};
-    if (on9kvdb_def::decode_table_index_header(index_block, manifest.limits.sstable_block_bytes, &index_header) !=
-            on9kvdb_def::format_status::ok ||
-        index_header.generation != reference.generation || index_header.data_block_count != reference.data_block_count) {
-        return ESP_ERR_INVALID_CRC;
-    }
-
     uint32_t selected_block_offset = UINT32_MAX;
-    uint32_t offset = on9kvdb_def::table_index_header_size;
-    for (uint32_t idx = 0; idx < index_header.entry_count; idx += 1) {
-        on9kvdb_def::table_index_entry index_entry = {};
-        if (on9kvdb_def::decode_table_index_entry(index_block, manifest.limits.sstable_block_bytes, offset, &index_entry) !=
-            on9kvdb_def::format_status::ok) {
+    const table_index_cache_slot *cached = nullptr;
+    if (table_index_cache != nullptr && reference.slot < manifest.geometry.table_count) {
+        const table_index_cache_slot &candidate = table_index_cache[reference.slot];
+        if (candidate.valid && candidate.generation == reference.generation &&
+            candidate.entry_count == reference.data_block_count) {
+            cached = &candidate;
+        }
+    }
+    if (cached != nullptr) {
+        for (uint32_t idx = 0; idx < cached->entry_count; idx += 1U) {
+            if (on9kvdb_def::compare_composite_key(cached->entries[idx].first_key, key) > 0) {
+                break;
+            }
+            selected_block_offset = cached->entries[idx].block_offset;
+        }
+    } else {
+        const uint32_t footer_offset = manifest.geometry.table_size - on9kvdb_def::table_footer_slot_size;
+        const uint32_t index_offset = footer_offset - manifest.limits.sstable_block_bytes;
+        esp_err_t ret = read_table_bytes_unsafe(reference.slot, index_offset, index_block, manifest.limits.sstable_block_bytes);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+        on9kvdb_def::table_index_header index_header = {};
+        if (on9kvdb_def::decode_table_index_header(index_block, manifest.limits.sstable_block_bytes, &index_header) !=
+                on9kvdb_def::format_status::ok ||
+            index_header.generation != reference.generation || index_header.data_block_count != reference.data_block_count) {
             return ESP_ERR_INVALID_CRC;
         }
-        on9kvdb_def::composite_key first_key = {};
-        copy_composite_key(&first_key, index_entry.namespace_name, index_entry.namespace_size, index_entry.key,
-                           index_entry.key_size);
-        if (on9kvdb_def::compare_composite_key(first_key, key) > 0) {
-            break;
+
+        uint32_t index_entry_offset = on9kvdb_def::table_index_header_size;
+        for (uint32_t idx = 0; idx < index_header.entry_count; idx += 1U) {
+            on9kvdb_def::table_index_entry index_entry = {};
+            if (on9kvdb_def::decode_table_index_entry(index_block, manifest.limits.sstable_block_bytes, index_entry_offset,
+                                                      &index_entry) != on9kvdb_def::format_status::ok) {
+                return ESP_ERR_INVALID_CRC;
+            }
+            on9kvdb_def::composite_key first_key = {};
+            copy_composite_key(&first_key, index_entry.namespace_name, index_entry.namespace_size, index_entry.key,
+                               index_entry.key_size);
+            if (on9kvdb_def::compare_composite_key(first_key, key) > 0) {
+                break;
+            }
+            selected_block_offset = index_entry.block_offset;
+            index_entry_offset += index_entry.total_size;
         }
-        selected_block_offset = index_entry.block_offset;
-        offset += index_entry.total_size;
     }
     if (selected_block_offset == UINT32_MAX) {
         return ESP_ERR_NOT_FOUND;
     }
 
-    ret = read_table_bytes_unsafe(reference.slot, selected_block_offset, data_block, manifest.limits.sstable_block_bytes);
+    esp_err_t ret =
+        read_table_bytes_unsafe(reference.slot, selected_block_offset, data_block, manifest.limits.sstable_block_bytes);
     if (ret != ESP_OK) {
         return ret;
     }
@@ -656,7 +722,7 @@ esp_err_t on9kvdb::lookup_table_unsafe(const on9kvdb_def::table_reference &refer
         return ESP_ERR_INVALID_CRC;
     }
 
-    offset = on9kvdb_def::table_block_header_size;
+    uint32_t offset = on9kvdb_def::table_block_header_size;
     for (uint16_t idx = 0; idx < block_header.entry_count; idx += 1) {
         on9kvdb_def::table_entry entry = {};
         if (on9kvdb_def::decode_table_entry(data_block, manifest.limits.sstable_block_bytes, offset, &entry) !=
@@ -700,6 +766,7 @@ esp_err_t on9kvdb::lookup_tables_unsafe(const char *namespace_name, const char *
                        reinterpret_cast<const uint8_t *>(key), static_cast<uint8_t>(key_size));
     uint64_t best_sequence = 0;
     uint32_t best_slot = manifest.geometry.table_count;
+    value_view best = {};
     for (uint32_t slot = 0; slot < manifest.geometry.table_count; slot += 1) {
         const on9kvdb_def::table_reference &reference = manifest.tables[slot];
         if (!reference.active || on9kvdb_def::compare_composite_key(composite, reference.min_key) < 0 ||
@@ -714,14 +781,30 @@ esp_err_t on9kvdb::lookup_tables_unsafe(const char *namespace_name, const char *
         if (ret == ESP_OK && candidate.transaction_sequence > best_sequence) {
             best_sequence = candidate.transaction_sequence;
             best_slot = slot;
+            if (table_lookup_value != nullptr) {
+                if (candidate.value_size > on9kvdb_def::max_value_len ||
+                    (candidate.value_size != 0 && candidate.value == nullptr)) {
+                    return ESP_ERR_INVALID_CRC;
+                }
+                if (candidate.value_size != 0) {
+                    memcpy(table_lookup_value, candidate.value, candidate.value_size);
+                }
+                best = candidate;
+                best.value = candidate.value_size == 0 ? nullptr : table_lookup_value;
+            }
         }
     }
     if (best_slot == manifest.geometry.table_count) {
         return ESP_ERR_NOT_FOUND;
     }
 
-    // Each table lookup reuses the same bounded block buffer. Re-read the winning table so the returned value remains valid
-    // until the caller finishes copying it while still holding the operation lock.
+    if (table_lookup_value != nullptr) {
+        *view_out = best;
+        return ESP_OK;
+    }
+
+    // The approved 100 KiB arena does not have room for the optional stable result buffer. Retain the checked fallback that
+    // re-reads the winning table so its value remains valid until the caller copies it under the operation lock.
     return lookup_table_unsafe(manifest.tables[best_slot], composite, view_out);
 }
 
