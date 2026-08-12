@@ -2,11 +2,11 @@
 
 ## Scope
 
-on9kvdb stores a binary key/value model in a caller-owned exclusive raw block
-range. The component receives that range through `on9kvdb_io`; it does not
-know paths, filesystems, partitions, mounting, formatting, or wear levelling.
-The supplied SDMMC adapter is non-owning: application code initializes and
-keeps the ESP-IDF host/card alive for the database lifetime.
+on9kvdb stores a binary key/value model in a caller-owned exclusive block
+range. The component receives that range through `on9kvdb_io`. The default
+SDMMC adapter is non-owning: application code initializes and keeps the
+ESP-IDF host/card alive for the database lifetime. The optional FATFS adapter
+is likewise non-owning: application code mounts and keeps the volume alive.
 
 The public model is byte-oriented. Namespace and key are 1–128 byte explicit
 ranges, values are 0–`UINT32_MAX - 1` bytes, and `0x00` has no special
@@ -28,6 +28,11 @@ C-string operation.
 - Geometry, limits, revisions, all checksums, and all offset/length arithmetic
   are validated before use. Revision 7 deliberately rejects prior FATFS
   images.
+- With `on9kvdb_io_fatfs`, its one designated regular file is the exclusive
+  range. It is created with immediate contiguous allocation only when absent;
+  an existing file is accepted only when its exact configured size and FATFS
+  contiguity are verified. The adapter neither manages nor accesses another
+  filesystem entry.
 
 ## Correctness and lifetime
 

@@ -6,6 +6,7 @@
 | --- | --- |
 | `on9kvdb_io.hpp` | Public raw block-device contract |
 | `on9kvdb_io_sdmmc.*` | Non-owning ESP-IDF SDMMC implementation |
+| `on9kvdb_io_fatfs.*` | One-contiguous-file FATFS implementation |
 | `on9kvdb_io.cpp` | Checked logical-region mapping and fixed bounce reads |
 | `on9kvdb_manifest.cpp` | Raw provisioning, identities, manifest copies/recovery gate |
 | `on9kvdb_wal.cpp` | WAL creation, append, scan, and replay |
@@ -31,6 +32,11 @@ ESP-IDF build verifies the full raw-SDMMC component path. Hardware qualification
 must additionally test the selected SDMMC wiring, a known exclusive LBA range,
 card removal/error propagation, reboot recovery, and power interruptions at
 every write/publication boundary.
+
+When changing the FATFS adapter, verify an empty mounted volume creates one
+contiguous file, then that a second boot reopens it without creating or touching
+any other file. Test rejection of a non-contiguous, wrong-sized, or externally
+modified target file.
 
 ## Review checklist
 

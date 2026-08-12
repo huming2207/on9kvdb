@@ -19,6 +19,11 @@
   persistence are device-specific. The SDMMC implementation uses a post-write
   card status command and makes no stronger power-loss claim.
 - SD controller management and NOR flash wear levelling are outside on9kvdb.
+- `on9kvdb_io_fatfs` ships with the main component. It creates one immediately
+  allocated contiguous file, validates that file before every open, and then
+  uses only its descriptor. This retains the database's fixed 4096-byte block
+  contract while deliberately avoiding directory and file allocation work on
+  its normal I/O path.
 
 ## Memory and read efficiency
 

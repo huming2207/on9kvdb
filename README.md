@@ -1,9 +1,10 @@
 # on9kvdb
 
-`on9kvdb` is a fixed-memory, LSM-style binary KV database for ESP-IDF. It
-stores records in an application-supplied raw block range; it does not depend
-on FATFS, VFS, paths, file descriptors, mounting, formatting, or a storage
-driver's wear-levelling policy.
+`on9kvdb` is a fixed-memory, LSM-style binary KV database for ESP-IDF. Its
+default storage path is an application-supplied raw block range. The component
+also supplies a single-file FATFS adapter for projects where a raw range is not
+practical; mounting, formatting, and storage-driver wear-levelling policy
+remain application responsibilities.
 
 ## Integration
 
@@ -27,6 +28,27 @@ The range must be at least `CONFIG_ON9KVDB_PROVISIONED_DATABASE_SIZE` and use
 a block size that divides 4096 bytes. It must not be mounted as a filesystem
 or shared with any other consumer. First use accepts only a range uniformly
 filled with `0x00` or `0xff`; any other unrecognized content fails closed.
+
+### Optional one-file FATFS adapter
+
+The adapter is built as part of `on9kvdb`. Mount the FATFS volume in
+application code, then provision one fixed-size, contiguous file and use it as
+the database's sole block range:
+
+```cpp
+on9kvdb_io_fatfs device;
+ESP_ERROR_CHECK(device.init("/sdcard", "on9kvdb.bin", 8U * 1024U * 1024U));
+
+on9kvdb database(&device, nullptr);
+ESP_ERROR_CHECK(database.init());
+```
+
+On first use the adapter calls ESP-IDF's contiguous-file creation API with
+immediate allocation. On later use it verifies that the same regular file has
+the requested size and remains contiguous. It opens only that descriptor for
+block I/O; it never mounts, formats, enumerates, deletes, resizes, or accesses
+another filesystem entry. Call `device.deinit()` after `database.deinit()`.
+The database file must not be changed by another FATFS user while it is open.
 
 ## Binary API
 
@@ -64,7 +86,9 @@ makes it reachable. A backend must return transport failure from `sync()`;
 the physical power-loss guarantee of SD cards, flash, and power systems is a
 platform-qualification responsibility.
 
-Revision 7 is intentionally incompatible with the previous FATFS image.
+Revision 7 is intentionally incompatible with the previous multi-file FATFS
+image. The optional adapter instead presents one new, dedicated contiguous
+file as the revision-7 block range.
 
 ## Memory model
 

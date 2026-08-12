@@ -5,6 +5,7 @@ idf_component_register(
             "on9kvdb_compaction.cpp"
             "on9kvdb_format.cpp"
             "on9kvdb_io.cpp"
+            "on9kvdb_io_fatfs.cpp"
             "on9kvdb_io_sdmmc.cpp"
             "on9kvdb_manifest.cpp"
             "on9kvdb_memtable.cpp"
@@ -25,6 +26,10 @@ idf_component_register(
             "heap"
             "log"
             "sdmmc"
+            "vfs"
+
+        PRIV_REQUIRES
+            "fatfs"
 )
 
 target_compile_options(${COMPONENT_LIB} PRIVATE
