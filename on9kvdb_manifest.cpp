@@ -18,6 +18,23 @@ namespace
         return identity.kind == kind && identity.generation == 1 && identity.database_id == database_id &&
                identity.file_size == file_size && identity.slot == slot;
     }
+
+    bool is_data_file_kind(on9kvdb_def::file_kind kind)
+    {
+        return kind == on9kvdb_def::file_kind::wal || kind == on9kvdb_def::file_kind::table ||
+               kind == on9kvdb_def::file_kind::value_bank;
+    }
+
+    uint64_t data_file_size(const on9kvdb_def::storage_geometry &geometry, on9kvdb_def::file_kind kind)
+    {
+        if (kind == on9kvdb_def::file_kind::wal) {
+            return geometry.wal_size;
+        }
+        if (kind == on9kvdb_def::file_kind::table) {
+            return geometry.table_size;
+        }
+        return kind == on9kvdb_def::file_kind::value_bank ? geometry.value_bank_size : 0;
+    }
 }
 
 esp_err_t on9kvdb::setup_manifest()
@@ -81,6 +98,11 @@ esp_err_t on9kvdb::create_manifest()
     manifest.geometry = geometry;
     manifest.limits = get_build_limits();
     manifest.active_wal_slot = 0;
+    manifest.active_value_bank = 0;
+    for (uint32_t bank = 0; bank < on9kvdb_def::value_bank_count; bank += 1U) {
+        manifest.value_bank_generation[bank] = 1;
+        manifest.value_bank_tail[bank] = on9kvdb_def::identity_region_size;
+    }
     manifest_valid_copy_count = 0;
     ret = write_manifest_copy(1, on9kvdb_def::manifest_state_provisioning_owned);
     if (ret != ESP_OK) {
@@ -302,11 +324,11 @@ esp_err_t on9kvdb::write_file_identity_copy(int file_fd, on9kvdb_def::file_kind 
     if (copy_slot >= on9kvdb_def::identity_slot_count) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (kind != on9kvdb_def::file_kind::wal && kind != on9kvdb_def::file_kind::table) {
+    if (!is_data_file_kind(kind)) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    const uint64_t file_size = kind == on9kvdb_def::file_kind::wal ? manifest.geometry.wal_size : manifest.geometry.table_size;
+    const uint64_t file_size = data_file_size(manifest.geometry, kind);
     on9kvdb_def::file_identity identity = {};
     identity.generation = 1;
     identity.database_id = manifest.database_id;
@@ -330,11 +352,11 @@ esp_err_t on9kvdb::write_file_identity_copy(int file_fd, on9kvdb_def::file_kind 
 esp_err_t on9kvdb::load_file_identity(int file_fd, on9kvdb_def::file_kind kind, uint32_t slot,
                                       bool valid_copies[on9kvdb_def::identity_slot_count]) const
 {
-    if (valid_copies == nullptr || (kind != on9kvdb_def::file_kind::wal && kind != on9kvdb_def::file_kind::table)) {
+    if (valid_copies == nullptr || !is_data_file_kind(kind)) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    const uint64_t file_size = kind == on9kvdb_def::file_kind::wal ? manifest.geometry.wal_size : manifest.geometry.table_size;
+    const uint64_t file_size = data_file_size(manifest.geometry, kind);
     bool any_valid = false;
     for (uint32_t copy_slot = 0; copy_slot < on9kvdb_def::identity_slot_count; copy_slot += 1) {
         valid_copies[copy_slot] = false;
@@ -366,11 +388,11 @@ esp_err_t on9kvdb::load_file_identity(int file_fd, on9kvdb_def::file_kind kind, 
 
 esp_err_t on9kvdb::provision_one_data_file(on9kvdb_def::file_kind kind, uint32_t slot)
 {
-    if (kind != on9kvdb_def::file_kind::wal && kind != on9kvdb_def::file_kind::table) {
+    if (!is_data_file_kind(kind)) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    const uint64_t file_size = kind == on9kvdb_def::file_kind::wal ? manifest.geometry.wal_size : manifest.geometry.table_size;
+    const uint64_t file_size = data_file_size(manifest.geometry, kind);
     char path[PATH_MAX] = {};
     esp_err_t ret = build_data_path(kind, slot, path, sizeof(path));
     if (ret != ESP_OK) {
@@ -483,6 +505,13 @@ esp_err_t on9kvdb::provision_all_data_files()
 
     for (uint32_t slot = 0; slot < manifest.geometry.table_count; slot += 1) {
         esp_err_t ret = provision_one_data_file(on9kvdb_def::file_kind::table, slot);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+    }
+
+    for (uint32_t slot = 0; slot < manifest.geometry.value_bank_count; slot += 1) {
+        esp_err_t ret = provision_one_data_file(on9kvdb_def::file_kind::value_bank, slot);
         if (ret != ESP_OK) {
             return ret;
         }

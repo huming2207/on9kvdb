@@ -8,6 +8,7 @@ idf_component_register(
             "on9kvdb_manifest.cpp"
             "on9kvdb_memtable.cpp"
             "on9kvdb_table.cpp"
+            "on9kvdb_value.cpp"
             "on9kvdb_wal.cpp"
 
         INCLUDE_DIRS

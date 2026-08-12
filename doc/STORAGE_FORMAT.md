@@ -1,5 +1,12 @@
 # on9kvdb Storage Format and Durability
 
+> **vNext note:** Storage revision 6 supersedes the revision-4 layout below.
+> It retains the fixed FATFS files and copy-on-write publication model, adds
+> two fixed value-bank files, external value descriptors, per-record CRC-32,
+> and binary names. The current authoritative extension is
+> [`BINARY_VALUE_API.md`](BINARY_VALUE_API.md); old typed-value wording here is
+> historical only.
+
 Phase 2 freezes the permanent filenames, file counts/sizes, manifest slots,
 and the two identity slots at the beginning of every WAL/SSTable file:
 

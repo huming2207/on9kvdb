@@ -3,12 +3,17 @@
 #include <cstddef>
 #include <cstdint>
 
+#ifndef CONFIG_ON9KVDB_INLINE_VALUE_SIZE
+#define CONFIG_ON9KVDB_INLINE_VALUE_SIZE 1024
+#endif
+
 #define ON9KVDB_PACKED __attribute__((packed, aligned(1)))
 
 namespace on9kvdb_def
 {
-    static const constexpr size_t max_name_len = 32;
-    static const constexpr size_t max_value_len = 8192;
+    static const constexpr size_t max_name_len = 128;
+    static const constexpr uint32_t max_value_len = UINT32_MAX - 1U;
+    static const constexpr uint32_t inline_value_len = CONFIG_ON9KVDB_INLINE_VALUE_SIZE;
     static const constexpr size_t max_transaction_mutations = 10;
     static const constexpr size_t runtime_memory_budget_default = 100U * 1024U;
     static const constexpr size_t runtime_memory_budget_max = 200U * 1024U - 1U;
@@ -25,6 +30,7 @@ namespace on9kvdb_def
     static const constexpr uint32_t identity_slot_count = 2;
     static const constexpr uint32_t identity_region_size = identity_slot_size * identity_slot_count;
     static const constexpr uint32_t wal_file_count = 2;
+    static const constexpr uint32_t value_bank_count = 2;
     static const constexpr uint32_t wal_header_slot_size = format_alignment;
     static const constexpr uint32_t wal_header_slot_count = 2;
     static const constexpr uint32_t wal_header_region_offset = identity_region_size;
@@ -43,17 +49,22 @@ namespace on9kvdb_def
     static const constexpr uint32_t table_block_header_size = 64;
     static const constexpr uint32_t table_index_header_size = 64;
     static const constexpr uint32_t table_entry_header_size = 24;
+    static const constexpr uint32_t value_ref_encoded_size = 24;
     static const constexpr uint32_t table_index_entry_header_size = 16;
+    static const constexpr uint32_t value_chunk_size = format_alignment;
+    static const constexpr uint32_t value_chunk_header_size = 64;
+    static const constexpr uint32_t value_chunk_payload_size = value_chunk_size - value_chunk_header_size;
 
-    static const constexpr uint16_t storage_revision = 4;
-    static const constexpr uint16_t geometry_revision = 1;
-    static const constexpr uint16_t logical_limits_revision = 2;
+    static const constexpr uint16_t storage_revision = 6;
+    static const constexpr uint16_t geometry_revision = 2;
+    static const constexpr uint16_t logical_limits_revision = 3;
     static const constexpr uint16_t wal_header_revision = 1;
     static const constexpr uint16_t wal_frame_revision = 1;
     static const constexpr uint16_t table_header_revision = 1;
     static const constexpr uint16_t table_block_revision = 1;
     static const constexpr uint16_t table_index_revision = 1;
     static const constexpr uint16_t table_footer_revision = 1;
+    static const constexpr uint16_t value_chunk_revision = 1;
     static const constexpr uint32_t manifest_magic = 0x394d564bUL;     // "KVM9"
     static const constexpr uint32_t wal_magic = 0x3957564bUL;          // "KVW9"
     static const constexpr uint32_t table_magic = 0x3954564bUL;        // "KVT9"
@@ -63,6 +74,8 @@ namespace on9kvdb_def
     static const constexpr uint32_t table_block_magic = 0x3942544bUL;  // "KTB9"
     static const constexpr uint32_t table_index_magic = 0x3949544bUL;  // "KTI9"
     static const constexpr uint32_t table_footer_magic = 0x3946544bUL; // "KTF9"
+    static const constexpr uint32_t value_bank_magic = 0x3956424bUL;   // "KBV9"
+    static const constexpr uint32_t value_chunk_magic = 0x3956434bUL;  // "KCV9"
     static const constexpr uint16_t manifest_state_provisioning_owned = 0x7001;
     static const constexpr uint16_t manifest_state_ready = 0x7002;
     static const constexpr uint16_t file_prefix_flag_identity = 1U << 0;
@@ -70,7 +83,10 @@ namespace on9kvdb_def
     static const constexpr uint16_t wal_frame_flag_commit = 1U << 0;
     static const constexpr uint8_t table_reference_flag_active = 1U << 0;
     static const constexpr uint8_t table_entry_flag_tombstone = 1U << 0;
+    static const constexpr uint8_t table_entry_flag_external_value = 1U << 1;
+    static const constexpr uint16_t value_chunk_flag_final = 1U << 0;
     static const constexpr uint8_t memtable_flag_tombstone = 1U << 0;
+    static const constexpr uint8_t memtable_flag_external_value = 1U << 1;
     static const constexpr uint8_t mutation_kind_set = 1;
     static const constexpr uint8_t mutation_kind_tombstone = 2;
 
@@ -79,6 +95,7 @@ namespace on9kvdb_def
         manifest = 1,
         wal = 2,
         table = 3,
+        value_bank = 4,
     };
 
     enum class format_status : uint8_t {
@@ -129,6 +146,8 @@ namespace on9kvdb_def
         uint32_t wal_count = 0;
         uint32_t table_size = 0;
         uint32_t table_count = 0;
+        uint32_t value_bank_size = 0;
+        uint32_t value_bank_count = 0;
         uint32_t alignment = 0;
     };
 
@@ -141,13 +160,22 @@ namespace on9kvdb_def
         uint32_t max_transaction_mutations = 0;
         uint32_t transaction_staging_bytes = 0;
         uint32_t sstable_block_bytes = 0;
+        uint32_t inline_value_bytes = 0;
     };
 
     struct composite_key {
-        uint8_t namespace_size = 0;
-        uint8_t key_size = 0;
-        char namespace_name[max_name_len + 1] = {};
-        char key[max_name_len + 1] = {};
+        uint16_t namespace_size = 0;
+        uint16_t key_size = 0;
+        uint8_t namespace_name[max_name_len] = {};
+        uint8_t key[max_name_len] = {};
+    };
+
+    struct value_ref {
+        uint64_t bank_generation = 0;
+        uint32_t first_chunk_offset = 0;
+        uint32_t value_size = 0;
+        uint32_t value_checksum = 0;
+        uint8_t bank_slot = UINT8_MAX;
     };
 
     struct table_reference {
@@ -176,6 +204,9 @@ namespace on9kvdb_def
         uint64_t safe_checkpoint_sequence = 0;
         uint64_t next_table_generation = 1;
         uint32_t active_table_bank = 0;
+        uint32_t active_value_bank = 0;
+        uint64_t value_bank_generation[value_bank_count] = {};
+        uint32_t value_bank_tail[value_bank_count] = {};
         table_reference tables[max_table_count] = {};
     };
 
@@ -251,8 +282,9 @@ namespace on9kvdb_def
         uint32_t value_size = 0;
         uint8_t namespace_size = 0;
         uint8_t key_size = 0;
-        uint8_t type = 0;
+        uint8_t reserved0 = 0;
         uint8_t flags = 0;
+        value_ref external_value = {};
         const uint8_t *namespace_name = nullptr;
         const uint8_t *key = nullptr;
         const uint8_t *value = nullptr;
@@ -268,8 +300,19 @@ namespace on9kvdb_def
         const uint8_t *key = nullptr;
     };
 
-    static const constexpr size_t manifest_table_reference_size = 184;
-    static const constexpr size_t manifest_table_reference_offset = 160;
+    struct value_chunk_header {
+        uint64_t database_id = 0;
+        uint64_t bank_generation = 0;
+        uint32_t first_chunk_offset = 0;
+        uint32_t value_size = 0;
+        uint32_t value_offset = 0;
+        uint16_t payload_size = 0;
+        uint16_t flags = 0;
+        uint32_t payload_checksum = 0;
+    };
+
+    static const constexpr size_t manifest_table_reference_size = 56;
+    static const constexpr size_t manifest_table_reference_offset = 224;
     static const constexpr size_t manifest_record_size = manifest_slot_size;
     static const constexpr size_t manifest_record_checksum_offset = manifest_record_size - sizeof(uint32_t);
     static const constexpr size_t file_identity_size = 56;
@@ -277,8 +320,8 @@ namespace on9kvdb_def
     static const constexpr size_t wal_header_size = 64;
     static const constexpr size_t wal_header_checksum_offset = 60;
     static const constexpr size_t wal_frame_checksum_offset = 60;
-    static const constexpr size_t table_metadata_size = 256;
-    static const constexpr size_t table_metadata_checksum_offset = 252;
+    static const constexpr size_t table_metadata_size = 640;
+    static const constexpr size_t table_metadata_checksum_offset = 636;
     static const constexpr size_t table_block_checksum_offset = 60;
     static const constexpr size_t table_index_checksum_offset = 60;
 
@@ -303,7 +346,7 @@ namespace on9kvdb_def
     uint32_t calc_crc32(const uint8_t *buf, size_t len);
     uint32_t calc_crc32_update(uint32_t crc, const uint8_t *buf, size_t len);
 
-    bool validate_name(const char *name, size_t *length_out = nullptr);
+    bool validate_bytes(const uint8_t *data, uint16_t size, uint16_t maximum_size = max_name_len);
 
     uint32_t make_handle_value(uint16_t slot, uint32_t generation);
     bool decode_handle_value(uint32_t value, uint16_t *slot_out, uint32_t *generation_out);
@@ -345,4 +388,9 @@ namespace on9kvdb_def
     format_status decode_table_entry(const uint8_t *buf, size_t buf_len, size_t offset, table_entry *entry_out);
     bool encode_table_index_entry(uint8_t *buf, size_t buf_len, size_t offset, const table_index_entry &entry, size_t *size_out);
     format_status decode_table_index_entry(const uint8_t *buf, size_t buf_len, size_t offset, table_index_entry *entry_out);
+
+    bool value_ref_is_valid(const value_ref &reference, uint32_t bank_size);
+    bool encode_value_chunk(uint8_t *chunk, size_t chunk_size, const value_chunk_header &header, const uint8_t *payload);
+    format_status decode_value_chunk(const uint8_t *chunk, size_t chunk_size, value_chunk_header *header_out,
+                                     const uint8_t **payload_out);
 }

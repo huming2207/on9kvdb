@@ -14,14 +14,15 @@ namespace
     }
 }
 
-esp_err_t on9kvdb::find_namespace_unsafe(const char *namespace_name, uint16_t *slot_index_out) const
+esp_err_t on9kvdb::find_namespace_unsafe(on9kvdb_bytes namespace_name, uint16_t *slot_index_out) const
 {
-    if (namespace_name == nullptr || slot_index_out == nullptr) {
+    if (!on9kvdb_def::validate_bytes(namespace_name.data, namespace_name.size) || slot_index_out == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
 
     for (uint32_t idx = 0; idx < CONFIG_ON9KVDB_MAX_NAMESPACES; idx += 1) {
-        if (namespaces[idx].used && strcmp(namespaces[idx].name, namespace_name) == 0) {
+        if (namespaces[idx].used && namespaces[idx].name_size == namespace_name.size &&
+            memcmp(namespaces[idx].name, namespace_name.data, namespace_name.size) == 0) {
             *slot_index_out = static_cast<uint16_t>(idx);
             return ESP_OK;
         }
@@ -29,9 +30,9 @@ esp_err_t on9kvdb::find_namespace_unsafe(const char *namespace_name, uint16_t *s
     return ESP_ERR_NOT_FOUND;
 }
 
-esp_err_t on9kvdb::ensure_namespace_capacity_unsafe(const char *namespace_name, uint16_t *slot_index_out, bool publish)
+esp_err_t on9kvdb::ensure_namespace_capacity_unsafe(on9kvdb_bytes namespace_name, uint16_t *slot_index_out, bool publish)
 {
-    if (namespace_name == nullptr || slot_index_out == nullptr) {
+    if (!on9kvdb_def::validate_bytes(namespace_name.data, namespace_name.size) || slot_index_out == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -46,11 +47,6 @@ esp_err_t on9kvdb::ensure_namespace_capacity_unsafe(const char *namespace_name, 
         return ESP_ERR_NO_MEM;
     }
 
-    size_t namespace_size = 0;
-    if (!on9kvdb_def::validate_name(namespace_name, &namespace_size)) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
     for (uint32_t idx = 0; idx < CONFIG_ON9KVDB_MAX_NAMESPACES; idx += 1) {
         if (namespaces[idx].used) {
             continue;
@@ -61,8 +57,8 @@ esp_err_t on9kvdb::ensure_namespace_capacity_unsafe(const char *namespace_name, 
             namespace_slot &slot = namespaces[idx];
             slot = {};
             slot.used = true;
-            slot.name_size = static_cast<uint8_t>(namespace_size);
-            memcpy(slot.name, namespace_name, namespace_size + 1U);
+            slot.name_size = namespace_name.size;
+            memcpy(slot.name, namespace_name.data, namespace_name.size);
             namespace_count += 1;
             stats.namespace_count = namespace_count;
         }
@@ -71,7 +67,7 @@ esp_err_t on9kvdb::ensure_namespace_capacity_unsafe(const char *namespace_name, 
     return ESP_ERR_NO_MEM;
 }
 
-uint32_t on9kvdb::hash_key_unsafe(uint16_t namespace_slot_index, const char *key, size_t key_size) const
+uint32_t on9kvdb::hash_key_unsafe(uint16_t namespace_slot_index, const uint8_t *key, size_t key_size) const
 {
     uint32_t hash = UINT32_C(2166136261);
     hash ^= static_cast<uint8_t>(namespace_slot_index);
@@ -79,13 +75,13 @@ uint32_t on9kvdb::hash_key_unsafe(uint16_t namespace_slot_index, const char *key
     hash ^= static_cast<uint8_t>(namespace_slot_index >> 8U);
     hash *= UINT32_C(16777619);
     for (size_t idx = 0; idx < key_size; idx += 1) {
-        hash ^= static_cast<uint8_t>(key[idx]);
+        hash ^= key[idx];
         hash *= UINT32_C(16777619);
     }
     return hash == 0 ? 1 : hash;
 }
 
-esp_err_t on9kvdb::find_memtable_bucket_unsafe(uint16_t namespace_slot_index, const char *key, size_t key_size,
+esp_err_t on9kvdb::find_memtable_bucket_unsafe(uint16_t namespace_slot_index, const uint8_t *key, size_t key_size,
                                                uint32_t *bucket_index_out, bool *found_out) const
 {
     if (key == nullptr || key_size == 0 || key_size > on9kvdb_def::max_name_len || bucket_index_out == nullptr ||
@@ -112,14 +108,19 @@ esp_err_t on9kvdb::find_memtable_bucket_unsafe(uint16_t namespace_slot_index, co
         }
 
         const auto *header = reinterpret_cast<const memtable_record_header *>(memtable_data + bucket.record_offset);
+        const bool external = (header->flags & on9kvdb_def::memtable_flag_external_value) != 0;
+        const uint32_t inline_size = external ? 0 : header->value_size;
         if (header->total_size != bucket.record_size || header->key_size == 0 || header->key_size > on9kvdb_def::max_name_len ||
-            header->namespace_slot_index >= CONFIG_ON9KVDB_MAX_NAMESPACES || !namespaces[header->namespace_slot_index].used) {
+            inline_size > bucket.record_size - sizeof(memtable_record_header) ||
+            header->key_size > bucket.record_size - sizeof(memtable_record_header) - inline_size ||
+            header->namespace_slot_index >= CONFIG_ON9KVDB_MAX_NAMESPACES || !namespaces[header->namespace_slot_index].used ||
+            (external && !on9kvdb_def::value_ref_is_valid(header->external_value, manifest.geometry.value_bank_size))) {
             return ESP_ERR_INVALID_STATE;
         }
         if (header->namespace_slot_index != namespace_slot_index) {
             continue;
         }
-        const char *record_key = reinterpret_cast<const char *>(header + 1);
+        const uint8_t *record_key = reinterpret_cast<const uint8_t *>(header + 1);
         if (header->key_size == key_size && memcmp(record_key, key, key_size) == 0) {
             *bucket_index_out = index;
             *found_out = true;
@@ -133,7 +134,7 @@ esp_err_t on9kvdb::find_memtable_bucket_unsafe(uint16_t namespace_slot_index, co
     return ESP_OK;
 }
 
-esp_err_t on9kvdb::lookup_memtable_unsafe(const char *namespace_name, const char *key, value_view *view_out) const
+esp_err_t on9kvdb::lookup_memtable_unsafe(on9kvdb_bytes namespace_name, on9kvdb_bytes key, value_view *view_out) const
 {
     if (view_out == nullptr) {
         return ESP_ERR_INVALID_ARG;
@@ -145,14 +146,13 @@ esp_err_t on9kvdb::lookup_memtable_unsafe(const char *namespace_name, const char
         return ret;
     }
 
-    size_t key_size = 0;
-    if (!on9kvdb_def::validate_name(key, &key_size)) {
+    if (!on9kvdb_def::validate_bytes(key.data, key.size)) {
         return ESP_ERR_INVALID_ARG;
     }
 
     uint32_t bucket_index = 0;
     bool found = false;
-    ret = find_memtable_bucket_unsafe(namespace_index, key, key_size, &bucket_index, &found);
+    ret = find_memtable_bucket_unsafe(namespace_index, key.data, key.size, &bucket_index, &found);
     if (ret != ESP_OK) {
         return ret;
     }
@@ -167,35 +167,40 @@ esp_err_t on9kvdb::lookup_memtable_unsafe(const char *namespace_name, const char
     view.value = record_key + header->key_size;
     view.transaction_sequence = header->transaction_sequence;
     view.value_size = header->value_size;
-    view.type = static_cast<on9kvdb_type>(header->type);
     view.tombstone = (header->flags & on9kvdb_def::memtable_flag_tombstone) != 0;
+    view.is_external = (header->flags & on9kvdb_def::memtable_flag_external_value) != 0;
+    view.external_value = header->external_value;
+    if (view.is_external) {
+        view.value = nullptr;
+    }
     *view_out = view;
     return ESP_OK;
 }
 
 const on9kvdb::mutation_slot *on9kvdb::find_staged_mutation_unsafe(const transaction_slot *transaction_slot_ptr,
-                                                                   const char *key) const
+                                                                   on9kvdb_bytes key) const
 {
-    if (transaction_slot_ptr == nullptr || key == nullptr) {
+    if (transaction_slot_ptr == nullptr || !on9kvdb_def::validate_bytes(key.data, key.size)) {
         return nullptr;
     }
 
     for (uint16_t idx = 0; idx < transaction_slot_ptr->mutation_count; idx += 1) {
-        if (strcmp(transaction_slot_ptr->mutations[idx].key, key) == 0) {
+        if (transaction_slot_ptr->mutations[idx].key_size == key.size &&
+            memcmp(transaction_slot_ptr->mutations[idx].key, key.data, key.size) == 0) {
             return &transaction_slot_ptr->mutations[idx];
         }
     }
     return nullptr;
 }
 
-on9kvdb::mutation_slot *on9kvdb::find_staged_mutation_unsafe(transaction_slot *transaction_slot_ptr, const char *key)
+on9kvdb::mutation_slot *on9kvdb::find_staged_mutation_unsafe(transaction_slot *transaction_slot_ptr, on9kvdb_bytes key)
 {
     return const_cast<mutation_slot *>(
         static_cast<const on9kvdb *>(this)->find_staged_mutation_unsafe(transaction_slot_ptr, key));
 }
 
 esp_err_t on9kvdb::lookup_transaction_unsafe(const transaction_slot &transaction_state, const handle_slot &handle,
-                                             const char *key, value_view *view_out) const
+                                             on9kvdb_bytes key, value_view *view_out) const
 {
     if (view_out == nullptr) {
         return ESP_ERR_INVALID_ARG;
@@ -204,17 +209,18 @@ esp_err_t on9kvdb::lookup_transaction_unsafe(const transaction_slot &transaction
     const mutation_slot *mutation = find_staged_mutation_unsafe(&transaction_state, key);
     if (mutation != nullptr) {
         value_view view = {};
-        view.type = static_cast<on9kvdb_type>(mutation->type);
         view.tombstone = mutation->kind == on9kvdb_def::mutation_kind_tombstone;
         view.value_size = mutation->value_size;
-        if (mutation->value_size > 0) {
+        view.is_external = mutation->external_value;
+        view.external_value = mutation->external_value_ref;
+        if (mutation->value_size > 0 && !mutation->external_value) {
             view.value = transaction_staging + mutation->value_offset;
         }
         *view_out = view;
         return ESP_OK;
     }
 
-    return lookup_committed_unsafe(handle.namespace_name, key, view_out);
+    return lookup_committed_unsafe({handle.namespace_name, handle.namespace_size}, key, view_out);
 }
 
 void on9kvdb::compact_memtable_unsafe()
@@ -245,10 +251,11 @@ void on9kvdb::remove_memtable_record_unsafe(uint32_t bucket_index)
     bucket.record_size = 0;
 }
 
-esp_err_t on9kvdb::preflight_memtable_transaction_unsafe(transaction_slot &transaction_state, const char *namespace_name,
+esp_err_t on9kvdb::preflight_memtable_transaction_unsafe(transaction_slot &transaction_state, on9kvdb_bytes namespace_name,
                                                          uint16_t *namespace_slot_out)
 {
-    if (namespace_name == nullptr || namespace_slot_out == nullptr || transaction_state.mutation_count == 0) {
+    if (!on9kvdb_def::validate_bytes(namespace_name.data, namespace_name.size) || namespace_slot_out == nullptr ||
+        transaction_state.mutation_count == 0) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -261,7 +268,7 @@ esp_err_t on9kvdb::preflight_memtable_transaction_unsafe(transaction_slot &trans
     uint32_t final_bytes = memtable_data_used;
     uint32_t final_entries = memtable_entry_count;
     uint64_t final_logical_state_bytes = stats.logical_state_bytes;
-    const uint32_t namespace_size = static_cast<uint32_t>(strlen(namespace_name));
+    const uint32_t namespace_size = namespace_name.size;
     for (uint16_t idx = 0; idx < transaction_state.mutation_count; idx += 1) {
         mutation_slot &mutation = transaction_state.mutations[idx];
         mutation.previous_state = previous_state_none;
@@ -281,7 +288,7 @@ esp_err_t on9kvdb::preflight_memtable_transaction_unsafe(transaction_slot &trans
             mutation.previous_value_size = old_header->value_size;
         } else {
             value_view old_table_value = {};
-            const esp_err_t table_ret = lookup_tables_unsafe(namespace_name, mutation.key, &old_table_value);
+            const esp_err_t table_ret = lookup_tables_unsafe(namespace_name, {mutation.key, mutation.key_size}, &old_table_value);
             if (table_ret == ESP_OK) {
                 mutation.previous_state = old_table_value.tombstone ? previous_state_tombstone : previous_state_live;
                 mutation.previous_value_size = old_table_value.value_size;
@@ -292,6 +299,7 @@ esp_err_t on9kvdb::preflight_memtable_transaction_unsafe(transaction_slot &trans
         }
 
         const uint32_t value_size = mutation.kind == on9kvdb_def::mutation_kind_set ? mutation.value_size : 0;
+        const uint32_t memtable_value_size = mutation.external_value ? 0 : value_size;
         if (mutation.previous_state != previous_state_none) {
             const uint32_t previous_size = align_record_size(static_cast<uint32_t>(sizeof(memtable_record_header)) +
                                                              namespace_size + mutation.key_size + mutation.previous_value_size);
@@ -301,7 +309,7 @@ esp_err_t on9kvdb::preflight_memtable_transaction_unsafe(transaction_slot &trans
             final_logical_state_bytes -= previous_size;
         }
         const uint32_t record_size =
-            align_record_size(static_cast<uint32_t>(sizeof(memtable_record_header)) + mutation.key_size + value_size);
+            align_record_size(static_cast<uint32_t>(sizeof(memtable_record_header)) + mutation.key_size + memtable_value_size);
         const uint32_t logical_record_size = align_record_size(static_cast<uint32_t>(sizeof(memtable_record_header)) +
                                                                namespace_size + mutation.key_size + value_size);
         if (record_size > CONFIG_ON9KVDB_MEMTABLE_DATA_SIZE - final_bytes) {
@@ -371,8 +379,9 @@ esp_err_t on9kvdb::apply_transaction_to_memtable_unsafe(const transaction_slot &
 
         const bool tombstone = mutation.kind == on9kvdb_def::mutation_kind_tombstone;
         const uint32_t value_size = tombstone ? 0 : mutation.value_size;
+        const uint32_t memtable_value_size = mutation.external_value ? 0 : value_size;
         const uint32_t record_size =
-            align_record_size(static_cast<uint32_t>(sizeof(memtable_record_header)) + mutation.key_size + value_size);
+            align_record_size(static_cast<uint32_t>(sizeof(memtable_record_header)) + mutation.key_size + memtable_value_size);
         auto *header = reinterpret_cast<memtable_record_header *>(memtable_data + memtable_data_used);
         *header = {};
         header->transaction_sequence = transaction_sequence;
@@ -380,15 +389,20 @@ esp_err_t on9kvdb::apply_transaction_to_memtable_unsafe(const transaction_slot &
         header->value_size = value_size;
         header->namespace_slot_index = namespace_slot_index;
         header->key_size = mutation.key_size;
-        header->type = mutation.type;
+        header->reserved0 = mutation.reserved0;
         header->flags = tombstone ? on9kvdb_def::memtable_flag_tombstone : 0;
+        if (mutation.external_value) {
+            header->flags |= on9kvdb_def::memtable_flag_external_value;
+            header->external_value = mutation.external_value_ref;
+        }
 
         uint8_t *key_out = reinterpret_cast<uint8_t *>(header + 1);
         memcpy(key_out, mutation.key, mutation.key_size);
-        if (value_size > 0) {
+        if (value_size > 0 && !mutation.external_value) {
             memcpy(key_out + mutation.key_size, transaction_staging + mutation.value_offset, value_size);
         }
-        const uint32_t meaningful_size = static_cast<uint32_t>(sizeof(memtable_record_header)) + mutation.key_size + value_size;
+        const uint32_t meaningful_size =
+            static_cast<uint32_t>(sizeof(memtable_record_header)) + mutation.key_size + memtable_value_size;
         if (record_size > meaningful_size) {
             memset(memtable_data + memtable_data_used + meaningful_size, 0, record_size - meaningful_size);
         }
@@ -413,6 +427,7 @@ esp_err_t on9kvdb::apply_transaction_to_memtable_unsafe(const transaction_slot &
     return ESP_OK;
 }
 
+#if 0 // Removed vNext typed getter implementation; values are read through on9kvdb_value_reader.
 esp_err_t on9kvdb::get_fixed_value_unsafe(const value_view &view, on9kvdb_type expected_type, void *value_out,
                                           size_t expected_size) const
 {
@@ -486,3 +501,4 @@ esp_err_t on9kvdb::get_variable_value_unsafe(const value_view &view, on9kvdb_typ
     *length = required;
     return ESP_OK;
 }
+#endif

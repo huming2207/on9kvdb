@@ -93,14 +93,13 @@ void on9kvdb::clear_transaction_unsafe()
     transaction->generation = generation;
 }
 
-esp_err_t on9kvdb::open(const char *namespace_name, on9kvdb_open_mode mode, on9kvdb_handle *handle_out)
+esp_err_t on9kvdb::open(on9kvdb_bytes namespace_name, on9kvdb_open_mode mode, on9kvdb_handle *handle_out)
 {
     if (handle_out == nullptr || (mode != on9kvdb_open_mode::read_only && mode != on9kvdb_open_mode::read_write)) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    size_t namespace_size = 0;
-    if (!on9kvdb_def::validate_name(namespace_name, &namespace_size)) {
+    if (!on9kvdb_def::validate_bytes(namespace_name.data, namespace_name.size)) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -135,8 +134,8 @@ esp_err_t on9kvdb::open(const char *namespace_name, on9kvdb_open_mode mode, on9k
         slot.generation = generation;
         slot.used = true;
         slot.mode = mode;
-        slot.namespace_size = static_cast<uint8_t>(namespace_size);
-        memcpy(slot.namespace_name, namespace_name, namespace_size + 1U);
+        slot.namespace_size = namespace_name.size;
+        memcpy(slot.namespace_name, namespace_name.data, namespace_name.size);
         *handle_out = on9kvdb_handle(on9kvdb_def::make_handle_value(static_cast<uint16_t>(idx), generation));
         release_operation_lock();
         return ESP_OK;
@@ -209,11 +208,10 @@ esp_err_t on9kvdb::begin(on9kvdb_handle handle, on9kvdb_transaction_handle *tran
     return ret;
 }
 
-esp_err_t on9kvdb::stage_value_unsafe(on9kvdb_transaction_handle transaction_handle, const char *key, on9kvdb_type type,
-                                      const void *value, size_t value_size, uint8_t mutation_kind)
+esp_err_t on9kvdb::stage_value_unsafe(on9kvdb_transaction_handle transaction_handle, on9kvdb_bytes key, const void *value,
+                                      size_t value_size, uint8_t mutation_kind)
 {
-    size_t key_size = 0;
-    if (!on9kvdb_def::validate_name(key, &key_size) || value_size > on9kvdb_def::max_value_len ||
+    if (!on9kvdb_def::validate_bytes(key.data, key.size) || value_size > on9kvdb_def::inline_value_len ||
         (value == nullptr && value_size != 0) ||
         (mutation_kind != on9kvdb_def::mutation_kind_set && mutation_kind != on9kvdb_def::mutation_kind_tombstone)) {
         return ESP_ERR_INVALID_ARG;
@@ -258,10 +256,10 @@ esp_err_t on9kvdb::stage_value_unsafe(on9kvdb_transaction_handle transaction_han
 
     mutation->value_offset = transaction_state->staged_value_bytes;
     mutation->value_size = static_cast<uint32_t>(value_size);
-    mutation->key_size = static_cast<uint8_t>(key_size);
-    mutation->type = static_cast<uint8_t>(type);
+    mutation->key_size = key.size;
+    mutation->reserved0 = 0;
     mutation->kind = mutation_kind;
-    memcpy(mutation->key, key, key_size + 1U);
+    memcpy(mutation->key, key.data, key.size);
     if (value_size > 0) {
         memcpy(transaction_staging + transaction_state->staged_value_bytes, value, value_size);
     }
@@ -269,81 +267,34 @@ esp_err_t on9kvdb::stage_value_unsafe(on9kvdb_transaction_handle transaction_han
     return ESP_OK;
 }
 
-#define ON9KVDB_DEFINE_INTEGER_SETTER(method_name, value_type, kv_type)                                                          \
-    esp_err_t on9kvdb::method_name(on9kvdb_transaction_handle transaction_handle, const char *key, value_type value)             \
-    {                                                                                                                            \
-        uint8_t encoded[sizeof(value)] = {};                                                                                     \
-        if constexpr (sizeof(value) == 1) {                                                                                      \
-            encoded[0] = static_cast<uint8_t>(value);                                                                            \
-        } else if constexpr (sizeof(value) == 2) {                                                                               \
-            (void)on9kvdb_def::write_u16_le(encoded, sizeof(encoded), 0, static_cast<uint16_t>(value));                          \
-        } else if constexpr (sizeof(value) == 4) {                                                                               \
-            (void)on9kvdb_def::write_u32_le(encoded, sizeof(encoded), 0, static_cast<uint32_t>(value));                          \
-        } else {                                                                                                                 \
-            (void)on9kvdb_def::write_u64_le(encoded, sizeof(encoded), 0, static_cast<uint64_t>(value));                          \
-        }                                                                                                                        \
-        const esp_err_t lock_ret = acquire_operation_lock();                                                                     \
-        if (lock_ret != ESP_OK) {                                                                                                \
-            return lock_ret;                                                                                                     \
-        }                                                                                                                        \
-        const esp_err_t ret =                                                                                                    \
-            stage_value_unsafe(transaction_handle, key, kv_type, encoded, sizeof(encoded), on9kvdb_def::mutation_kind_set);      \
-        release_operation_lock();                                                                                                \
-        return ret;                                                                                                              \
-    }
-
-ON9KVDB_DEFINE_INTEGER_SETTER(set_i8, int8_t, on9kvdb_type::i8)
-ON9KVDB_DEFINE_INTEGER_SETTER(set_u8, uint8_t, on9kvdb_type::u8)
-ON9KVDB_DEFINE_INTEGER_SETTER(set_i16, int16_t, on9kvdb_type::i16)
-ON9KVDB_DEFINE_INTEGER_SETTER(set_u16, uint16_t, on9kvdb_type::u16)
-ON9KVDB_DEFINE_INTEGER_SETTER(set_i32, int32_t, on9kvdb_type::i32)
-ON9KVDB_DEFINE_INTEGER_SETTER(set_u32, uint32_t, on9kvdb_type::u32)
-ON9KVDB_DEFINE_INTEGER_SETTER(set_i64, int64_t, on9kvdb_type::i64)
-ON9KVDB_DEFINE_INTEGER_SETTER(set_u64, uint64_t, on9kvdb_type::u64)
-
-#undef ON9KVDB_DEFINE_INTEGER_SETTER
-
-esp_err_t on9kvdb::set_str(on9kvdb_transaction_handle transaction_handle, const char *key, const char *value)
+esp_err_t on9kvdb::stage_external_value_unsafe(on9kvdb_transaction_handle transaction_handle, on9kvdb_bytes key,
+                                               const on9kvdb_def::value_ref &reference)
 {
-    if (value == nullptr) {
+    if (!on9kvdb_def::value_ref_is_valid(reference, manifest.geometry.value_bank_size)) {
         return ESP_ERR_INVALID_ARG;
     }
-    const size_t string_size = strnlen(value, on9kvdb_def::max_value_len);
-    if (string_size >= on9kvdb_def::max_value_len) {
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    esp_err_t ret = acquire_operation_lock();
+    esp_err_t ret = stage_value_unsafe(transaction_handle, key, nullptr, 0, on9kvdb_def::mutation_kind_set);
     if (ret != ESP_OK) {
         return ret;
     }
-    ret = stage_value_unsafe(transaction_handle, key, on9kvdb_type::str, value, string_size + 1U, on9kvdb_def::mutation_kind_set);
-    release_operation_lock();
-    return ret;
-}
-
-esp_err_t on9kvdb::set_blob(on9kvdb_transaction_handle transaction_handle, const char *key, const void *value, size_t length)
-{
-    if (value == nullptr && length != 0) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (length > on9kvdb_def::max_value_len) {
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    esp_err_t ret = acquire_operation_lock();
+    transaction_slot *transaction_state = nullptr;
+    ret = get_transaction_unsafe(transaction_handle, &transaction_state);
     if (ret != ESP_OK) {
         return ret;
     }
-    ret = stage_value_unsafe(transaction_handle, key, on9kvdb_type::blob, value, length, on9kvdb_def::mutation_kind_set);
-    release_operation_lock();
-    return ret;
+    mutation_slot *mutation = find_staged_mutation_unsafe(transaction_state, key);
+    if (mutation == nullptr) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    mutation->value_size = reference.value_size;
+    mutation->external_value = true;
+    mutation->external_value_ref = reference;
+    return ESP_OK;
 }
 
-esp_err_t on9kvdb::erase_key(on9kvdb_transaction_handle transaction_handle, const char *key)
+esp_err_t on9kvdb::erase_key(on9kvdb_transaction_handle transaction_handle, on9kvdb_bytes key)
 {
-    size_t key_size = 0;
-    if (!on9kvdb_def::validate_name(key, &key_size)) {
+    if (!on9kvdb_def::validate_bytes(key.data, key.size)) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -362,7 +313,35 @@ esp_err_t on9kvdb::erase_key(on9kvdb_transaction_handle transaction_handle, cons
         }
     }
     if (ret == ESP_OK) {
-        ret = stage_value_unsafe(transaction_handle, key, on9kvdb_type::any, nullptr, 0, on9kvdb_def::mutation_kind_tombstone);
+        ret = stage_value_unsafe(transaction_handle, key, nullptr, 0, on9kvdb_def::mutation_kind_tombstone);
+    }
+    release_operation_lock();
+    return ret;
+}
+
+esp_err_t on9kvdb::set(on9kvdb_transaction_handle transaction_handle, on9kvdb_bytes key, const uint8_t *value,
+                       uint32_t value_size)
+{
+    if (!on9kvdb_def::validate_bytes(key.data, key.size) || (value == nullptr && value_size != 0) ||
+        value_size > on9kvdb_def::max_value_len) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    esp_err_t ret = acquire_operation_lock();
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    if (value_size <= on9kvdb_def::inline_value_len) {
+        ret = stage_value_unsafe(transaction_handle, key, value, value_size, on9kvdb_def::mutation_kind_set);
+    } else {
+        on9kvdb_value_writer writer = {};
+        ret = begin_value_write_unsafe(transaction_handle, key, value_size, &writer);
+        ret = ret ?: write_value_unsafe(value_writer, value, value_size);
+        ret = ret ?: finish_value_write_unsafe(value_writer);
+        if (ret != ESP_OK && value_writer != nullptr && value_writer->active) {
+            const uint32_t generation = value_writer->generation;
+            *value_writer = {};
+            value_writer->generation = generation;
+        }
     }
     release_operation_lock();
     return ret;
@@ -390,20 +369,34 @@ esp_err_t on9kvdb::commit(on9kvdb_transaction_handle transaction_handle)
     handle_slot &handle = handles[transaction_state->handle_slot_index];
     compact_memtable_unsafe();
     uint16_t namespace_index = 0;
-    ret = preflight_memtable_transaction_unsafe(*transaction_state, handle.namespace_name, &namespace_index);
+    const on9kvdb_bytes namespace_name = {handle.namespace_name, handle.namespace_size};
+    ret = preflight_memtable_transaction_unsafe(*transaction_state, namespace_name, &namespace_index);
     if (ret == ESP_ERR_NO_MEM && memtable_entry_count > 0) {
         ret = flush_memtable_unsafe();
         if (ret == ESP_OK) {
-            ret = preflight_memtable_transaction_unsafe(*transaction_state, handle.namespace_name, &namespace_index);
+            ret = preflight_memtable_transaction_unsafe(*transaction_state, namespace_name, &namespace_index);
         }
     }
     bool wal_durable = false;
+    if (ret == ESP_OK) {
+        // A WAL descriptor can make a large value reachable after reboot.  Persist its chunks before the WAL commit record
+        // is written, otherwise recovery could publish a reference to unwritten media.
+        for (uint32_t bank_slot = 0; bank_slot < on9kvdb_def::value_bank_count && ret == ESP_OK; bank_slot += 1U) {
+            const uint8_t bank_bit = static_cast<uint8_t>(UINT8_C(1) << bank_slot);
+            if ((value_bank_dirty_mask & bank_bit) != 0) {
+                ret = sync_fd(storage_fds[descriptor_index(on9kvdb_def::file_kind::value_bank, bank_slot)]);
+                if (ret == ESP_OK) {
+                    value_bank_dirty_mask &= static_cast<uint8_t>(~bank_bit);
+                }
+            }
+        }
+    }
     if (ret == ESP_OK) {
         ret = append_transaction_unsafe(transaction_state, handle);
         wal_durable = ret == ESP_OK;
     }
     if (ret == ESP_OK) {
-        ret = ensure_namespace_capacity_unsafe(handle.namespace_name, &namespace_index, true);
+        ret = ensure_namespace_capacity_unsafe(namespace_name, &namespace_index, true);
     }
     if (ret == ESP_OK) {
         ret = apply_transaction_to_memtable_unsafe(*transaction_state, namespace_index, next_transaction_sequence);
@@ -445,9 +438,14 @@ esp_err_t on9kvdb::abort(on9kvdb_transaction_handle transaction_handle)
     return ret;
 }
 
+#if 0 // Removed vNext typed/string API; retained temporarily as migration reference only.
 #define ON9KVDB_DEFINE_FIXED_GETTER(method_name, value_type, kv_type)                                                            \
     esp_err_t on9kvdb::method_name(on9kvdb_handle handle, const char *key, value_type *value_out) const                          \
     {                                                                                                                            \
+        on9kvdb_bytes key_bytes = {};                                                                                            \
+        if (!make_cstring_bytes(key, &key_bytes)) {                                                                              \
+            return ESP_ERR_INVALID_ARG;                                                                                          \
+        }                                                                                                                        \
         esp_err_t ret = acquire_operation_lock();                                                                                \
         if (ret != ESP_OK) {                                                                                                     \
             return ret;                                                                                                          \
@@ -456,7 +454,7 @@ esp_err_t on9kvdb::abort(on9kvdb_transaction_handle transaction_handle)
         ret = get_handle_slot_unsafe(handle, &handle_state);                                                                     \
         value_view view = {};                                                                                                    \
         if (ret == ESP_OK) {                                                                                                     \
-            ret = lookup_committed_unsafe(handle_state->namespace_name, key, &view);                                             \
+            ret = lookup_committed_unsafe({handle_state->namespace_name, handle_state->namespace_size}, key_bytes, &view);       \
         }                                                                                                                        \
         if (ret == ESP_OK) {                                                                                                     \
             ret = get_fixed_value_unsafe(view, kv_type, value_out, sizeof(*value_out));                                          \
@@ -467,6 +465,10 @@ esp_err_t on9kvdb::abort(on9kvdb_transaction_handle transaction_handle)
                                                                                                                                  \
     esp_err_t on9kvdb::method_name(on9kvdb_transaction_handle transaction_handle, const char *key, value_type *value_out) const  \
     {                                                                                                                            \
+        on9kvdb_bytes key_bytes = {};                                                                                            \
+        if (!make_cstring_bytes(key, &key_bytes)) {                                                                              \
+            return ESP_ERR_INVALID_ARG;                                                                                          \
+        }                                                                                                                        \
         esp_err_t ret = acquire_operation_lock();                                                                                \
         if (ret != ESP_OK) {                                                                                                     \
             return ret;                                                                                                          \
@@ -476,7 +478,7 @@ esp_err_t on9kvdb::abort(on9kvdb_transaction_handle transaction_handle)
         value_view view = {};                                                                                                    \
         if (ret == ESP_OK) {                                                                                                     \
             const handle_slot &handle_state = handles[transaction_state->handle_slot_index];                                     \
-            ret = lookup_transaction_unsafe(*transaction_state, handle_state, key, &view);                                       \
+            ret = lookup_transaction_unsafe(*transaction_state, handle_state, key_bytes, &view);                                 \
         }                                                                                                                        \
         if (ret == ESP_OK) {                                                                                                     \
             ret = get_fixed_value_unsafe(view, kv_type, value_out, sizeof(*value_out));                                          \
@@ -499,6 +501,10 @@ ON9KVDB_DEFINE_FIXED_GETTER(get_u64, uint64_t, on9kvdb_type::u64)
 #define ON9KVDB_DEFINE_VARIABLE_GETTER(method_name, output_type, kv_type)                                                        \
     esp_err_t on9kvdb::method_name(on9kvdb_handle handle, const char *key, output_type value_out, size_t *length) const          \
     {                                                                                                                            \
+        on9kvdb_bytes key_bytes = {};                                                                                            \
+        if (!make_cstring_bytes(key, &key_bytes)) {                                                                              \
+            return ESP_ERR_INVALID_ARG;                                                                                          \
+        }                                                                                                                        \
         esp_err_t ret = acquire_operation_lock();                                                                                \
         if (ret != ESP_OK) {                                                                                                     \
             return ret;                                                                                                          \
@@ -507,7 +513,7 @@ ON9KVDB_DEFINE_FIXED_GETTER(get_u64, uint64_t, on9kvdb_type::u64)
         ret = get_handle_slot_unsafe(handle, &handle_state);                                                                     \
         value_view view = {};                                                                                                    \
         if (ret == ESP_OK) {                                                                                                     \
-            ret = lookup_committed_unsafe(handle_state->namespace_name, key, &view);                                             \
+            ret = lookup_committed_unsafe({handle_state->namespace_name, handle_state->namespace_size}, key_bytes, &view);       \
         }                                                                                                                        \
         if (ret == ESP_OK) {                                                                                                     \
             ret = get_variable_value_unsafe(view, kv_type, value_out, length);                                                   \
@@ -519,6 +525,10 @@ ON9KVDB_DEFINE_FIXED_GETTER(get_u64, uint64_t, on9kvdb_type::u64)
     esp_err_t on9kvdb::method_name(on9kvdb_transaction_handle transaction_handle, const char *key, output_type value_out,        \
                                    size_t *length) const                                                                         \
     {                                                                                                                            \
+        on9kvdb_bytes key_bytes = {};                                                                                            \
+        if (!make_cstring_bytes(key, &key_bytes)) {                                                                              \
+            return ESP_ERR_INVALID_ARG;                                                                                          \
+        }                                                                                                                        \
         esp_err_t ret = acquire_operation_lock();                                                                                \
         if (ret != ESP_OK) {                                                                                                     \
             return ret;                                                                                                          \
@@ -528,7 +538,7 @@ ON9KVDB_DEFINE_FIXED_GETTER(get_u64, uint64_t, on9kvdb_type::u64)
         value_view view = {};                                                                                                    \
         if (ret == ESP_OK) {                                                                                                     \
             const handle_slot &handle_state = handles[transaction_state->handle_slot_index];                                     \
-            ret = lookup_transaction_unsafe(*transaction_state, handle_state, key, &view);                                       \
+            ret = lookup_transaction_unsafe(*transaction_state, handle_state, key_bytes, &view);                                 \
         }                                                                                                                        \
         if (ret == ESP_OK) {                                                                                                     \
             ret = get_variable_value_unsafe(view, kv_type, value_out, length);                                                   \
@@ -547,6 +557,10 @@ esp_err_t on9kvdb::find_key(on9kvdb_handle handle, const char *key, on9kvdb_type
     if (type_out == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
+    on9kvdb_bytes key_bytes = {};
+    if (!make_cstring_bytes(key, &key_bytes)) {
+        return ESP_ERR_INVALID_ARG;
+    }
     esp_err_t ret = acquire_operation_lock();
     if (ret != ESP_OK) {
         return ret;
@@ -555,7 +569,7 @@ esp_err_t on9kvdb::find_key(on9kvdb_handle handle, const char *key, on9kvdb_type
     ret = get_handle_slot_unsafe(handle, &handle_state);
     value_view view = {};
     if (ret == ESP_OK) {
-        ret = lookup_committed_unsafe(handle_state->namespace_name, key, &view);
+        ret = lookup_committed_unsafe({handle_state->namespace_name, handle_state->namespace_size}, key_bytes, &view);
     }
     if (ret == ESP_OK && view.tombstone) {
         ret = ESP_ERR_NOT_FOUND;
@@ -572,6 +586,10 @@ esp_err_t on9kvdb::find_key(on9kvdb_transaction_handle transaction_handle, const
     if (type_out == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
+    on9kvdb_bytes key_bytes = {};
+    if (!make_cstring_bytes(key, &key_bytes)) {
+        return ESP_ERR_INVALID_ARG;
+    }
     esp_err_t ret = acquire_operation_lock();
     if (ret != ESP_OK) {
         return ret;
@@ -581,7 +599,7 @@ esp_err_t on9kvdb::find_key(on9kvdb_transaction_handle transaction_handle, const
     value_view view = {};
     if (ret == ESP_OK) {
         const handle_slot &handle = handles[transaction_state->handle_slot_index];
-        ret = lookup_transaction_unsafe(*transaction_state, handle, key, &view);
+        ret = lookup_transaction_unsafe(*transaction_state, handle, key_bytes, &view);
     }
     if (ret == ESP_OK && view.tombstone) {
         ret = ESP_ERR_NOT_FOUND;
@@ -592,6 +610,8 @@ esp_err_t on9kvdb::find_key(on9kvdb_transaction_handle transaction_handle, const
     release_operation_lock();
     return ret;
 }
+
+#endif
 
 esp_err_t on9kvdb::get_stats(on9kvdb_stats *stats_out) const
 {

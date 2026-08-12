@@ -22,6 +22,9 @@ size_t on9kvdb::descriptor_index(on9kvdb_def::file_kind kind, uint32_t slot)
         return slot < on9kvdb_def::wal_file_count ? 1U + slot : storage_fd_count;
     case on9kvdb_def::file_kind::table:
         return slot < CONFIG_ON9KVDB_SSTABLE_COUNT ? 1U + on9kvdb_def::wal_file_count + slot : storage_fd_count;
+    case on9kvdb_def::file_kind::value_bank:
+        return slot < on9kvdb_def::value_bank_count ? 1U + on9kvdb_def::wal_file_count + CONFIG_ON9KVDB_SSTABLE_COUNT + slot
+                                                    : storage_fd_count;
     default:
         return storage_fd_count;
     }
@@ -50,6 +53,8 @@ esp_err_t on9kvdb::build_data_path(on9kvdb_def::file_kind kind, uint32_t slot, c
         prefix = "wal";
     } else if (kind == on9kvdb_def::file_kind::table) {
         prefix = "table";
+    } else if (kind == on9kvdb_def::file_kind::value_bank) {
+        prefix = "value";
     } else {
         return ESP_ERR_INVALID_ARG;
     }
@@ -141,8 +146,16 @@ esp_err_t on9kvdb::verify_canonical_file_set(bool creating) const
             }
             continue;
         }
+        if (parse_slot_file_name(entry->d_name, "value_", &slot)) {
+            if (creating || slot >= on9kvdb_def::value_bank_count) {
+                ret = ESP_ERR_INVALID_CRC;
+                break;
+            }
+            continue;
+        }
 
-        const bool reserved_name = strncmp(entry->d_name, "wal_", 4) == 0 || strncmp(entry->d_name, "table_", 6) == 0;
+        const bool reserved_name = strncmp(entry->d_name, "wal_", 4) == 0 || strncmp(entry->d_name, "table_", 6) == 0 ||
+                                   strncmp(entry->d_name, "value_", 6) == 0;
         if (reserved_name) {
             ret = ESP_ERR_INVALID_CRC;
             break;

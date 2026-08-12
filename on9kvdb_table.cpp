@@ -14,39 +14,16 @@ namespace
         return (size + 7U) & ~UINT32_C(7);
     }
 
-    bool valid_table_value(on9kvdb_type type, const uint8_t *value, uint32_t value_size, bool tombstone)
+    bool valid_table_value(const uint8_t *value, uint32_t value_size, bool tombstone, bool external)
     {
         if (tombstone) {
-            return type == on9kvdb_type::any && value_size == 0;
+            return value_size == 0 && !external;
         }
-        if (value == nullptr && value_size != 0) {
-            return false;
-        }
-
-        switch (type) {
-        case on9kvdb_type::i8:
-        case on9kvdb_type::u8:
-            return value_size == 1;
-        case on9kvdb_type::i16:
-        case on9kvdb_type::u16:
-            return value_size == 2;
-        case on9kvdb_type::i32:
-        case on9kvdb_type::u32:
-            return value_size == 4;
-        case on9kvdb_type::i64:
-        case on9kvdb_type::u64:
-            return value_size == 8;
-        case on9kvdb_type::str:
-            return value_size > 0 && value[value_size - 1U] == '\0';
-        case on9kvdb_type::blob:
-            return true;
-        default:
-            return false;
-        }
+        return external || value_size == 0 || value != nullptr;
     }
 
-    void copy_composite_key(on9kvdb_def::composite_key *key_out, const uint8_t *namespace_name, uint8_t namespace_size,
-                            const uint8_t *key, uint8_t key_size)
+    void copy_composite_key(on9kvdb_def::composite_key *key_out, const uint8_t *namespace_name, uint16_t namespace_size,
+                            const uint8_t *key, uint16_t key_size)
     {
         *key_out = {};
         key_out->namespace_size = namespace_size;
@@ -271,9 +248,12 @@ esp_err_t on9kvdb::flush_memtable_unsafe()
         }
         const auto *record = reinterpret_cast<const memtable_record_header *>(memtable_data + entry.record_offset);
         const uint32_t record_header_bytes = static_cast<uint32_t>(sizeof(memtable_record_header));
+        const bool external = (record->flags & on9kvdb_def::memtable_flag_external_value) != 0;
+        const uint32_t inline_value_size = external ? 0 : record->value_size;
         if (record->total_size != entry.record_size || record->key_size == 0 || record->key_size > on9kvdb_def::max_name_len ||
-            record->value_size > entry.record_size - record_header_bytes ||
-            record->key_size > entry.record_size - record_header_bytes - record->value_size ||
+            inline_value_size > entry.record_size - record_header_bytes ||
+            record->key_size > entry.record_size - record_header_bytes - inline_value_size ||
+            (external && !on9kvdb_def::value_ref_is_valid(record->external_value, manifest.geometry.value_bank_size)) ||
             record->namespace_slot_index >= CONFIG_ON9KVDB_MAX_NAMESPACES || !namespaces[record->namespace_slot_index].used) {
             return ESP_ERR_INVALID_STATE;
         }
@@ -313,8 +293,10 @@ esp_err_t on9kvdb::flush_memtable_unsafe()
         const namespace_slot &record_namespace = namespaces[record->namespace_slot_index];
         const uint8_t *record_key = reinterpret_cast<const uint8_t *>(record + 1);
         const uint8_t *record_value = record_key + record->key_size;
+        const bool external = (record->flags & on9kvdb_def::memtable_flag_external_value) != 0;
+        const uint32_t encoded_value_size = external ? on9kvdb_def::value_ref_encoded_size : record->value_size;
         const uint32_t encoded_size = align_table_entry_size(on9kvdb_def::table_entry_header_size + record_namespace.name_size +
-                                                             record->key_size + record->value_size);
+                                                             record->key_size + encoded_value_size);
 
         if (state.data_block_entry_count > 0 &&
             encoded_size > manifest.limits.sstable_block_bytes - on9kvdb_def::table_block_header_size - state.data_payload_size) {
@@ -350,11 +332,15 @@ esp_err_t on9kvdb::flush_memtable_unsafe()
         entry.value_size = record->value_size;
         entry.namespace_size = record_namespace.name_size;
         entry.key_size = record->key_size;
-        entry.type = record->type;
+        entry.reserved0 = record->reserved0;
         entry.flags = (record->flags & on9kvdb_def::memtable_flag_tombstone) != 0 ? on9kvdb_def::table_entry_flag_tombstone : 0;
+        if (external) {
+            entry.flags |= on9kvdb_def::table_entry_flag_external_value;
+            entry.external_value = record->external_value;
+        }
         entry.namespace_name = reinterpret_cast<const uint8_t *>(record_namespace.name);
         entry.key = record_key;
-        entry.value = record_value;
+        entry.value = external ? nullptr : record_value;
         size_t entry_size = 0;
         if (!on9kvdb_def::encode_table_entry(data_block, manifest.limits.sstable_block_bytes,
                                              on9kvdb_def::table_block_header_size + state.data_payload_size, entry,
@@ -564,8 +550,9 @@ esp_err_t on9kvdb::validate_table_unsafe(const on9kvdb_def::table_reference &ref
                 return ESP_ERR_INVALID_CRC;
             }
             const bool tombstone = (entry.flags & on9kvdb_def::table_entry_flag_tombstone) != 0;
+            const bool external = (entry.flags & on9kvdb_def::table_entry_flag_external_value) != 0;
             if (entry.transaction_sequence < footer.min_sequence || entry.transaction_sequence > footer.max_sequence ||
-                !valid_table_value(static_cast<on9kvdb_type>(entry.type), entry.value, entry.value_size, tombstone)) {
+                entry.reserved0 != 0 || !valid_table_value(entry.value, entry.value_size, tombstone, external)) {
                 return ESP_ERR_INVALID_CRC;
             }
 
@@ -591,9 +578,7 @@ esp_err_t on9kvdb::validate_table_unsafe(const on9kvdb_def::table_reference &ref
     }
     content_crc = on9kvdb_def::calc_crc32_update(content_crc, index_block, footer.block_size);
     if (index_entry_offset != on9kvdb_def::table_index_header_size + index_header.payload_size ||
-        total_entries != footer.entry_count || total_data_bytes != footer.data_bytes || ~content_crc != footer.content_checksum ||
-        !on9kvdb_def::composite_key_equal(footer.min_key, reference.min_key) ||
-        !on9kvdb_def::composite_key_equal(previous_key, reference.max_key)) {
+        total_entries != footer.entry_count || total_data_bytes != footer.data_bytes || ~content_crc != footer.content_checksum) {
         return ESP_ERR_INVALID_CRC;
     }
     return cache_table_index_unsafe(reference, index_block);
@@ -738,8 +723,9 @@ esp_err_t on9kvdb::lookup_table_unsafe(const on9kvdb_def::table_reference &refer
             view.value = entry.value;
             view.transaction_sequence = entry.transaction_sequence;
             view.value_size = entry.value_size;
-            view.type = static_cast<on9kvdb_type>(entry.type);
             view.tombstone = (entry.flags & on9kvdb_def::table_entry_flag_tombstone) != 0;
+            view.is_external = (entry.flags & on9kvdb_def::table_entry_flag_external_value) != 0;
+            view.external_value = entry.external_value;
             *view_out = view;
             return ESP_OK;
         }
@@ -751,26 +737,27 @@ esp_err_t on9kvdb::lookup_table_unsafe(const on9kvdb_def::table_reference &refer
     return ESP_ERR_NOT_FOUND;
 }
 
-esp_err_t on9kvdb::lookup_tables_unsafe(const char *namespace_name, const char *key, value_view *view_out) const
+esp_err_t on9kvdb::lookup_tables_unsafe(on9kvdb_bytes namespace_name, on9kvdb_bytes key, value_view *view_out) const
 {
     if (view_out == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
-    size_t namespace_size = 0;
-    size_t key_size = 0;
-    if (!on9kvdb_def::validate_name(namespace_name, &namespace_size) || !on9kvdb_def::validate_name(key, &key_size)) {
+    if (!on9kvdb_def::validate_bytes(namespace_name.data, namespace_name.size) ||
+        !on9kvdb_def::validate_bytes(key.data, key.size)) {
         return ESP_ERR_INVALID_ARG;
     }
 
     on9kvdb_def::composite_key composite = {};
-    copy_composite_key(&composite, reinterpret_cast<const uint8_t *>(namespace_name), static_cast<uint8_t>(namespace_size),
-                       reinterpret_cast<const uint8_t *>(key), static_cast<uint8_t>(key_size));
+    copy_composite_key(&composite, namespace_name.data, namespace_name.size, key.data, key.size);
     uint64_t best_sequence = 0;
     uint32_t best_slot = manifest.geometry.table_count;
     value_view best = {};
     for (uint32_t slot = 0; slot < manifest.geometry.table_count; slot += 1) {
         const on9kvdb_def::table_reference &reference = manifest.tables[slot];
-        if (!reference.active || on9kvdb_def::compare_composite_key(composite, reference.min_key) < 0 ||
+        if (!reference.active) {
+            continue;
+        }
+        if (on9kvdb_def::compare_composite_key(composite, reference.min_key) < 0 ||
             on9kvdb_def::compare_composite_key(composite, reference.max_key) > 0) {
             continue;
         }
@@ -783,15 +770,17 @@ esp_err_t on9kvdb::lookup_tables_unsafe(const char *namespace_name, const char *
             best_sequence = candidate.transaction_sequence;
             best_slot = slot;
             if (table_lookup_value != nullptr) {
-                if (candidate.value_size > on9kvdb_def::max_value_len ||
+                if ((!candidate.is_external && candidate.value_size > on9kvdb_def::inline_value_len) ||
                     (candidate.value_size != 0 && candidate.value == nullptr)) {
-                    return ESP_ERR_INVALID_CRC;
+                    if (!candidate.is_external) {
+                        return ESP_ERR_INVALID_CRC;
+                    }
                 }
-                if (candidate.value_size != 0) {
+                if (!candidate.is_external && candidate.value_size != 0) {
                     memcpy(table_lookup_value, candidate.value, candidate.value_size);
                 }
                 best = candidate;
-                best.value = candidate.value_size == 0 ? nullptr : table_lookup_value;
+                best.value = candidate.is_external || candidate.value_size == 0 ? nullptr : table_lookup_value;
             }
         }
     }
@@ -809,7 +798,7 @@ esp_err_t on9kvdb::lookup_tables_unsafe(const char *namespace_name, const char *
     return lookup_table_unsafe(manifest.tables[best_slot], composite, view_out);
 }
 
-esp_err_t on9kvdb::lookup_committed_unsafe(const char *namespace_name, const char *key, value_view *view_out) const
+esp_err_t on9kvdb::lookup_committed_unsafe(on9kvdb_bytes namespace_name, on9kvdb_bytes key, value_view *view_out) const
 {
     const esp_err_t memtable_ret = lookup_memtable_unsafe(namespace_name, key, view_out);
     if (memtable_ret != ESP_ERR_NOT_FOUND) {
@@ -822,7 +811,7 @@ esp_err_t on9kvdb::recover_tables_unsafe()
 {
     stats.table_bytes_used = 0;
     for (uint32_t slot = 0; slot < manifest.geometry.table_count; slot += 1) {
-        const on9kvdb_def::table_reference &reference = manifest.tables[slot];
+        on9kvdb_def::table_reference &reference = manifest.tables[slot];
         if (!reference.active) {
             continue;
         }
@@ -830,6 +819,20 @@ esp_err_t on9kvdb::recover_tables_unsafe()
         if (ret != ESP_OK) {
             return ret;
         }
+        const uint32_t footer_offset = manifest.geometry.table_size - on9kvdb_def::table_footer_slot_size;
+        esp_err_t read_ret =
+            read_table_bytes_unsafe(reference.slot, footer_offset, io_frame, on9kvdb_def::table_footer_slot_size);
+        if (read_ret != ESP_OK) {
+            return read_ret;
+        }
+        on9kvdb_def::table_metadata footer = {};
+        if (on9kvdb_def::decode_table_metadata(io_frame, on9kvdb_def::table_footer_slot_size, on9kvdb_def::table_footer_magic,
+                                               &footer) != on9kvdb_def::format_status::ok ||
+            footer.generation != reference.generation || footer.slot != reference.slot) {
+            return ESP_ERR_INVALID_CRC;
+        }
+        reference.min_key = footer.min_key;
+        reference.max_key = footer.max_key;
         stats.table_bytes_used += on9kvdb_def::table_header_region_size +
                                   static_cast<uint64_t>(reference.data_block_count + 1U) * manifest.limits.sstable_block_bytes +
                                   on9kvdb_def::table_footer_slot_size;
@@ -911,15 +914,18 @@ esp_err_t on9kvdb::recover_tables_unsafe()
         }
 
         uint16_t namespace_index = 0;
-        esp_err_t ret = ensure_namespace_capacity_unsafe(winner->key.namespace_name, &namespace_index, true);
+        esp_err_t ret =
+            ensure_namespace_capacity_unsafe({winner->key.namespace_name, winner->key.namespace_size}, &namespace_index, true);
         if (ret != ESP_OK) {
             return ret;
         }
-        if (stats.logical_state_bytes > manifest.geometry.max_live_bytes ||
-            winner->total_size > manifest.geometry.max_live_bytes - stats.logical_state_bytes) {
+        const uint64_t logical_entry_size = (static_cast<uint64_t>(on9kvdb_def::table_entry_header_size) +
+                                             winner->key.namespace_size + winner->key.key_size + winner->value_size + 7U) &
+                                            ~UINT64_C(7);
+        if (logical_entry_size > manifest.geometry.max_live_bytes - stats.logical_state_bytes) {
             return ESP_ERR_INVALID_CRC;
         }
-        stats.logical_state_bytes += winner->total_size;
+        stats.logical_state_bytes += logical_entry_size;
         if ((winner->flags & on9kvdb_def::table_entry_flag_tombstone) != 0) {
             stats.tombstone_count += 1U;
         } else {

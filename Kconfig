@@ -12,10 +12,11 @@ menu "on9kvdb"
 
     config ON9KVDB_PROVISIONED_DATABASE_SIZE
         int "Total provisioned database size in bytes"
-        default 4194304
+        default 6291456
         range 196608 4294967295
         help
-            Exact sum of manifest, both WAL files, and every SSTable file.
+            Exact sum of the manifest, both WAL files, every SSTable file,
+            and both fixed value-bank files.
             Every file is allocated contiguously at its final size. Existing
             databases must match this build-time value exactly.
 
@@ -47,14 +48,42 @@ menu "on9kvdb"
 
     config ON9KVDB_SSTABLE_BLOCK_SIZE
         int "Logical SSTable block size in bytes"
-        default 12288
-        range 12288 65536
+        default 16384
+        range 16384 65536
         help
             Size of each immutable SSTable data/index block. It must be a
-            multiple of 4096 bytes, fit one maximum encoded record, divide
-            the configured SSTable data region exactly, and fit two blocks
-            plus sortable memtable offsets in the runtime scratch arena.
+            multiple of 4096 bytes, fit 128-byte binary namespace/key
+            records, divide the configured SSTable data region exactly, and
+            fit two blocks plus sortable memtable offsets in the runtime
+            scratch arena.
             Existing databases must match this value exactly.
+
+    config ON9KVDB_VALUE_BANK_SIZE
+        int "Size of each append-only value bank in bytes"
+        default 1048576
+        range 65536 4294967295
+        help
+            Final preallocated size of each of the two permanent value-bank
+            files. Values larger than ON9KVDB_INLINE_VALUE_SIZE are stored as
+            CRC-protected 4096-byte chunks in the active bank. The configured
+            logical capacity remains the practical maximum value length.
+
+    config ON9KVDB_INLINE_VALUE_SIZE
+        int "Largest inline value in bytes"
+        default 1024
+        range 1 4096
+        help
+            Values at or below this size remain in WAL and SSTable records.
+            Larger values use the append-only value banks and streaming API.
+            Existing databases must match this value exactly.
+
+    config ON9KVDB_MAX_VALUE_READERS
+        int "Maximum simultaneous value readers"
+        default 2
+        range 1 16
+        help
+            Fixed reader-slot count. Each slot reserves one DMA-capable
+            4096-byte buffer at initialization for zero-copy peek/consume.
 
     config ON9KVDB_RUNTIME_MEMORY_BUDGET
         int "Default component-owned runtime memory budget in bytes"

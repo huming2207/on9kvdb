@@ -1,5 +1,11 @@
 # on9kvdb API, Logical Model, and Recovery
 
+> **Superseded API note:** The v1 typed C-string public API described in older
+> sections of this document has been replaced by the binary vNext API in
+> [`BINARY_VALUE_API.md`](BINARY_VALUE_API.md). Use only byte slices and value
+> readers/writers; there are no typed scalar/string/blob accessors or C-string
+> termination rules.
+
 The logical identity and ordering key is:
 
 ```text
@@ -126,4 +132,3 @@ Public getters copy into caller-owned buffers. A transaction reads its own
 staged overlay. Every other handle, including another handle for the same
 namespace, sees only committed state. Committed visibility never precedes the
 successful WAL durability barrier.
-

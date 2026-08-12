@@ -1,5 +1,9 @@
 # on9kvdb Approved Design Decisions
 
+> **vNext note:** Decisions that assume C strings or typed values are
+> superseded by [`BINARY_VALUE_API.md`](BINARY_VALUE_API.md). The active format
+> revision is 6 and names are explicit binary slices.
+
 Reviewed on 2026-07-29. Phase 0 decisions and the Phase 1 through Phase 6
 implementation policies are approved. Later changes must follow these
 decisions and must ask before changing them.

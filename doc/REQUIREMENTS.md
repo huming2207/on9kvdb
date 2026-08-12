@@ -1,5 +1,9 @@
 # on9kvdb Requirements and Constraints
 
+> **vNext note:** The current public model is binary namespace/key/value data,
+> not typed C strings. See [`BINARY_VALUE_API.md`](BINARY_VALUE_API.md) for
+> the active API and storage requirements.
+
 ## Status and scope
 
 This document records the mandatory scope, constraints, platform assumptions,

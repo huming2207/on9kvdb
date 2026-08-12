@@ -10,36 +10,33 @@
 namespace
 {
     static const constexpr uint32_t transaction_header_size = 8;
-    static const constexpr uint32_t mutation_header_size = 8;
+    static const constexpr uint32_t mutation_header_size = 32;
+    static const constexpr uint8_t mutation_flag_external_value = 1U << 0;
     static const constexpr uint32_t recovery_frame_delay_interval = 8;
     static const constexpr uint32_t recovery_transaction_delay_interval = 8;
     static const constexpr uint32_t max_transaction_payload_size =
         CONFIG_ON9KVDB_TRANSACTION_STAGING_SIZE + transaction_header_size + on9kvdb_def::max_name_len +
         CONFIG_ON9KVDB_MAX_TRANSACTION_MUTATIONS * (mutation_header_size + on9kvdb_def::max_name_len);
 
-    bool valid_value_shape(on9kvdb_type type, const uint8_t *value, uint32_t value_size)
+    uint32_t calc_mutation_checksum(const uint8_t header[mutation_header_size], const uint8_t *key, uint16_t key_size,
+                                    const uint8_t *value, uint32_t value_size)
     {
-        switch (type) {
-        case on9kvdb_type::i8:
-        case on9kvdb_type::u8:
-            return value_size == 1;
-        case on9kvdb_type::i16:
-        case on9kvdb_type::u16:
-            return value_size == 2;
-        case on9kvdb_type::i32:
-        case on9kvdb_type::u32:
-            return value_size == 4;
-        case on9kvdb_type::i64:
-        case on9kvdb_type::u64:
-            return value_size == 8;
-        case on9kvdb_type::str:
-            return value != nullptr && value_size > 0 && value_size <= on9kvdb_def::max_value_len &&
-                   value[value_size - 1U] == '\0';
-        case on9kvdb_type::blob:
-            return value_size <= on9kvdb_def::max_value_len;
-        default:
-            return false;
+        uint32_t crc = on9kvdb_def::calc_crc32_update(UINT32_MAX, header, 28);
+        const uint8_t zeroes[sizeof(uint32_t)] = {};
+        crc = on9kvdb_def::calc_crc32_update(crc, zeroes, sizeof(zeroes));
+        crc = on9kvdb_def::calc_crc32_update(crc, key, key_size);
+        crc = on9kvdb_def::calc_crc32_update(crc, value, value_size);
+        return ~crc;
+    }
+
+    bool is_zero_bytes(const uint8_t *data, size_t size)
+    {
+        for (size_t index = 0; index < size; index += 1U) {
+            if (data[index] != 0) {
+                return false;
+            }
         }
+        return true;
     }
 }
 
@@ -139,7 +136,7 @@ esp_err_t on9kvdb::calculate_transaction_payload_unsafe(const transaction_slot &
     uint64_t payload_size = transaction_header_size + handle.namespace_size;
     for (uint16_t idx = 0; idx < transaction_state.mutation_count; idx += 1) {
         const mutation_slot &mutation = transaction_state.mutations[idx];
-        payload_size += mutation_header_size + mutation.key_size + mutation.value_size;
+        payload_size += mutation_header_size + mutation.key_size + (mutation.external_value ? 0 : mutation.value_size);
     }
     if (payload_size > max_transaction_payload_size || payload_size > UINT32_MAX) {
         return ESP_ERR_INVALID_SIZE;
@@ -189,8 +186,8 @@ esp_err_t on9kvdb::copy_transaction_payload_unsafe(const transaction_slot &trans
 
     uint64_t total_size = transaction_header_size + handle.namespace_size;
     for (uint16_t idx = 0; idx < transaction_state.mutation_count; idx += 1) {
-        total_size +=
-            mutation_header_size + transaction_state.mutations[idx].key_size + transaction_state.mutations[idx].value_size;
+        total_size += mutation_header_size + transaction_state.mutations[idx].key_size +
+                      (transaction_state.mutations[idx].external_value ? 0 : transaction_state.mutations[idx].value_size);
     }
     if (stream_offset > total_size || destination_size > total_size - stream_offset) {
         return ESP_ERR_INVALID_SIZE;
@@ -211,13 +208,28 @@ esp_err_t on9kvdb::copy_transaction_payload_unsafe(const transaction_slot &trans
         const mutation_slot &mutation = transaction_state.mutations[idx];
         uint8_t mutation_header[mutation_header_size] = {};
         mutation_header[0] = mutation.kind;
-        mutation_header[1] = mutation.type;
+        mutation_header[1] = mutation.reserved0;
         (void)on9kvdb_def::write_u16_le(mutation_header, sizeof(mutation_header), 2, mutation.key_size);
         (void)on9kvdb_def::write_u32_le(mutation_header, sizeof(mutation_header), 4, mutation.value_size);
+        if (mutation.external_value) {
+            mutation_header[8] = mutation_flag_external_value;
+            mutation_header[9] = mutation.external_value_ref.bank_slot;
+            (void)on9kvdb_def::write_u64_le(mutation_header, sizeof(mutation_header), 12,
+                                            mutation.external_value_ref.bank_generation);
+            (void)on9kvdb_def::write_u32_le(mutation_header, sizeof(mutation_header), 20,
+                                            mutation.external_value_ref.first_chunk_offset);
+            (void)on9kvdb_def::write_u32_le(mutation_header, sizeof(mutation_header), 24,
+                                            mutation.external_value_ref.value_checksum);
+        }
+        const uint8_t *inline_value = mutation.external_value ? nullptr : transaction_staging + mutation.value_offset;
+        const uint32_t inline_value_size = mutation.external_value ? 0 : mutation.value_size;
+        const uint32_t mutation_checksum =
+            calc_mutation_checksum(mutation_header, mutation.key, mutation.key_size, inline_value, inline_value_size);
+        (void)on9kvdb_def::write_u32_le(mutation_header, sizeof(mutation_header), 28, mutation_checksum);
         copy_wal_payload_segment_unsafe(&copy_state, mutation_header, sizeof(mutation_header));
-        copy_wal_payload_segment_unsafe(&copy_state, reinterpret_cast<const uint8_t *>(mutation.key), mutation.key_size);
-        if (mutation.value_size > 0) {
-            copy_wal_payload_segment_unsafe(&copy_state, transaction_staging + mutation.value_offset, mutation.value_size);
+        copy_wal_payload_segment_unsafe(&copy_state, mutation.key, mutation.key_size);
+        if (inline_value_size > 0) {
+            copy_wal_payload_segment_unsafe(&copy_state, inline_value, inline_value_size);
         }
     }
 
@@ -361,10 +373,12 @@ esp_err_t on9kvdb::append_transaction_unsafe(transaction_slot *transaction_state
 
 esp_err_t on9kvdb::parse_recovered_transaction_unsafe(const uint8_t *payload, size_t payload_size,
                                                       uint16_t expected_mutation_count,
-                                                      char namespace_name[on9kvdb_def::max_name_len + 1])
+                                                      uint8_t namespace_name[on9kvdb_def::max_name_len],
+                                                      uint16_t *namespace_size_out)
 {
     if (payload == nullptr || payload_size < transaction_header_size || namespace_name == nullptr ||
-        expected_mutation_count == 0 || expected_mutation_count > CONFIG_ON9KVDB_MAX_TRANSACTION_MUTATIONS) {
+        namespace_size_out == nullptr || expected_mutation_count == 0 ||
+        expected_mutation_count > CONFIG_ON9KVDB_MAX_TRANSACTION_MUTATIONS) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -379,14 +393,8 @@ esp_err_t on9kvdb::parse_recovered_transaction_unsafe(const uint8_t *payload, si
         return ESP_ERR_INVALID_RESPONSE;
     }
 
-    if (memchr(payload + transaction_header_size, '\0', namespace_size) != nullptr) {
-        return ESP_ERR_INVALID_RESPONSE;
-    }
     memcpy(namespace_name, payload + transaction_header_size, namespace_size);
-    namespace_name[namespace_size] = '\0';
-    if (!on9kvdb_def::validate_name(namespace_name)) {
-        return ESP_ERR_INVALID_RESPONSE;
-    }
+    *namespace_size_out = namespace_size;
 
     *transaction = {};
     transaction->mutation_count = mutation_count;
@@ -397,14 +405,23 @@ esp_err_t on9kvdb::parse_recovered_transaction_unsafe(const uint8_t *payload, si
             return ESP_ERR_INVALID_RESPONSE;
         }
 
+        const size_t mutation_start = offset;
         mutation_slot &mutation = transaction->mutations[idx];
         mutation = {};
         mutation.kind = payload[offset];
-        mutation.type = payload[offset + 1U];
+        mutation.reserved0 = payload[offset + 1U];
         uint16_t key_size = 0;
         uint32_t value_size = 0;
+        uint32_t mutation_checksum = 0;
         if (!on9kvdb_def::read_u16_le(payload, payload_size, offset + 2U, &key_size) ||
-            !on9kvdb_def::read_u32_le(payload, payload_size, offset + 4U, &value_size)) {
+            !on9kvdb_def::read_u32_le(payload, payload_size, offset + 4U, &value_size) ||
+            !on9kvdb_def::read_u32_le(payload, payload_size, offset + 28U, &mutation_checksum)) {
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        const uint8_t flags = payload[offset + 8U];
+        const bool external = (flags & mutation_flag_external_value) != 0;
+        if ((flags & ~mutation_flag_external_value) != 0 || payload[mutation_start + 10U] != 0 ||
+            payload[mutation_start + 11U] != 0 || (!external && !is_zero_bytes(payload + mutation_start + 9U, 19U))) {
             return ESP_ERR_INVALID_RESPONSE;
         }
         offset += mutation_header_size;
@@ -412,40 +429,56 @@ esp_err_t on9kvdb::parse_recovered_transaction_unsafe(const uint8_t *payload, si
             return ESP_ERR_INVALID_RESPONSE;
         }
 
-        if (memchr(payload + offset, '\0', key_size) != nullptr) {
-            return ESP_ERR_INVALID_RESPONSE;
-        }
         memcpy(mutation.key, payload + offset, key_size);
-        mutation.key[key_size] = '\0';
-        mutation.key_size = static_cast<uint8_t>(key_size);
-        if (!on9kvdb_def::validate_name(mutation.key)) {
-            return ESP_ERR_INVALID_RESPONSE;
-        }
+        mutation.key_size = key_size;
         for (uint16_t previous = 0; previous < idx; previous += 1) {
-            if (strcmp(transaction->mutations[previous].key, mutation.key) == 0) {
+            if (transaction->mutations[previous].key_size == mutation.key_size &&
+                memcmp(transaction->mutations[previous].key, mutation.key, mutation.key_size) == 0) {
                 return ESP_ERR_INVALID_RESPONSE;
             }
         }
         offset += key_size;
-        if (value_size > payload_size - offset || value_size > on9kvdb_def::max_value_len) {
+        const uint32_t inline_value_size = external ? 0 : value_size;
+        if (inline_value_size > payload_size - offset || (!external && value_size > on9kvdb_def::inline_value_len)) {
             return ESP_ERR_INVALID_RESPONSE;
+        }
+
+        if (calc_mutation_checksum(payload + mutation_start, mutation.key, key_size, payload + offset, inline_value_size) !=
+            mutation_checksum) {
+            return ESP_ERR_INVALID_CRC;
         }
 
         mutation.value_offset = static_cast<uint32_t>(offset);
         mutation.value_size = value_size;
-        const auto type = static_cast<on9kvdb_type>(mutation.type);
-        if (mutation.kind == on9kvdb_def::mutation_kind_tombstone) {
-            if (type != on9kvdb_type::any || value_size != 0) {
+        mutation.external_value = external;
+        if (external) {
+            mutation.external_value_ref = {};
+            mutation.external_value_ref.bank_slot = payload[mutation_start + 9U];
+            if (!on9kvdb_def::read_u64_le(payload, payload_size, mutation_start + 12U,
+                                          &mutation.external_value_ref.bank_generation) ||
+                !on9kvdb_def::read_u32_le(payload, payload_size, mutation_start + 20U,
+                                          &mutation.external_value_ref.first_chunk_offset) ||
+                !on9kvdb_def::read_u32_le(payload, payload_size, mutation_start + 24U,
+                                          &mutation.external_value_ref.value_checksum)) {
                 return ESP_ERR_INVALID_RESPONSE;
             }
-        } else if (mutation.kind != on9kvdb_def::mutation_kind_set || !valid_value_shape(type, payload + offset, value_size)) {
+            mutation.external_value_ref.value_size = value_size;
+        }
+        if (mutation.kind == on9kvdb_def::mutation_kind_tombstone) {
+            if (mutation.reserved0 != 0 || value_size != 0 || external) {
+                return ESP_ERR_INVALID_RESPONSE;
+            }
+        } else if (mutation.kind != on9kvdb_def::mutation_kind_set || mutation.reserved0 != 0 ||
+                   (external ? (value_size <= on9kvdb_def::inline_value_len ||
+                                !on9kvdb_def::value_ref_is_valid(mutation.external_value_ref, manifest.geometry.value_bank_size))
+                             : value_size > on9kvdb_def::inline_value_len)) {
             return ESP_ERR_INVALID_RESPONSE;
         }
-        if (value_size > CONFIG_ON9KVDB_TRANSACTION_STAGING_SIZE - staged_value_bytes) {
+        if (inline_value_size > CONFIG_ON9KVDB_TRANSACTION_STAGING_SIZE - staged_value_bytes) {
             return ESP_ERR_INVALID_SIZE;
         }
-        staged_value_bytes += value_size;
-        offset += value_size;
+        staged_value_bytes += inline_value_size;
+        offset += inline_value_size;
     }
 
     if (offset != payload_size) {
@@ -581,17 +614,40 @@ esp_err_t on9kvdb::scan_wal_slot(uint32_t slot, uint64_t generation, uint64_t *e
         }
 
         if (*expected_sequence > manifest.safe_checkpoint_sequence) {
-            char namespace_name[on9kvdb_def::max_name_len + 1] = {};
-            ret = parse_recovered_transaction_unsafe(transaction_staging, payload_offset, first.mutation_count, namespace_name);
+            uint8_t namespace_name[on9kvdb_def::max_name_len] = {};
+            uint16_t namespace_size = 0;
+            ret = parse_recovered_transaction_unsafe(transaction_staging, payload_offset, first.mutation_count, namespace_name,
+                                                     &namespace_size);
             if (ret != ESP_OK) {
                 return ret;
             }
 
+            for (uint16_t mutation_index = 0; mutation_index < transaction->mutation_count; mutation_index += 1U) {
+                const mutation_slot &mutation = transaction->mutations[mutation_index];
+                if (!mutation.external_value) {
+                    continue;
+                }
+                const uint64_t chunk_count =
+                    (static_cast<uint64_t>(mutation.external_value_ref.value_size) + on9kvdb_def::value_chunk_payload_size - 1U) /
+                    on9kvdb_def::value_chunk_payload_size;
+                const uint64_t end = static_cast<uint64_t>(mutation.external_value_ref.first_chunk_offset) +
+                                     chunk_count * on9kvdb_def::value_chunk_size;
+                const uint32_t bank_slot = mutation.external_value_ref.bank_slot;
+                if (bank_slot >= on9kvdb_def::value_bank_count || end > manifest.geometry.value_bank_size ||
+                    mutation.external_value_ref.bank_generation != manifest.value_bank_generation[bank_slot]) {
+                    return ESP_ERR_INVALID_CRC;
+                }
+                if (end > manifest.value_bank_tail[bank_slot]) {
+                    manifest.value_bank_tail[bank_slot] = static_cast<uint32_t>(end);
+                }
+            }
+
             compact_memtable_unsafe();
             uint16_t namespace_index = 0;
-            ret = preflight_memtable_transaction_unsafe(*transaction, namespace_name, &namespace_index);
+            const on9kvdb_bytes namespace_bytes = {namespace_name, namespace_size};
+            ret = preflight_memtable_transaction_unsafe(*transaction, namespace_bytes, &namespace_index);
             if (ret == ESP_OK) {
-                ret = ensure_namespace_capacity_unsafe(namespace_name, &namespace_index, true);
+                ret = ensure_namespace_capacity_unsafe(namespace_bytes, &namespace_index, true);
             }
             if (ret == ESP_OK) {
                 ret = apply_transaction_to_memtable_unsafe(*transaction, namespace_index, *expected_sequence);

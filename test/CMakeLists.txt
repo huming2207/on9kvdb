@@ -1,6 +1,6 @@
 idf_component_register(
         SRCS
-            "test_on9kvdb_phase1.cpp"
+            "test_on9kvdb_vnext.cpp"
 
         PRIV_REQUIRES
             "on9kvdb"

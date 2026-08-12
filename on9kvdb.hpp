@@ -16,18 +16,12 @@ enum class on9kvdb_open_mode : uint8_t {
     read_write = 1,
 };
 
-enum class on9kvdb_type : uint8_t {
-    i8 = 0x01,
-    u8 = 0x02,
-    i16 = 0x03,
-    u16 = 0x04,
-    i32 = 0x05,
-    u32 = 0x06,
-    i64 = 0x07,
-    u64 = 0x08,
-    str = 0x09,
-    blob = 0x0a,
-    any = 0xff,
+struct on9kvdb_bytes {
+    // An opaque binary name. `data` is never retained after open/set/erase returns; the caller may reuse it immediately.
+    // `size` is explicit so embedded 0x00 bytes are ordinary data rather than a terminator. Empty names are invalid and
+    // namespaces/keys are limited to on9kvdb_def::max_name_len bytes.
+    const uint8_t *data = nullptr;
+    uint16_t size = 0;
 };
 
 class on9kvdb_handle
@@ -61,6 +55,44 @@ public:
 
 private:
     explicit constexpr on9kvdb_transaction_handle(uint32_t value) : raw(value) {}
+
+private:
+    uint32_t raw = 0;
+
+    friend class on9kvdb;
+};
+
+class on9kvdb_value_reader
+{
+public:
+    constexpr on9kvdb_value_reader() = default;
+
+    [[nodiscard]] constexpr bool is_valid() const
+    {
+        return raw != 0;
+    }
+
+private:
+    explicit constexpr on9kvdb_value_reader(uint32_t value) : raw(value) {}
+
+private:
+    uint32_t raw = 0;
+
+    friend class on9kvdb;
+};
+
+class on9kvdb_value_writer
+{
+public:
+    constexpr on9kvdb_value_writer() = default;
+
+    [[nodiscard]] constexpr bool is_valid() const
+    {
+        return raw != 0;
+    }
+
+private:
+    explicit constexpr on9kvdb_value_writer(uint32_t value) : raw(value) {}
 
 private:
     uint32_t raw = 0;
@@ -112,7 +144,39 @@ public:
     esp_err_t init();
     esp_err_t deinit(bool force = false);
 
-    esp_err_t open(const char *namespace_name, on9kvdb_open_mode mode, on9kvdb_handle *handle_out);
+    // A namespace is a binary byte slice. Read-only handles can open existing namespaces only; read-write handles may
+    // create a namespace when their first transaction commits a value into it.
+    esp_err_t open(on9kvdb_bytes namespace_name, on9kvdb_open_mode mode, on9kvdb_handle *handle_out);
+    // Convenience path for a contiguous value. Large values take the same fixed-buffer streaming path as the writer API.
+    esp_err_t set(on9kvdb_transaction_handle transaction, on9kvdb_bytes key, const uint8_t *value, uint32_t value_size);
+    esp_err_t erase_key(on9kvdb_transaction_handle transaction, on9kvdb_bytes key);
+
+    // Opens a committed value. The reader pins the referenced value bank until close(reader), preventing compaction from
+    // recycling the bank while the reader has a live view. A reader observes the committed state only, not a transaction's
+    // staged overlay.
+    esp_err_t open_value(on9kvdb_handle handle, on9kvdb_bytes key, on9kvdb_value_reader *reader_out);
+    esp_err_t get_value_size(on9kvdb_value_reader reader, uint32_t *size_out) const;
+    // Ring-style zero-copy access. On success, data_out points into that reader's fixed private buffer and size_out is the
+    // consecutive range beginning at the current cursor. It remains valid only until the next operation on this reader or
+    // close(reader). Call consume_value() with no more than size_out bytes to advance.
+    esp_err_t peek_value(on9kvdb_value_reader reader, const uint8_t **data_out, uint32_t *size_out);
+    esp_err_t consume_value(on9kvdb_value_reader reader, uint32_t size);
+    // Copies at most destination_size bytes from the cursor into caller-owned memory, advances by the copied count, and
+    // never allocates. This is the normal small-scalar/value path when a pointer into the reader buffer is not useful.
+    esp_err_t read_value_into(on9kvdb_value_reader reader, void *destination, uint32_t destination_size, uint32_t *read_size_out);
+    esp_err_t seek_value(on9kvdb_value_reader reader, uint32_t offset);
+    esp_err_t close(on9kvdb_value_reader reader);
+
+    // Progressive writer. total_size is fixed before writing so the engine can choose inline storage or reserve an exact
+    // number of value-bank chunks without a heap buffer or extent map. write_value() is sequential only: it accepts the
+    // next bytes of the value, and finish_value_write() succeeds only after exactly total_size bytes were supplied.
+    // An unfinished writer keeps its transaction open; abort_value_write() makes its already-written chunks unreachable.
+    esp_err_t begin_value_write(on9kvdb_transaction_handle transaction, on9kvdb_bytes key, uint32_t value_size,
+                                on9kvdb_value_writer *writer_out);
+    esp_err_t write_value(on9kvdb_value_writer writer, const uint8_t *data, uint32_t size);
+    esp_err_t finish_value_write(on9kvdb_value_writer writer);
+    esp_err_t abort_value_write(on9kvdb_value_writer writer);
+
     esp_err_t close(on9kvdb_handle handle);
 
     esp_err_t begin(on9kvdb_handle handle, on9kvdb_transaction_handle *transaction_out);
@@ -120,49 +184,13 @@ public:
     esp_err_t close(on9kvdb_transaction_handle transaction);
     esp_err_t abort(on9kvdb_transaction_handle transaction);
 
-    esp_err_t set_i8(on9kvdb_transaction_handle transaction, const char *key, int8_t value);
-    esp_err_t set_u8(on9kvdb_transaction_handle transaction, const char *key, uint8_t value);
-    esp_err_t set_i16(on9kvdb_transaction_handle transaction, const char *key, int16_t value);
-    esp_err_t set_u16(on9kvdb_transaction_handle transaction, const char *key, uint16_t value);
-    esp_err_t set_i32(on9kvdb_transaction_handle transaction, const char *key, int32_t value);
-    esp_err_t set_u32(on9kvdb_transaction_handle transaction, const char *key, uint32_t value);
-    esp_err_t set_i64(on9kvdb_transaction_handle transaction, const char *key, int64_t value);
-    esp_err_t set_u64(on9kvdb_transaction_handle transaction, const char *key, uint64_t value);
-    esp_err_t set_str(on9kvdb_transaction_handle transaction, const char *key, const char *value);
-    esp_err_t set_blob(on9kvdb_transaction_handle transaction, const char *key, const void *value, size_t length);
-    esp_err_t erase_key(on9kvdb_transaction_handle transaction, const char *key);
-
-    esp_err_t get_i8(on9kvdb_handle handle, const char *key, int8_t *value_out) const;
-    esp_err_t get_u8(on9kvdb_handle handle, const char *key, uint8_t *value_out) const;
-    esp_err_t get_i16(on9kvdb_handle handle, const char *key, int16_t *value_out) const;
-    esp_err_t get_u16(on9kvdb_handle handle, const char *key, uint16_t *value_out) const;
-    esp_err_t get_i32(on9kvdb_handle handle, const char *key, int32_t *value_out) const;
-    esp_err_t get_u32(on9kvdb_handle handle, const char *key, uint32_t *value_out) const;
-    esp_err_t get_i64(on9kvdb_handle handle, const char *key, int64_t *value_out) const;
-    esp_err_t get_u64(on9kvdb_handle handle, const char *key, uint64_t *value_out) const;
-    esp_err_t get_str(on9kvdb_handle handle, const char *key, char *value_out, size_t *length) const;
-    esp_err_t get_blob(on9kvdb_handle handle, const char *key, void *value_out, size_t *length) const;
-
-    esp_err_t get_i8(on9kvdb_transaction_handle transaction, const char *key, int8_t *value_out) const;
-    esp_err_t get_u8(on9kvdb_transaction_handle transaction, const char *key, uint8_t *value_out) const;
-    esp_err_t get_i16(on9kvdb_transaction_handle transaction, const char *key, int16_t *value_out) const;
-    esp_err_t get_u16(on9kvdb_transaction_handle transaction, const char *key, uint16_t *value_out) const;
-    esp_err_t get_i32(on9kvdb_transaction_handle transaction, const char *key, int32_t *value_out) const;
-    esp_err_t get_u32(on9kvdb_transaction_handle transaction, const char *key, uint32_t *value_out) const;
-    esp_err_t get_i64(on9kvdb_transaction_handle transaction, const char *key, int64_t *value_out) const;
-    esp_err_t get_u64(on9kvdb_transaction_handle transaction, const char *key, uint64_t *value_out) const;
-    esp_err_t get_str(on9kvdb_transaction_handle transaction, const char *key, char *value_out, size_t *length) const;
-    esp_err_t get_blob(on9kvdb_transaction_handle transaction, const char *key, void *value_out, size_t *length) const;
-
-    esp_err_t find_key(on9kvdb_handle handle, const char *key, on9kvdb_type *type_out) const;
-    esp_err_t find_key(on9kvdb_transaction_handle transaction, const char *key, on9kvdb_type *type_out) const;
     esp_err_t get_stats(on9kvdb_stats *stats_out) const;
 
 private:
     struct namespace_slot {
         bool used;
-        uint8_t name_size;
-        char name[on9kvdb_def::max_name_len + 1];
+        uint16_t name_size;
+        uint8_t name[on9kvdb_def::max_name_len];
     };
 
     struct handle_slot {
@@ -170,19 +198,21 @@ private:
         bool used;
         bool transaction_active;
         on9kvdb_open_mode mode;
-        uint8_t namespace_size;
-        char namespace_name[on9kvdb_def::max_name_len + 1];
+        uint16_t namespace_size;
+        uint8_t namespace_name[on9kvdb_def::max_name_len];
     };
 
     struct mutation_slot {
         uint32_t value_offset;
         uint32_t value_size;
         uint32_t previous_value_size;
-        uint8_t key_size;
-        uint8_t type;
+        uint16_t key_size;
+        uint8_t reserved0;
         uint8_t kind;
         uint8_t previous_state;
-        char key[on9kvdb_def::max_name_len + 1];
+        bool external_value;
+        on9kvdb_def::value_ref external_value_ref;
+        uint8_t key[on9kvdb_def::max_name_len];
     };
 
     struct transaction_slot {
@@ -206,21 +236,49 @@ private:
         uint32_t total_size;
         uint32_t value_size;
         uint16_t namespace_slot_index;
-        uint8_t key_size;
-        uint8_t type;
+        uint16_t key_size;
+        uint8_t reserved0;
         uint8_t flags;
-        uint8_t reserved[3];
+        uint8_t reserved[2];
+        on9kvdb_def::value_ref external_value;
     };
 
-    static_assert(sizeof(memtable_record_header) == 24);
+    static_assert(sizeof(memtable_record_header) == 48);
     static_assert(alignof(memtable_record_header) <= alignof(uint64_t));
 
     struct value_view {
         const uint8_t *value = nullptr;
         uint64_t transaction_sequence = 0;
         uint32_t value_size = 0;
-        on9kvdb_type type = on9kvdb_type::any;
+        on9kvdb_def::value_ref external_value = {};
         bool tombstone = false;
+        bool is_external = false;
+    };
+
+    struct value_reader_slot {
+        uint32_t generation = 0;
+        uint32_t value_size = 0;
+        uint32_t cursor = 0;
+        uint32_t buffer_size = 0;
+        uint32_t buffer_value_offset = 0;
+        on9kvdb_def::value_ref external_value = {};
+        bool used = false;
+        bool external = false;
+    };
+
+    struct value_writer_slot {
+        uint64_t checksum_state = UINT32_MAX;
+        uint32_t transaction_handle_raw = 0;
+        uint32_t generation = 0;
+        uint32_t expected_size = 0;
+        uint32_t written_size = 0;
+        uint32_t chunk_payload_size = 0;
+        uint32_t next_chunk_offset = 0;
+        uint16_t key_size = 0;
+        uint8_t key[on9kvdb_def::max_name_len] = {};
+        on9kvdb_def::value_ref reference = {};
+        bool active = false;
+        bool inline_value = false;
     };
 
     static const constexpr uint32_t maximum_table_data_blocks =
@@ -272,9 +330,10 @@ private:
         uint32_t block_payload_end = 0;
         uint32_t total_size = 0;
         uint32_t value_size = 0;
+        on9kvdb_def::value_ref external_value = {};
         uint16_t entry_index = 0;
         uint16_t block_entry_count = 0;
-        uint8_t type = 0;
+        uint8_t reserved0 = 0;
         uint8_t flags = 0;
         bool active = false;
     };
@@ -301,6 +360,23 @@ private:
     esp_err_t acquire_diagnostic_lock() const;
     void release_operation_lock() const;
 
+private: // Value banks and streaming handles
+    esp_err_t get_value_reader_unsafe(on9kvdb_value_reader reader, value_reader_slot **slot_out);
+    esp_err_t get_value_reader_unsafe(on9kvdb_value_reader reader, const value_reader_slot **slot_out) const;
+    esp_err_t get_value_writer_unsafe(on9kvdb_value_writer writer, value_writer_slot **slot_out);
+    esp_err_t open_value_unsafe(const value_view &view, on9kvdb_value_reader *reader_out);
+    esp_err_t fill_reader_buffer_unsafe(value_reader_slot *reader);
+    esp_err_t begin_value_write_unsafe(on9kvdb_transaction_handle transaction, on9kvdb_bytes key, uint32_t value_size,
+                                       on9kvdb_value_writer *writer_out);
+    esp_err_t write_value_unsafe(value_writer_slot *writer, const uint8_t *data, uint32_t size);
+    esp_err_t finish_value_write_unsafe(value_writer_slot *writer);
+    esp_err_t flush_value_writer_chunk_unsafe(value_writer_slot *writer, bool final_chunk);
+    esp_err_t copy_external_value_unsafe(const on9kvdb_def::value_ref &source, uint32_t destination_bank,
+                                         uint64_t destination_generation, uint32_t *destination_tail,
+                                         on9kvdb_def::value_ref *destination_out);
+    bool value_bank_is_pinned_unsafe(uint32_t bank_slot) const;
+    bool value_bank_has_staged_reference_unsafe(uint32_t bank_slot) const;
+
 private: // Handles and transactions
     esp_err_t get_handle_slot_unsafe(on9kvdb_handle handle, handle_slot **slot_out, uint16_t *slot_index_out = nullptr);
     esp_err_t get_handle_slot_unsafe(on9kvdb_handle handle, const handle_slot **slot_out,
@@ -308,10 +384,12 @@ private: // Handles and transactions
     esp_err_t get_transaction_unsafe(on9kvdb_transaction_handle transaction, transaction_slot **slot_out);
     esp_err_t get_transaction_unsafe(on9kvdb_transaction_handle transaction, const transaction_slot **slot_out) const;
     void clear_transaction_unsafe();
-    esp_err_t stage_value_unsafe(on9kvdb_transaction_handle transaction, const char *key, on9kvdb_type type, const void *value,
-                                 size_t value_size, uint8_t mutation_kind);
-    mutation_slot *find_staged_mutation_unsafe(transaction_slot *transaction, const char *key);
-    const mutation_slot *find_staged_mutation_unsafe(const transaction_slot *transaction, const char *key) const;
+    esp_err_t stage_value_unsafe(on9kvdb_transaction_handle transaction, on9kvdb_bytes key, const void *value, size_t value_size,
+                                 uint8_t mutation_kind);
+    esp_err_t stage_external_value_unsafe(on9kvdb_transaction_handle transaction, on9kvdb_bytes key,
+                                          const on9kvdb_def::value_ref &reference);
+    mutation_slot *find_staged_mutation_unsafe(transaction_slot *transaction, on9kvdb_bytes key);
+    const mutation_slot *find_staged_mutation_unsafe(const transaction_slot *transaction, on9kvdb_bytes key) const;
 
 private: // Manifest and provisioning
     esp_err_t setup_manifest();
@@ -342,7 +420,7 @@ private: // WAL
                                               uint32_t stream_offset, uint8_t *destination, size_t destination_size) const;
     static void copy_wal_payload_segment_unsafe(wal_payload_copy_state *copy_state, const uint8_t *data, size_t size);
     esp_err_t parse_recovered_transaction_unsafe(const uint8_t *payload, size_t payload_size, uint16_t expected_mutation_count,
-                                                 char namespace_name[on9kvdb_def::max_name_len + 1]);
+                                                 uint8_t namespace_name[on9kvdb_def::max_name_len], uint16_t *namespace_size_out);
 
 private: // Immutable SSTables
     esp_err_t flush_memtable_unsafe();
@@ -353,16 +431,17 @@ private: // Immutable SSTables
                                              uint8_t *index_block);
     esp_err_t append_compaction_entry_unsafe(compaction_output *output, const compaction_cursor *table_cursor,
                                              const memtable_record_header *memtable_record,
-                                             const namespace_slot *memtable_namespace);
+                                             const namespace_slot *memtable_namespace, uint32_t destination_value_bank,
+                                             uint64_t destination_value_generation, uint32_t *destination_value_tail);
     esp_err_t finish_compaction_output_unsafe(compaction_output *output, on9kvdb_def::table_reference *reference_out);
     esp_err_t recover_tables_unsafe();
     esp_err_t validate_table_unsafe(const on9kvdb_def::table_reference &reference);
     esp_err_t cache_table_index_unsafe(const on9kvdb_def::table_reference &reference, const uint8_t *index_block);
     void invalidate_table_index_cache_unsafe(uint32_t slot);
-    esp_err_t lookup_tables_unsafe(const char *namespace_name, const char *key, value_view *view_out) const;
+    esp_err_t lookup_tables_unsafe(on9kvdb_bytes namespace_name, on9kvdb_bytes key, value_view *view_out) const;
     esp_err_t lookup_table_unsafe(const on9kvdb_def::table_reference &reference, const on9kvdb_def::composite_key &key,
                                   value_view *view_out) const;
-    esp_err_t lookup_committed_unsafe(const char *namespace_name, const char *key, value_view *view_out) const;
+    esp_err_t lookup_committed_unsafe(on9kvdb_bytes namespace_name, on9kvdb_bytes key, value_view *view_out) const;
     esp_err_t read_table_bytes_unsafe(uint32_t slot, uint64_t offset, uint8_t *destination, size_t size) const;
     esp_err_t write_table_bytes_unsafe(uint32_t slot, uint64_t offset, const uint8_t *source, size_t size);
     esp_err_t finish_table_data_block_unsafe(table_build_state *state);
@@ -372,24 +451,20 @@ private: // Immutable SSTables
     void reset_memtable_unsafe();
 
 private: // Memtable and namespace registry
-    esp_err_t find_namespace_unsafe(const char *namespace_name, uint16_t *slot_index_out) const;
-    esp_err_t ensure_namespace_capacity_unsafe(const char *namespace_name, uint16_t *slot_index_out, bool publish);
-    uint32_t hash_key_unsafe(uint16_t namespace_slot_index, const char *key, size_t key_size) const;
-    esp_err_t find_memtable_bucket_unsafe(uint16_t namespace_slot_index, const char *key, size_t key_size,
+    esp_err_t find_namespace_unsafe(on9kvdb_bytes namespace_name, uint16_t *slot_index_out) const;
+    esp_err_t ensure_namespace_capacity_unsafe(on9kvdb_bytes namespace_name, uint16_t *slot_index_out, bool publish);
+    uint32_t hash_key_unsafe(uint16_t namespace_slot_index, const uint8_t *key, size_t key_size) const;
+    esp_err_t find_memtable_bucket_unsafe(uint16_t namespace_slot_index, const uint8_t *key, size_t key_size,
                                           uint32_t *bucket_index_out, bool *found_out) const;
-    esp_err_t lookup_memtable_unsafe(const char *namespace_name, const char *key, value_view *view_out) const;
-    esp_err_t lookup_transaction_unsafe(const transaction_slot &transaction, const handle_slot &handle, const char *key,
+    esp_err_t lookup_memtable_unsafe(on9kvdb_bytes namespace_name, on9kvdb_bytes key, value_view *view_out) const;
+    esp_err_t lookup_transaction_unsafe(const transaction_slot &transaction, const handle_slot &handle, on9kvdb_bytes key,
                                         value_view *view_out) const;
-    esp_err_t preflight_memtable_transaction_unsafe(transaction_slot &transaction, const char *namespace_name,
+    esp_err_t preflight_memtable_transaction_unsafe(transaction_slot &transaction, on9kvdb_bytes namespace_name,
                                                     uint16_t *namespace_slot_out);
     void compact_memtable_unsafe();
     void remove_memtable_record_unsafe(uint32_t bucket_index);
     esp_err_t apply_transaction_to_memtable_unsafe(const transaction_slot &transaction, uint16_t namespace_slot_index,
                                                    uint64_t transaction_sequence);
-    esp_err_t get_fixed_value_unsafe(const value_view &view, on9kvdb_type expected_type, void *value_out,
-                                     size_t expected_size) const;
-    esp_err_t get_variable_value_unsafe(const value_view &view, on9kvdb_type expected_type, void *value_out,
-                                        size_t *length) const;
 
 private: // FATFS and bounded I/O
     esp_err_t build_manifest_path();
@@ -410,7 +485,8 @@ private:
     static size_t descriptor_index(on9kvdb_def::file_kind kind, uint32_t slot);
 
 private:
-    static const constexpr size_t storage_fd_count = 1U + on9kvdb_def::wal_file_count + CONFIG_ON9KVDB_SSTABLE_COUNT;
+    static const constexpr size_t storage_fd_count =
+        1U + on9kvdb_def::wal_file_count + CONFIG_ON9KVDB_SSTABLE_COUNT + on9kvdb_def::value_bank_count;
 
     const char *file_path = nullptr;
     on9kvdb_cfg cfg = {};
@@ -427,6 +503,8 @@ private:
     void *runtime_arena = nullptr;
     size_t runtime_arena_size = 0;
     uint8_t *io_frame = nullptr;
+    uint8_t *value_reader_buffers = nullptr;
+    uint8_t *value_writer_buffer = nullptr;
     namespace_slot *namespaces = nullptr;
     handle_slot *handles = nullptr;
     transaction_slot *transaction = nullptr;
@@ -437,6 +515,8 @@ private:
     uint8_t *table_lookup_value = nullptr;
     uint8_t *future_scratch = nullptr;
     size_t future_scratch_size = 0;
+    value_reader_slot *value_readers = nullptr;
+    value_writer_slot *value_writer = nullptr;
     uint32_t namespace_count = 0;
     uint32_t memtable_data_used = 0;
     uint32_t memtable_entry_count = 0;
@@ -448,6 +528,7 @@ private:
     bool initialized = false;
     bool shutting_down = false;
     bool storage_faulted = false;
+    uint8_t value_bank_dirty_mask = 0;
 
 private:
     static const constexpr char TAG[] = "on9kvdb";

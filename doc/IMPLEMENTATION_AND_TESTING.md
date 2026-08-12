@@ -1,5 +1,9 @@
 # on9kvdb Implementation and Verification
 
+> **vNext note:** The active acceptance surface is the binary API and value
+> reader/writer design in [`BINARY_VALUE_API.md`](BINARY_VALUE_API.md). Legacy
+> typed-accessor phases below are not part of the current implementation.
+
 Phases 0 through 6 are complete. Phase 7 is pending. The phase descriptions
 remain as the required implementation and review record.
 

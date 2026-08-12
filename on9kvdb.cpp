@@ -9,8 +9,8 @@
 
 #include "on9kvdb.hpp"
 
-static_assert(on9kvdb_def::max_name_len == 32);
-static_assert(on9kvdb_def::max_value_len == 8192);
+static_assert(on9kvdb_def::max_name_len == 128);
+static_assert(on9kvdb_def::max_value_len == UINT32_MAX - 1U);
 static_assert(on9kvdb_def::max_transaction_mutations == 10);
 static_assert(CONFIG_ON9KVDB_MAX_TRANSACTION_MUTATIONS >= 1);
 static_assert(CONFIG_ON9KVDB_MAX_TRANSACTION_MUTATIONS <= on9kvdb_def::max_transaction_mutations);
@@ -20,8 +20,8 @@ static_assert(CONFIG_ON9KVDB_MAX_OPEN_HANDLES >= 1);
 static_assert(CONFIG_ON9KVDB_MAX_OPEN_HANDLES <= on9kvdb_def::handle_slot_capacity);
 static_assert(CONFIG_ON9KVDB_MEMTABLE_ENTRY_COUNT >= 16);
 static_assert((CONFIG_ON9KVDB_MEMTABLE_ENTRY_COUNT & (CONFIG_ON9KVDB_MEMTABLE_ENTRY_COUNT - 1)) == 0);
-static_assert(CONFIG_ON9KVDB_MEMTABLE_DATA_SIZE >= on9kvdb_def::max_value_len);
-static_assert(CONFIG_ON9KVDB_TRANSACTION_STAGING_SIZE >= on9kvdb_def::max_value_len);
+static_assert(CONFIG_ON9KVDB_MEMTABLE_DATA_SIZE >= on9kvdb_def::inline_value_len);
+static_assert(CONFIG_ON9KVDB_TRANSACTION_STAGING_SIZE >= on9kvdb_def::inline_value_len);
 static_assert(CONFIG_ON9KVDB_RUNTIME_MEMORY_BUDGET >= 32768);
 static_assert(CONFIG_ON9KVDB_RUNTIME_MEMORY_BUDGET <= on9kvdb_def::runtime_memory_budget_max);
 static_assert(on9kvdb_def::runtime_memory_budget_default <= on9kvdb_def::runtime_memory_budget_max);
@@ -31,6 +31,8 @@ static_assert(CONFIG_ON9KVDB_WAL_FILE_SIZE >= on9kvdb_def::wal_record_region_off
 static_assert(CONFIG_ON9KVDB_SSTABLE_FILE_SIZE > on9kvdb_def::identity_region_size);
 static_assert(CONFIG_ON9KVDB_WAL_FILE_SIZE % on9kvdb_def::format_alignment == 0);
 static_assert(CONFIG_ON9KVDB_SSTABLE_FILE_SIZE % on9kvdb_def::format_alignment == 0);
+static_assert(CONFIG_ON9KVDB_VALUE_BANK_SIZE % on9kvdb_def::format_alignment == 0);
+static_assert(CONFIG_ON9KVDB_VALUE_BANK_SIZE > on9kvdb_def::identity_region_size);
 static_assert(CONFIG_ON9KVDB_SSTABLE_COUNT >= 4);
 static_assert(CONFIG_ON9KVDB_SSTABLE_COUNT <= on9kvdb_def::max_table_count);
 static_assert((CONFIG_ON9KVDB_SSTABLE_COUNT & 1U) == 0);
@@ -55,7 +57,8 @@ static_assert(static_cast<uint64_t>(CONFIG_ON9KVDB_MAX_LIVE_DATA_SIZE) <=
                   (CONFIG_ON9KVDB_SSTABLE_BLOCK_SIZE - on9kvdb_def::table_block_header_size));
 static_assert(static_cast<uint64_t>(on9kvdb_def::manifest_file_size) +
                   static_cast<uint64_t>(on9kvdb_def::wal_file_count) * CONFIG_ON9KVDB_WAL_FILE_SIZE +
-                  static_cast<uint64_t>(CONFIG_ON9KVDB_SSTABLE_COUNT) * CONFIG_ON9KVDB_SSTABLE_FILE_SIZE ==
+                  static_cast<uint64_t>(CONFIG_ON9KVDB_SSTABLE_COUNT) * CONFIG_ON9KVDB_SSTABLE_FILE_SIZE +
+                  static_cast<uint64_t>(on9kvdb_def::value_bank_count) * CONFIG_ON9KVDB_VALUE_BANK_SIZE ==
               CONFIG_ON9KVDB_PROVISIONED_DATABASE_SIZE);
 
 #if !defined(CONFIG_FATFS_SECTOR_512) && !defined(CONFIG_FATFS_SECTOR_4096)
@@ -64,7 +67,7 @@ static_assert(static_cast<uint64_t>(on9kvdb_def::manifest_file_size) +
 
 namespace
 {
-    static const constexpr size_t internal_io_bytes = on9kvdb_def::wal_frame_size;
+    static const constexpr size_t internal_io_bytes = on9kvdb_def::wal_frame_size * (2U + CONFIG_ON9KVDB_MAX_VALUE_READERS);
     static const constexpr size_t table_sort_bytes = CONFIG_ON9KVDB_MEMTABLE_ENTRY_COUNT * sizeof(uint32_t);
     static const constexpr size_t table_scratch_bytes = table_sort_bytes + 2U * CONFIG_ON9KVDB_SSTABLE_BLOCK_SIZE;
     static const constexpr size_t manifest_scratch_bytes = 2U * sizeof(on9kvdb_def::manifest_record);
@@ -130,6 +133,8 @@ on9kvdb_def::storage_geometry on9kvdb::get_build_geometry()
     geometry.wal_count = on9kvdb_def::wal_file_count;
     geometry.table_size = CONFIG_ON9KVDB_SSTABLE_FILE_SIZE;
     geometry.table_count = CONFIG_ON9KVDB_SSTABLE_COUNT;
+    geometry.value_bank_size = CONFIG_ON9KVDB_VALUE_BANK_SIZE;
+    geometry.value_bank_count = on9kvdb_def::value_bank_count;
     geometry.alignment = on9kvdb_def::format_alignment;
     return geometry;
 }
@@ -145,6 +150,7 @@ on9kvdb_def::logical_limits on9kvdb::get_build_limits()
     limits.max_transaction_mutations = CONFIG_ON9KVDB_MAX_TRANSACTION_MUTATIONS;
     limits.transaction_staging_bytes = CONFIG_ON9KVDB_TRANSACTION_STAGING_SIZE;
     limits.sstable_block_bytes = CONFIG_ON9KVDB_SSTABLE_BLOCK_SIZE;
+    limits.inline_value_bytes = on9kvdb_def::inline_value_len;
     return limits;
 }
 
@@ -162,9 +168,11 @@ size_t on9kvdb::minimum_runtime_memory_budget()
     const size_t arena_bytes =
         (alignof(namespace_slot) - 1U) + sizeof(namespace_slot) * CONFIG_ON9KVDB_MAX_NAMESPACES + (alignof(handle_slot) - 1U) +
         sizeof(handle_slot) * CONFIG_ON9KVDB_MAX_OPEN_HANDLES + (alignof(transaction_slot) - 1U) + sizeof(transaction_slot) +
-        (alignof(memtable_bucket) - 1U) + sizeof(memtable_bucket) * CONFIG_ON9KVDB_MEMTABLE_ENTRY_COUNT +
-        (alignof(uint64_t) - 1U) + CONFIG_ON9KVDB_TRANSACTION_STAGING_SIZE + transaction_recovery_overhead +
-        (alignof(uint64_t) - 1U) + CONFIG_ON9KVDB_MEMTABLE_DATA_SIZE + (alignof(uint64_t) - 1U) + minimum_future_scratch_size();
+        (alignof(value_reader_slot) - 1U) + sizeof(value_reader_slot) * CONFIG_ON9KVDB_MAX_VALUE_READERS +
+        (alignof(value_writer_slot) - 1U) + sizeof(value_writer_slot) + (alignof(memtable_bucket) - 1U) +
+        sizeof(memtable_bucket) * CONFIG_ON9KVDB_MEMTABLE_ENTRY_COUNT + (alignof(uint64_t) - 1U) +
+        CONFIG_ON9KVDB_TRANSACTION_STAGING_SIZE + transaction_recovery_overhead + (alignof(uint64_t) - 1U) +
+        CONFIG_ON9KVDB_MEMTABLE_DATA_SIZE + (alignof(uint64_t) - 1U) + minimum_future_scratch_size();
     return internal_io_bytes + arena_bytes;
 }
 
@@ -245,6 +253,9 @@ esp_err_t on9kvdb::allocate_runtime_memory()
         return ESP_ERR_NO_MEM;
     }
     memset(io_frame, 0, internal_io_bytes);
+    value_reader_buffers = io_frame + on9kvdb_def::wal_frame_size;
+    value_writer_buffer =
+        value_reader_buffers + static_cast<size_t>(CONFIG_ON9KVDB_MAX_VALUE_READERS) * on9kvdb_def::value_chunk_size;
 
     runtime_arena_size = cfg.runtime_memory_budget - internal_io_bytes;
     uint32_t arena_caps = MALLOC_CAP_8BIT;
@@ -302,6 +313,15 @@ esp_err_t on9kvdb::allocate_runtime_memory()
     memtable_data = static_cast<uint8_t *>(allocation);
     allocation = nullptr;
 
+    all_carved = all_carved && carve_arena(&cursor, &remaining, alignof(value_reader_slot),
+                                           sizeof(value_reader_slot) * CONFIG_ON9KVDB_MAX_VALUE_READERS, &allocation);
+    value_readers = static_cast<value_reader_slot *>(allocation);
+    allocation = nullptr;
+    all_carved =
+        all_carved && carve_arena(&cursor, &remaining, alignof(value_writer_slot), sizeof(value_writer_slot), &allocation);
+    value_writer = static_cast<value_writer_slot *>(allocation);
+    allocation = nullptr;
+
     // The approved default budget remains 100 KiB. A caller can opt into the fixed SSTable index cache and a stable lookup
     // value buffer by supplying enough additional arena space; otherwise lookup retains its checked on-disk fallback.
     uint8_t *optional_cursor = cursor;
@@ -311,7 +331,7 @@ esp_err_t on9kvdb::allocate_runtime_memory()
     const bool optional_carved =
         carve_arena(&optional_cursor, &optional_remaining, alignof(table_index_cache_slot),
                     sizeof(table_index_cache_slot) * CONFIG_ON9KVDB_SSTABLE_COUNT, &optional_cache) &&
-        carve_arena(&optional_cursor, &optional_remaining, alignof(uint64_t), on9kvdb_def::max_value_len, &optional_value) &&
+        carve_arena(&optional_cursor, &optional_remaining, alignof(uint64_t), on9kvdb_def::inline_value_len, &optional_value) &&
         optional_remaining >= minimum_future_scratch_size();
     if (optional_carved) {
         cursor = optional_cursor;
@@ -321,7 +341,7 @@ esp_err_t on9kvdb::allocate_runtime_memory()
         for (uint32_t slot = 0; slot < CONFIG_ON9KVDB_SSTABLE_COUNT; slot += 1U) {
             new (&table_index_cache[slot]) table_index_cache_slot{};
         }
-        memset(table_lookup_value, 0, on9kvdb_def::max_value_len);
+        memset(table_lookup_value, 0, on9kvdb_def::inline_value_len);
     }
 
     all_carved = all_carved && carve_arena(&cursor, &remaining, alignof(uint64_t), 0, &allocation);
@@ -339,6 +359,10 @@ esp_err_t on9kvdb::allocate_runtime_memory()
         new (&handles[idx]) handle_slot{};
     }
     new (transaction) transaction_slot{};
+    for (uint32_t idx = 0; idx < CONFIG_ON9KVDB_MAX_VALUE_READERS; idx += 1U) {
+        new (&value_readers[idx]) value_reader_slot{};
+    }
+    new (value_writer) value_writer_slot{};
     for (uint32_t idx = 0; idx < CONFIG_ON9KVDB_MEMTABLE_ENTRY_COUNT; idx += 1) {
         new (&memtable_index[idx]) memtable_bucket{};
         memtable_index[idx].record_offset = UINT32_MAX;
@@ -470,6 +494,8 @@ void on9kvdb::reset_runtime_state_unsafe()
     runtime_arena = nullptr;
     runtime_arena_size = 0;
     io_frame = nullptr;
+    value_reader_buffers = nullptr;
+    value_writer_buffer = nullptr;
     namespaces = nullptr;
     handles = nullptr;
     transaction = nullptr;
@@ -480,12 +506,15 @@ void on9kvdb::reset_runtime_state_unsafe()
     table_lookup_value = nullptr;
     future_scratch = nullptr;
     future_scratch_size = 0;
+    value_readers = nullptr;
+    value_writer = nullptr;
     namespace_count = 0;
     memtable_data_used = 0;
     memtable_entry_count = 0;
     next_transaction_sequence = 1;
     stats = {};
     storage_faulted = false;
+    value_bank_dirty_mask = 0;
     for (uint32_t slot = 0; slot < on9kvdb_def::wal_file_count; slot += 1) {
         wal_tail[slot] = 0;
     }
@@ -533,6 +562,10 @@ esp_err_t on9kvdb::deinit(bool force)
     for (uint32_t idx = 0; !resources_busy && idx < CONFIG_ON9KVDB_MAX_OPEN_HANDLES; idx += 1) {
         resources_busy = handles[idx].used;
     }
+    for (uint32_t idx = 0; !resources_busy && idx < CONFIG_ON9KVDB_MAX_VALUE_READERS; idx += 1U) {
+        resources_busy = value_readers[idx].used;
+    }
+    resources_busy = resources_busy || (value_writer != nullptr && value_writer->active);
     if (resources_busy && !force) {
         xSemaphoreGive(operation_lock);
         shutting_down = false;

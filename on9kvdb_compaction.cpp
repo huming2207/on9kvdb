@@ -14,6 +14,13 @@ namespace
         return (size + 7U) & ~UINT32_C(7);
     }
 
+    uint64_t logical_entry_size(uint16_t namespace_size, uint16_t key_size, uint32_t value_size)
+    {
+        const uint64_t size =
+            static_cast<uint64_t>(on9kvdb_def::table_entry_header_size) + namespace_size + key_size + value_size;
+        return (size + 7U) & ~UINT64_C(7);
+    }
+
     void copy_composite_key(on9kvdb_def::composite_key *destination, const uint8_t *namespace_name, uint8_t namespace_size,
                             const uint8_t *key, uint8_t key_size)
     {
@@ -22,16 +29,6 @@ namespace
         destination->key_size = key_size;
         memcpy(destination->namespace_name, namespace_name, namespace_size);
         memcpy(destination->key, key, key_size);
-    }
-
-    bool contains_nul(const uint8_t *bytes, size_t size)
-    {
-        for (size_t index = 0; index < size; index += 1) {
-            if (bytes[index] == 0) {
-                return true;
-            }
-        }
-        return false;
     }
 
     on9kvdb_def::table_reference make_table_reference(const on9kvdb_def::table_metadata &metadata)
@@ -145,36 +142,51 @@ esp_err_t on9kvdb::load_compaction_cursor_unsafe(compaction_cursor *cursor, uint
 
     const uint8_t namespace_size = io_frame[16];
     const uint8_t key_size = io_frame[17];
-    const uint8_t type = io_frame[18];
+    const uint8_t reserved0 = io_frame[18];
     const uint8_t flags = io_frame[19];
-    const uint32_t meaningful_size = on9kvdb_def::table_entry_header_size + namespace_size + key_size + value_size;
+    const bool external = (flags & on9kvdb_def::table_entry_flag_external_value) != 0;
+    const uint32_t encoded_value_size = external ? on9kvdb_def::value_ref_encoded_size : value_size;
+    const uint32_t meaningful_size = on9kvdb_def::table_entry_header_size + namespace_size + key_size + encoded_value_size;
     if (namespace_size == 0 || namespace_size > on9kvdb_def::max_name_len || key_size == 0 ||
-        key_size > on9kvdb_def::max_name_len || value_size > on9kvdb_def::max_value_len || transaction_sequence == 0 ||
-        total_size < meaningful_size || total_size % 8U != 0 || cursor->entry_offset > cursor->block_payload_end ||
-        total_size > cursor->block_payload_end - cursor->entry_offset ||
-        (flags & ~on9kvdb_def::table_entry_flag_tombstone) != 0 ||
+        key_size > on9kvdb_def::max_name_len || reserved0 != 0 || value_size > on9kvdb_def::max_value_len ||
+        transaction_sequence == 0 || total_size < meaningful_size || total_size % 8U != 0 ||
+        cursor->entry_offset > cursor->block_payload_end || total_size > cursor->block_payload_end - cursor->entry_offset ||
+        (flags & ~(on9kvdb_def::table_entry_flag_tombstone | on9kvdb_def::table_entry_flag_external_value)) != 0 ||
         ((flags & on9kvdb_def::table_entry_flag_tombstone) != 0 && value_size != 0)) {
         return ESP_ERR_INVALID_CRC;
     }
 
     const size_t name_bytes = static_cast<size_t>(namespace_size) + key_size;
+    const size_t descriptor_bytes = external ? on9kvdb_def::value_ref_encoded_size : 0;
     ret = read_table_bytes_unsafe(cursor->source_slot, absolute_offset + on9kvdb_def::table_entry_header_size,
-                                  io_frame + on9kvdb_def::table_entry_header_size, name_bytes);
+                                  io_frame + on9kvdb_def::table_entry_header_size, name_bytes + descriptor_bytes);
     if (ret != ESP_OK) {
         return ret;
     }
     const uint8_t *namespace_name = io_frame + on9kvdb_def::table_entry_header_size;
     const uint8_t *key = namespace_name + namespace_size;
-    if (contains_nul(namespace_name, namespace_size) || contains_nul(key, key_size)) {
-        return ESP_ERR_INVALID_CRC;
-    }
-
     copy_composite_key(&cursor->key, namespace_name, namespace_size, key, key_size);
     cursor->transaction_sequence = transaction_sequence;
     cursor->total_size = total_size;
     cursor->value_size = value_size;
-    cursor->type = type;
+    cursor->reserved0 = reserved0;
     cursor->flags = flags;
+    cursor->external_value = {};
+    if (external) {
+        const uint8_t *encoded_ref = key + key_size;
+        cursor->external_value.bank_slot = encoded_ref[0];
+        if (encoded_ref[1] != 0 || encoded_ref[2] != 0 || encoded_ref[3] != 0 ||
+            !on9kvdb_def::read_u64_le(encoded_ref, descriptor_bytes, 4, &cursor->external_value.bank_generation) ||
+            !on9kvdb_def::read_u32_le(encoded_ref, descriptor_bytes, 12, &cursor->external_value.first_chunk_offset) ||
+            !on9kvdb_def::read_u32_le(encoded_ref, descriptor_bytes, 16, &cursor->external_value.value_checksum) ||
+            encoded_ref[20] != 0 || encoded_ref[21] != 0 || encoded_ref[22] != 0 || encoded_ref[23] != 0) {
+            return ESP_ERR_INVALID_CRC;
+        }
+        cursor->external_value.value_size = value_size;
+        if (!on9kvdb_def::value_ref_is_valid(cursor->external_value, manifest.geometry.value_bank_size)) {
+            return ESP_ERR_INVALID_CRC;
+        }
+    }
     cursor->active = true;
     return ESP_OK;
 }
@@ -229,10 +241,11 @@ esp_err_t on9kvdb::start_compaction_output_unsafe(compaction_output *output, uin
 
 esp_err_t on9kvdb::append_compaction_entry_unsafe(compaction_output *output, const compaction_cursor *table_cursor,
                                                   const memtable_record_header *memtable_record,
-                                                  const namespace_slot *memtable_namespace)
+                                                  const namespace_slot *memtable_namespace, uint32_t destination_value_bank,
+                                                  uint64_t destination_value_generation, uint32_t *destination_value_tail)
 {
     if (output == nullptr || !output->active || ((table_cursor == nullptr) == (memtable_record == nullptr)) ||
-        (memtable_record != nullptr && memtable_namespace == nullptr)) {
+        (memtable_record != nullptr && memtable_namespace == nullptr) || destination_value_tail == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -248,8 +261,10 @@ esp_err_t on9kvdb::append_compaction_entry_unsafe(compaction_output *output, con
         copy_composite_key(&key, reinterpret_cast<const uint8_t *>(memtable_namespace->name), memtable_namespace->name_size,
                            record_key, memtable_record->key_size);
         transaction_sequence = memtable_record->transaction_sequence;
-        encoded_size = align_entry_size(on9kvdb_def::table_entry_header_size + memtable_namespace->name_size +
-                                        memtable_record->key_size + memtable_record->value_size);
+        const bool external = (memtable_record->flags & on9kvdb_def::memtable_flag_external_value) != 0;
+        encoded_size =
+            align_entry_size(on9kvdb_def::table_entry_header_size + memtable_namespace->name_size + memtable_record->key_size +
+                             (external ? on9kvdb_def::value_ref_encoded_size : memtable_record->value_size));
     }
 
     if (output->build.data_block_entry_count > 0 && encoded_size > manifest.limits.sstable_block_bytes -
@@ -299,7 +314,21 @@ esp_err_t on9kvdb::append_compaction_entry_unsafe(compaction_output *output, con
             decoded.total_size != encoded_size || decoded.transaction_sequence != transaction_sequence) {
             return ESP_ERR_INVALID_CRC;
         }
-        actual_size = decoded.total_size;
+        if ((decoded.flags & on9kvdb_def::table_entry_flag_external_value) != 0) {
+            on9kvdb_def::value_ref relocated = {};
+            ret = copy_external_value_unsafe(decoded.external_value, destination_value_bank, destination_value_generation,
+                                             destination_value_tail, &relocated);
+            if (ret != ESP_OK) {
+                return ret;
+            }
+            decoded.external_value = relocated;
+            if (!on9kvdb_def::encode_table_entry(output->build.data_block, manifest.limits.sstable_block_bytes,
+                                                 destination_offset, decoded, &actual_size)) {
+                return ESP_ERR_INVALID_STATE;
+            }
+        } else {
+            actual_size = decoded.total_size;
+        }
     } else {
         const uint8_t *record_key = reinterpret_cast<const uint8_t *>(memtable_record + 1);
         on9kvdb_def::table_entry entry = {};
@@ -307,12 +336,22 @@ esp_err_t on9kvdb::append_compaction_entry_unsafe(compaction_output *output, con
         entry.value_size = memtable_record->value_size;
         entry.namespace_size = memtable_namespace->name_size;
         entry.key_size = memtable_record->key_size;
-        entry.type = memtable_record->type;
+        entry.reserved0 = memtable_record->reserved0;
         entry.flags =
             (memtable_record->flags & on9kvdb_def::memtable_flag_tombstone) != 0 ? on9kvdb_def::table_entry_flag_tombstone : 0;
         entry.namespace_name = reinterpret_cast<const uint8_t *>(memtable_namespace->name);
         entry.key = record_key;
-        entry.value = record_key + memtable_record->key_size;
+        const bool external = (memtable_record->flags & on9kvdb_def::memtable_flag_external_value) != 0;
+        if (external) {
+            entry.flags |= on9kvdb_def::table_entry_flag_external_value;
+            const esp_err_t relocate_ret =
+                copy_external_value_unsafe(memtable_record->external_value, destination_value_bank, destination_value_generation,
+                                           destination_value_tail, &entry.external_value);
+            if (relocate_ret != ESP_OK) {
+                return relocate_ret;
+            }
+        }
+        entry.value = external ? nullptr : record_key + memtable_record->key_size;
         if (!on9kvdb_def::encode_table_entry(output->build.data_block, manifest.limits.sstable_block_bytes, destination_offset,
                                              entry, &actual_size)) {
             return ESP_ERR_INVALID_SIZE;
@@ -416,14 +455,26 @@ esp_err_t on9kvdb::compact_tables_unsafe()
     const uint32_t bank_size = manifest.geometry.table_count / 2U;
     const uint32_t input_start = manifest.active_table_bank * bank_size;
     const uint32_t output_start = (1U - manifest.active_table_bank) * bank_size;
+    const uint32_t destination_value_bank = 1U - manifest.active_value_bank;
     const size_t sort_bytes = static_cast<size_t>(CONFIG_ON9KVDB_MEMTABLE_ENTRY_COUNT) * sizeof(uint32_t);
     const size_t block_bytes = manifest.limits.sstable_block_bytes;
     const size_t cursor_offset = sort_bytes + 2U * block_bytes;
     const size_t required_scratch = cursor_offset + bank_size * sizeof(compaction_cursor);
     if (future_scratch == nullptr || future_scratch_size < required_scratch ||
-        manifest.next_table_generation > UINT64_MAX - bank_size || manifest.generation > UINT64_MAX - 2U) {
+        manifest.next_table_generation > UINT64_MAX - bank_size || manifest.generation > UINT64_MAX - 2U ||
+        manifest.active_value_bank >= on9kvdb_def::value_bank_count ||
+        manifest.value_bank_generation[destination_value_bank] == UINT64_MAX) {
         return ESP_ERR_INVALID_SIZE;
     }
+    // The destination bank is overwritten from its beginning. Readers publish direct pointers into their dedicated buffers,
+    // so a reader retaining a value from the previous generation makes that bank unavailable for this compaction. A finished
+    // but uncommitted writer is also a pin: it may hold a descriptor for an old bank which has not reached the memtable yet.
+    if (value_bank_is_pinned_unsafe(destination_value_bank) ||
+        value_bank_has_staged_reference_unsafe(destination_value_bank)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const uint64_t destination_value_generation = manifest.value_bank_generation[destination_value_bank] + 1U;
+    uint32_t destination_value_tail = on9kvdb_def::identity_region_size;
 
     for (uint32_t slot = input_start; slot < input_start + bank_size; slot += 1) {
         if (manifest.tables[slot].active) {
@@ -553,15 +604,15 @@ esp_err_t on9kvdb::compact_tables_unsafe()
             break;
         }
 
-        const uint32_t winner_size = winner_is_memtable
-                                         ? align_entry_size(on9kvdb_def::table_entry_header_size + memtable_namespace->name_size +
-                                                            memtable_record->key_size + memtable_record->value_size)
-                                         : winner_cursor->total_size;
-        logical_state_bytes += winner_size;
-        if (logical_state_bytes > manifest.geometry.max_live_bytes) {
+        const uint64_t winner_logical_size =
+            winner_is_memtable
+                ? logical_entry_size(memtable_namespace->name_size, memtable_record->key_size, memtable_record->value_size)
+                : logical_entry_size(winner_cursor->key.namespace_size, winner_cursor->key.key_size, winner_cursor->value_size);
+        if (winner_logical_size > manifest.geometry.max_live_bytes - logical_state_bytes) {
             ret = ESP_ERR_NO_MEM;
             break;
         }
+        logical_state_bytes += winner_logical_size;
 
         if (!output.active) {
             if (output_count >= bank_size) {
@@ -576,7 +627,8 @@ esp_err_t on9kvdb::compact_tables_unsafe()
         }
         ret = append_compaction_entry_unsafe(&output, winner_is_memtable ? nullptr : winner_cursor,
                                              winner_is_memtable ? memtable_record : nullptr,
-                                             winner_is_memtable ? memtable_namespace : nullptr);
+                                             winner_is_memtable ? memtable_namespace : nullptr, destination_value_bank,
+                                             destination_value_generation, &destination_value_tail);
         if (ret == ESP_ERR_NO_MEM) {
             on9kvdb_def::table_reference reference = {};
             ret = finish_compaction_output_unsafe(&output, &reference);
@@ -594,7 +646,8 @@ esp_err_t on9kvdb::compact_tables_unsafe()
             if (ret == ESP_OK) {
                 ret = append_compaction_entry_unsafe(&output, winner_is_memtable ? nullptr : winner_cursor,
                                                      winner_is_memtable ? memtable_record : nullptr,
-                                                     winner_is_memtable ? memtable_namespace : nullptr);
+                                                     winner_is_memtable ? memtable_namespace : nullptr, destination_value_bank,
+                                                     destination_value_generation, &destination_value_tail);
             }
         }
         if (ret != ESP_OK) {
@@ -662,13 +715,21 @@ esp_err_t on9kvdb::compact_tables_unsafe()
     for (uint32_t slot = input_start; slot < input_start + bank_size; slot += 1) {
         manifest.tables[slot] = {};
     }
+    // All output tables and copied chunks are already synchronized and unreachable. This manifest copy is the single point
+    // at which they become live; until both copies stabilize, neither the old table bank nor old value bank may be recycled.
     manifest.active_table_bank = 1U - manifest.active_table_bank;
+    manifest.active_value_bank = destination_value_bank;
+    manifest.value_bank_generation[destination_value_bank] = destination_value_generation;
+    manifest.value_bank_tail[destination_value_bank] = destination_value_tail;
     manifest.safe_checkpoint_sequence = greatest_sequence;
     manifest.next_table_generation += output_count;
     const uint32_t inactive_wal_slot = 1U - manifest.active_wal_slot;
     manifest.wal_generation[inactive_wal_slot] = 0;
 
-    ret = write_manifest_copy(manifest.generation + 1U, on9kvdb_def::manifest_state_ready);
+    ret = sync_fd(storage_fds[descriptor_index(on9kvdb_def::file_kind::value_bank, destination_value_bank)]);
+    if (ret == ESP_OK) {
+        ret = write_manifest_copy(manifest.generation + 1U, on9kvdb_def::manifest_state_ready);
+    }
     if (ret != ESP_OK) {
         manifest = *previous;
         for (uint32_t slot = output_start; slot < output_start + bank_size; slot += 1) {
