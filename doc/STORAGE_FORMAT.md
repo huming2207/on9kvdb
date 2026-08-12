@@ -1,115 +1,47 @@
-# on9kvdb Storage Format and Durability
+# Storage format
 
-> **vNext note:** Storage revision 6 supersedes the revision-4 layout below.
-> It retains the fixed FATFS files and copy-on-write publication model, adds
-> two fixed value-bank files, external value descriptors, per-record CRC-32,
-> and binary names. The current authoritative extension is
-> [`BINARY_VALUE_API.md`](BINARY_VALUE_API.md); old typed-value wording here is
-> historical only.
+## Revision and raw region layout
 
-Phase 2 freezes the permanent filenames, file counts/sizes, manifest slots,
-and the two identity slots at the beginning of every WAL/SSTable file:
+Storage revision 7 is an exclusive raw block image. Its configured geometry
+exactly partitions the database-visible bytes as follows:
 
 ```text
-<base path>/
-├── manifest.db
-├── wal_0.db
-├── wal_1.db
-├── table_0.db
-├── table_1.db
-├── ...
-└── table_<N-1>.db
+offset 0
+  manifest region: 2 x 4096-byte alternating manifest copies
+  WAL regions:     2 fixed slots
+  table regions:   CONFIG_ON9KVDB_SSTABLE_COUNT fixed slots
+  value regions:   2 fixed append-only banks
+offset CONFIG_ON9KVDB_PROVISIONED_DATABASE_SIZE
 ```
 
-Every file is permanent, contiguous, and fixed-size. Storage revision 4 freezes
-the WAL framing, SSTable block/index/footer layout, equal table banks, and
-manifest publication fields documented below and in `../README.md`.
+Every boundary and on-media write is aligned to 4096 bytes. `on9kvdb_io.cpp`
+maps `(file_kind, slot, offset)` into this range with checked arithmetic; the
+old names remain only as logical format terms, not POSIX files.
 
-## Manifest
+## Durable records
 
-`manifest.db` contains two independently checksummed, sector-aligned manifest
-slots. A manifest generation is the sole publication point for:
+Manifest copies, region identities, WAL headers/frames, table headers/blocks/
+indexes/footers, external-value chunks, and byte values include format
+revision/magic/size checks plus CRC-32. A failed decode is corruption unless a
+documented alternate manifest copy is valid.
 
-- storage format version and feature flags;
-- database identity;
-- persisted geometry and limits;
-- live SSTable slot IDs, logical generations, levels, key ranges, and sequence
-  ranges;
-- active WAL slot/generation and safe replay/checkpoint sequence;
-- next logical transaction/table generation;
-- provisioning/ready state.
+Each data region begins with two independently encoded identity slots. The
+identity binds its logical kind/slot/final size to the random database ID in
+the manifest. Provisioning writes missing identities only while the manifest
+is in the dedicated provisioning-owned state.
 
-Write and sync the alternating manifest slot before treating its generation as
-current. Recovery selects the highest valid generation that is internally
-consistent with referenced files. Do not mutate a published manifest slot in
-place. Runtime health and compaction counters are deliberately not persisted.
+## Publication order
 
-## WAL slots
+1. Write new unreachable table/value/WAL header data in its fixed slot.
+2. Call `on9kvdb_io::sync()` and check the result.
+3. Write the later alternating manifest copy or WAL commit frame.
+4. Call `sync()` again before returning durable success.
 
-Use at least two physical WAL slots so recycling one cannot destroy the only
-durable recovery log.
+The prior manifest copy remains usable after an interrupted write. When only
+one copy is valid, initialization writes a new alternating copy before allowing
+any physical slot to be reused. Recovery first validates manifests and
+identities, then scans the active WAL above the checkpoint.
 
-Each WAL generation should have redundant/checksummed headers and a sequence of
-self-delimiting records. Each record needs explicit:
-
-- magic, storage revision, record kind, and header size;
-- WAL generation and transaction sequence;
-- namespace/key/value type and explicit lengths where applicable;
-- payload checksum and header/record checksum;
-- bounds/alignment information; and
-- commit-record metadata sufficient to validate the complete transaction.
-
-Do not use file length as the logical WAL tail. The file length never changes.
-Recovery scans within the generation's valid logical region and stops at the
-first erased, invalid, torn, out-of-order, or out-of-bounds record. Only
-transactions with a complete valid commit record are replayed.
-
-Before recycling a WAL slot:
-
-1. Flush all transactions it protects into one or more new SSTables.
-2. Sync and validate those SSTables.
-3. Publish a manifest generation selecting the SSTables and advancing the safe
-   WAL checkpoint.
-4. Only then initialize the old WAL physical slot with a new logical
-   generation.
-
-Phase 3 freezes two redundant 4096-byte WAL-generation header slots after the
-8192-byte file-identity region. Transaction data starts at offset 16384.
-Transactions occupy one or more complete 4096-byte frames and never wrap.
-Every frame is written once for the selected logical WAL generation; a later
-transaction never shares or rewrites a frame containing an acknowledged
-transaction. The final frame carries the commit flag, and every frame binds
-the database identity, WAL generation, transaction sequence, frame index/count,
-payload bounds, transaction checksum, and frame checksum.
-
-The current engine alternates between two logical WAL generations. Before
-overwriting a previously used slot, full compaction checkpoints its reachable
-transactions and both manifest copies are stabilized with that slot
-unreferenced.
-
-## SSTable slots
-
-An SSTable is immutable after it is published by the manifest. It contains:
-
-- redundant headers and separately verifiable footer metadata;
-- sorted composite internal keys;
-- type, transaction sequence, tombstone state, and value bytes;
-- checksummed data blocks, sparse index, headers, and footer;
-- a bounded sparse index;
-- a checksum covering all authoritative table metadata.
-
-V1 has no Bloom filter or compression. Either feature requires measurement and
-explicit approval.
-
-Compaction must be copy-on-write:
-
-1. Select only currently free output table slots.
-2. Merge live input tables and tombstones into the output slots.
-3. Sync and validate every output.
-4. Publish one new manifest generation selecting the outputs and no longer
-   selecting the inputs.
-5. Stabilize both manifest copies on the new selection.
-6. Reuse old input slots only after neither valid manifest references them.
-
-Reserve enough unselected table capacity to complete worst-case compaction.
-Returning `ESP_ERR_NO_MEM` is preferable to overwriting a live table.
+`sync()` is an interface-level status barrier. It is intentionally separate
+from claims about cache flushes, card firmware, capacitor hold-up, or an SD
+card's behaviour during sudden power loss.

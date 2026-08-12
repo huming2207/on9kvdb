@@ -56,27 +56,7 @@ esp_err_t on9kvdb::read_table_bytes_unsafe(uint32_t slot, uint64_t offset, uint8
     if (slot >= manifest.geometry.table_count || destination == nullptr || io_frame == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
-
-    const int file_fd = storage_fds[descriptor_index(on9kvdb_def::file_kind::table, slot)];
-    const uintptr_t frame_start = reinterpret_cast<uintptr_t>(io_frame);
-    const uintptr_t frame_end = frame_start + on9kvdb_def::wal_frame_size;
-    const uintptr_t destination_start = reinterpret_cast<uintptr_t>(destination);
-    if (destination_start >= frame_start && destination_start < frame_end) {
-        return size <= frame_end - destination_start
-                   ? read_exact_fd(file_fd, manifest.geometry.table_size, offset, destination, size)
-                   : ESP_ERR_INVALID_SIZE;
-    }
-    size_t copied = 0;
-    while (copied < size) {
-        const size_t chunk = size - copied < on9kvdb_def::wal_frame_size ? size - copied : on9kvdb_def::wal_frame_size;
-        esp_err_t ret = read_exact_fd(file_fd, manifest.geometry.table_size, offset + copied, io_frame, chunk);
-        if (ret != ESP_OK) {
-            return ret;
-        }
-        memcpy(destination + copied, io_frame, chunk);
-        copied += chunk;
-    }
-    return ESP_OK;
+    return read_storage_bytes_unsafe(on9kvdb_def::file_kind::table, slot, offset, destination, size);
 }
 
 esp_err_t on9kvdb::write_table_bytes_unsafe(uint32_t slot, uint64_t offset, const uint8_t *source, size_t size)
@@ -85,25 +65,7 @@ esp_err_t on9kvdb::write_table_bytes_unsafe(uint32_t slot, uint64_t offset, cons
         return ESP_ERR_INVALID_ARG;
     }
 
-    const int file_fd = storage_fds[descriptor_index(on9kvdb_def::file_kind::table, slot)];
-    const uintptr_t frame_start = reinterpret_cast<uintptr_t>(io_frame);
-    const uintptr_t frame_end = frame_start + on9kvdb_def::wal_frame_size;
-    const uintptr_t source_start = reinterpret_cast<uintptr_t>(source);
-    if (source_start >= frame_start && source_start < frame_end) {
-        return size <= frame_end - source_start ? write_exact_fd(file_fd, manifest.geometry.table_size, offset, source, size)
-                                                : ESP_ERR_INVALID_SIZE;
-    }
-    size_t copied = 0;
-    while (copied < size) {
-        const size_t chunk = size - copied < on9kvdb_def::wal_frame_size ? size - copied : on9kvdb_def::wal_frame_size;
-        memcpy(io_frame, source + copied, chunk);
-        const esp_err_t ret = write_exact_fd(file_fd, manifest.geometry.table_size, offset + copied, io_frame, chunk);
-        if (ret != ESP_OK) {
-            return ret;
-        }
-        copied += chunk;
-    }
-    return ESP_OK;
+    return write_storage_bytes_unsafe(on9kvdb_def::file_kind::table, slot, offset, source, size);
 }
 
 int on9kvdb::compare_memtable_records_unsafe(uint32_t lhs_offset, uint32_t rhs_offset) const
@@ -273,7 +235,6 @@ esp_err_t on9kvdb::flush_memtable_unsafe()
         (index_offset - on9kvdb_def::table_data_region_offset) / manifest.limits.sstable_block_bytes;
 
     table_build_state state = {};
-    state.file_fd = storage_fds[descriptor_index(on9kvdb_def::file_kind::table, table_slot)];
     state.data_block = data_block;
     state.index_block = index_block;
     state.generation = table_generation;
@@ -399,8 +360,8 @@ esp_err_t on9kvdb::flush_memtable_unsafe()
         ret = ESP_ERR_INVALID_STATE;
     }
     if (ret == ESP_OK) {
-        ret = write_exact_fd(state.file_fd, manifest.geometry.table_size, footer_offset, io_frame,
-                             on9kvdb_def::table_footer_slot_size);
+        ret = write_storage_bytes_unsafe(on9kvdb_def::file_kind::table, table_slot, footer_offset, io_frame,
+                                         on9kvdb_def::table_footer_slot_size);
     }
     for (uint32_t copy = 0; ret == ESP_OK && copy < on9kvdb_def::table_header_slot_count; copy += 1) {
         memset(io_frame, 0, on9kvdb_def::wal_frame_size);
@@ -411,11 +372,11 @@ esp_err_t on9kvdb::flush_memtable_unsafe()
         }
         const uint64_t header_offset =
             on9kvdb_def::table_header_region_offset + static_cast<uint64_t>(copy) * on9kvdb_def::table_header_slot_size;
-        ret = write_exact_fd(state.file_fd, manifest.geometry.table_size, header_offset, io_frame,
-                             on9kvdb_def::table_header_slot_size);
+        ret = write_storage_bytes_unsafe(on9kvdb_def::file_kind::table, table_slot, header_offset, io_frame,
+                                         on9kvdb_def::table_header_slot_size);
     }
     if (ret == ESP_OK) {
-        ret = sync_fd(state.file_fd);
+        ret = sync_storage_unsafe();
     }
     if (ret != ESP_OK) {
         return ret;

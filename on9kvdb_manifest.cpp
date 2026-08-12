@@ -1,9 +1,6 @@
-#include <cerrno>
 #include <cstring>
 #include <inttypes.h>
 #include <new>
-#include <sys/stat.h>
-#include <unistd.h>
 
 #include <esp_log.h>
 #include <esp_random.h>
@@ -39,55 +36,17 @@ namespace
 
 esp_err_t on9kvdb::setup_manifest()
 {
-    struct stat file_stat = {};
-    const int stat_result = stat(manifest_path, &file_stat);
-    if (stat_result == 0) {
-        if (!S_ISREG(file_stat.st_mode) || file_stat.st_size <= 0) {
-            return ESP_ERR_INVALID_CRC;
-        }
-        return open_existing_manifest();
+    bool blank = false;
+    const esp_err_t ret = storage_region_is_blank_unsafe(&blank);
+    if (ret != ESP_OK) {
+        return ret;
     }
-    if (errno != ENOENT) {
-        ESP_LOGE(TAG, "Manifest: stat failed: errno=%d", errno);
-        return ESP_FAIL;
-    }
-
-    return create_manifest();
+    return blank ? create_manifest() : open_existing_manifest();
 }
 
 esp_err_t on9kvdb::create_manifest()
 {
-    esp_err_t ret = verify_canonical_file_set(true);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-
-    uint64_t free_bytes = 0;
-    ret = validate_fatfs_mount(&free_bytes);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-
     const on9kvdb_def::storage_geometry geometry = get_build_geometry();
-    if (free_bytes < geometry.provisioned_size) {
-        return ESP_ERR_NO_MEM;
-    }
-
-    bool created = false;
-    ret = provision_contiguous_file(manifest_path, on9kvdb_def::manifest_file_size, &created);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-    if (!created) {
-        return ESP_ERR_INVALID_CRC;
-    }
-
-    const size_t fd_index = descriptor_index(on9kvdb_def::file_kind::manifest, 0);
-    ret = open_file(manifest_path, &storage_fds[fd_index]);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-
     uint64_t database_id = 0;
     while (database_id == 0) {
         database_id = (static_cast<uint64_t>(esp_random()) << 32U) | esp_random();
@@ -104,7 +63,7 @@ esp_err_t on9kvdb::create_manifest()
         manifest.value_bank_tail[bank] = on9kvdb_def::identity_region_size;
     }
     manifest_valid_copy_count = 0;
-    ret = write_manifest_copy(1, on9kvdb_def::manifest_state_provisioning_owned);
+    esp_err_t ret = write_manifest_copy(1, on9kvdb_def::manifest_state_provisioning_owned);
     if (ret != ESP_OK) {
         return ret;
     }
@@ -119,18 +78,7 @@ esp_err_t on9kvdb::create_manifest()
 
 esp_err_t on9kvdb::open_existing_manifest()
 {
-    esp_err_t ret = validate_contiguous_file(manifest_path, on9kvdb_def::manifest_file_size);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-
-    const size_t fd_index = descriptor_index(on9kvdb_def::file_kind::manifest, 0);
-    ret = open_file(manifest_path, &storage_fds[fd_index]);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-
-    ret = load_manifest();
+    esp_err_t ret = load_manifest();
     if (ret != ESP_OK) {
         return ret;
     }
@@ -141,11 +89,6 @@ esp_err_t on9kvdb::open_existing_manifest()
         ESP_LOGE(TAG, "Manifest: Kconfig geometry/limit mismatch; "
                       "delete and recreate the complete database");
         return ESP_ERR_INVALID_SIZE;
-    }
-
-    ret = verify_canonical_file_set(false);
-    if (ret != ESP_OK) {
-        return ret;
     }
 
     if (manifest.state == on9kvdb_def::manifest_state_ready && manifest_valid_copy_count < on9kvdb_def::manifest_slot_count) {
@@ -172,7 +115,6 @@ esp_err_t on9kvdb::load_manifest()
         return ESP_ERR_INVALID_STATE;
     }
 
-    const int manifest_fd = storage_fds[descriptor_index(on9kvdb_def::file_kind::manifest, 0)];
     bool found = false;
     bool newer_version_found = false;
     auto *valid = reinterpret_cast<on9kvdb_def::manifest_record *>(future_scratch);
@@ -187,7 +129,7 @@ esp_err_t on9kvdb::load_manifest()
     for (uint32_t slot = 0; slot < on9kvdb_def::manifest_slot_count; slot += 1) {
         const uint64_t offset = static_cast<uint64_t>(slot) * on9kvdb_def::manifest_slot_size;
         esp_err_t ret =
-            read_exact_fd(manifest_fd, on9kvdb_def::manifest_file_size, offset, io_frame, on9kvdb_def::manifest_record_size);
+            read_storage_bytes_unsafe(on9kvdb_def::file_kind::manifest, 0, offset, io_frame, on9kvdb_def::manifest_record_size);
         if (ret != ESP_OK) {
             return ret;
         }
@@ -250,7 +192,12 @@ esp_err_t on9kvdb::load_manifest()
             stabilization_required = valid[slot].active_table_bank != selected->active_table_bank ||
                                      valid[slot].active_wal_slot != selected->active_wal_slot ||
                                      valid[slot].wal_generation[0] != selected->wal_generation[0] ||
-                                     valid[slot].wal_generation[1] != selected->wal_generation[1];
+                                     valid[slot].wal_generation[1] != selected->wal_generation[1] ||
+                                     valid[slot].active_value_bank != selected->active_value_bank ||
+                                     valid[slot].value_bank_generation[0] != selected->value_bank_generation[0] ||
+                                     valid[slot].value_bank_generation[1] != selected->value_bank_generation[1] ||
+                                     valid[slot].value_bank_tail[0] != selected->value_bank_tail[0] ||
+                                     valid[slot].value_bank_tail[1] != selected->value_bank_tail[1];
         }
     }
 
@@ -284,11 +231,10 @@ esp_err_t on9kvdb::write_manifest_copy(uint64_t generation, uint16_t state)
 
     const uint32_t slot = static_cast<uint32_t>((generation - 1U) % on9kvdb_def::manifest_slot_count);
     const uint64_t offset = static_cast<uint64_t>(slot) * on9kvdb_def::manifest_slot_size;
-    const int manifest_fd = storage_fds[descriptor_index(on9kvdb_def::file_kind::manifest, 0)];
     esp_err_t ret =
-        write_exact_fd(manifest_fd, on9kvdb_def::manifest_file_size, offset, io_frame, on9kvdb_def::manifest_record_size);
+        write_storage_bytes_unsafe(on9kvdb_def::file_kind::manifest, 0, offset, io_frame, on9kvdb_def::manifest_record_size);
     if (ret == ESP_OK) {
-        ret = sync_fd(manifest_fd);
+        ret = sync_storage_unsafe();
     }
     if (ret == ESP_OK) {
         manifest = *next;
@@ -319,7 +265,7 @@ esp_err_t on9kvdb::stabilize_manifest_unsafe()
     return ret;
 }
 
-esp_err_t on9kvdb::write_file_identity_copy(int file_fd, on9kvdb_def::file_kind kind, uint32_t slot, uint32_t copy_slot) const
+esp_err_t on9kvdb::write_file_identity_copy(on9kvdb_def::file_kind kind, uint32_t slot, uint32_t copy_slot)
 {
     if (copy_slot >= on9kvdb_def::identity_slot_count) {
         return ESP_ERR_INVALID_ARG;
@@ -336,20 +282,19 @@ esp_err_t on9kvdb::write_file_identity_copy(int file_fd, on9kvdb_def::file_kind 
     identity.slot = slot;
     identity.kind = kind;
 
-    uint8_t encoded[on9kvdb_def::file_identity_size] = {};
-    if (!on9kvdb_def::encode_file_identity(encoded, sizeof(encoded), identity)) {
+    if (io_frame == nullptr) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    memset(io_frame, 0, on9kvdb_def::identity_slot_size);
+    if (!on9kvdb_def::encode_file_identity(io_frame, on9kvdb_def::identity_slot_size, identity)) {
         return ESP_ERR_INVALID_STATE;
     }
 
     const uint64_t offset = static_cast<uint64_t>(copy_slot) * on9kvdb_def::identity_slot_size;
-    esp_err_t ret = write_exact_fd(file_fd, file_size, offset, encoded, sizeof(encoded));
-    if (ret == ESP_OK) {
-        ret = sync_fd(file_fd);
-    }
-    return ret;
+    return write_storage_bytes_unsafe(kind, slot, offset, io_frame, on9kvdb_def::identity_slot_size);
 }
 
-esp_err_t on9kvdb::load_file_identity(int file_fd, on9kvdb_def::file_kind kind, uint32_t slot,
+esp_err_t on9kvdb::load_file_identity(on9kvdb_def::file_kind kind, uint32_t slot,
                                       bool valid_copies[on9kvdb_def::identity_slot_count]) const
 {
     if (valid_copies == nullptr || !is_data_file_kind(kind)) {
@@ -362,7 +307,7 @@ esp_err_t on9kvdb::load_file_identity(int file_fd, on9kvdb_def::file_kind kind, 
         valid_copies[copy_slot] = false;
         uint8_t encoded[on9kvdb_def::file_identity_size] = {};
         const uint64_t offset = static_cast<uint64_t>(copy_slot) * on9kvdb_def::identity_slot_size;
-        esp_err_t ret = read_exact_fd(file_fd, file_size, offset, encoded, sizeof(encoded));
+        esp_err_t ret = read_storage_bytes_unsafe(kind, slot, offset, encoded, sizeof(encoded));
         if (ret != ESP_OK) {
             return ret;
         }
@@ -392,36 +337,8 @@ esp_err_t on9kvdb::provision_one_data_file(on9kvdb_def::file_kind kind, uint32_t
         return ESP_ERR_INVALID_ARG;
     }
 
-    const uint64_t file_size = data_file_size(manifest.geometry, kind);
-    char path[PATH_MAX] = {};
-    esp_err_t ret = build_data_path(kind, slot, path, sizeof(path));
-    if (ret != ESP_OK) {
-        return ret;
-    }
-
-    bool created = false;
-    if (manifest.state == on9kvdb_def::manifest_state_provisioning_owned) {
-        ret = provision_contiguous_file(path, file_size, &created);
-    } else if (manifest.state == on9kvdb_def::manifest_state_ready) {
-        ret = validate_contiguous_file(path, file_size);
-    } else {
-        return ESP_ERR_INVALID_CRC;
-    }
-    if (ret != ESP_OK) {
-        return ret;
-    }
-
-    const size_t fd_index = descriptor_index(kind, slot);
-    if (fd_index >= storage_fd_count || storage_fds[fd_index] >= 0) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    ret = open_file(path, &storage_fds[fd_index]);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-
     bool valid_copies[on9kvdb_def::identity_slot_count] = {};
-    ret = load_file_identity(storage_fds[fd_index], kind, slot, valid_copies);
+    esp_err_t ret = load_file_identity(kind, slot, valid_copies);
     if (ret == ESP_ERR_NOT_FOUND && manifest.state == on9kvdb_def::manifest_state_provisioning_owned) {
         ret = ESP_OK;
     }
@@ -433,21 +350,21 @@ esp_err_t on9kvdb::provision_one_data_file(on9kvdb_def::file_kind kind, uint32_t
     }
 
     if (manifest.state == on9kvdb_def::manifest_state_provisioning_owned && kind == on9kvdb_def::file_kind::table) {
-        // FatFs f_expand() allocates clusters but does not initialize their sectors. Explicit zero publication markers let
-        // Phase 4 distinguish a never-published slot from a slot that must not be overwritten after manifest-copy fallback.
+        // Explicit zero publication markers distinguish a never-published raw slot from a table that must not be overwritten
+        // after manifest-copy fallback.
         memset(io_frame, 0, on9kvdb_def::wal_frame_size);
         for (uint32_t copy_slot = 0; copy_slot < on9kvdb_def::table_header_slot_count; copy_slot += 1) {
             const uint64_t offset =
                 on9kvdb_def::table_header_region_offset + static_cast<uint64_t>(copy_slot) * on9kvdb_def::table_header_slot_size;
-            ret = write_exact_fd(storage_fds[fd_index], file_size, offset, io_frame, on9kvdb_def::table_header_slot_size);
+            ret = write_storage_bytes_unsafe(kind, slot, offset, io_frame, on9kvdb_def::table_header_slot_size);
             if (ret != ESP_OK) {
                 return ret;
             }
         }
-        ret = write_exact_fd(storage_fds[fd_index], file_size, file_size - on9kvdb_def::table_footer_slot_size, io_frame,
-                             on9kvdb_def::table_footer_slot_size);
+        ret = write_storage_bytes_unsafe(kind, slot, manifest.geometry.table_size - on9kvdb_def::table_footer_slot_size, io_frame,
+                                         on9kvdb_def::table_footer_slot_size);
         if (ret == ESP_OK) {
-            ret = sync_fd(storage_fds[fd_index]);
+            ret = sync_storage_unsafe();
         }
         if (ret != ESP_OK) {
             return ret;
@@ -459,14 +376,18 @@ esp_err_t on9kvdb::provision_one_data_file(on9kvdb_def::file_kind kind, uint32_t
             if (valid_copies[copy_slot]) {
                 continue;
             }
-            ret = write_file_identity_copy(storage_fds[fd_index], kind, slot, copy_slot);
+            ret = write_file_identity_copy(kind, slot, copy_slot);
             if (ret != ESP_OK) {
                 return ret;
             }
         }
+        ret = sync_storage_unsafe();
+        if (ret != ESP_OK) {
+            return ret;
+        }
 
         bool final_copies[on9kvdb_def::identity_slot_count] = {};
-        ret = load_file_identity(storage_fds[fd_index], kind, slot, final_copies);
+        ret = load_file_identity(kind, slot, final_copies);
         if (ret != ESP_OK) {
             return ret;
         }
@@ -490,7 +411,6 @@ esp_err_t on9kvdb::provision_one_data_file(on9kvdb_def::file_kind kind, uint32_t
         }
     }
 
-    (void)created;
     return ESP_OK;
 }
 

@@ -22,8 +22,8 @@ No requirement became optional merely because it moved to another file.
 
 | Document | Audit focus | Read when changing |
 | --- | --- | --- |
-| [`REQUIREMENTS.md`](REQUIREMENTS.md) | Scope, hard constraints, FATFS/journal assumptions, allocation and coding rules, WAL/memtable architecture | Any production code or behavior |
-| [`STORAGE_FORMAT.md`](STORAGE_FORMAT.md) | File layout, persistent metadata, synchronization, manifest publication, physical-slot reuse | Encoding, I/O, recovery, flush, compaction, geometry |
+| [`REQUIREMENTS.md`](REQUIREMENTS.md) | Scope, raw-block ownership, allocation and coding rules, WAL/memtable architecture | Any production code or behavior |
+| [`STORAGE_FORMAT.md`](STORAGE_FORMAT.md) | Raw-region layout, persistent metadata, synchronization, manifest publication, physical-slot reuse | Encoding, I/O, recovery, flush, compaction, geometry |
 | [`API_AND_RECOVERY.md`](API_AND_RECOVERY.md) | Logical-key model, public API and errors, provisioning, recovery, locks and visibility | Public APIs, lifecycle, handles, replay, concurrency |
 | [`DESIGN_DECISIONS.md`](DESIGN_DECISIONS.md) | Approved capacities, workload, memory, transaction, table-bank, corruption and integration policies | Kconfig, budgets, format policy, feature scope |
 | [`IMPLEMENTATION_AND_TESTING.md`](IMPLEMENTATION_AND_TESTING.md) | Phase record, fault model, invariants, acceptance criteria and source ownership | Tests, qualification, release claims, refactors |

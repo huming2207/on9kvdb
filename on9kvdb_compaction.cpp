@@ -219,7 +219,6 @@ esp_err_t on9kvdb::start_compaction_output_unsafe(compaction_output *output, uin
 
     *output = {};
     invalidate_table_index_cache_unsafe(slot);
-    output->build.file_fd = storage_fds[descriptor_index(on9kvdb_def::file_kind::table, slot)];
     output->build.data_block = data_block;
     output->build.index_block = index_block;
     output->build.generation = generation;
@@ -417,8 +416,8 @@ esp_err_t on9kvdb::finish_compaction_output_unsafe(compaction_output *output, on
         ret = ESP_ERR_INVALID_STATE;
     }
     if (ret == ESP_OK) {
-        ret = write_exact_fd(output->build.file_fd, manifest.geometry.table_size, output->metadata.footer_offset, io_frame,
-                             on9kvdb_def::table_footer_slot_size);
+        ret = write_storage_bytes_unsafe(on9kvdb_def::file_kind::table, output->build.slot, output->metadata.footer_offset,
+                                         io_frame, on9kvdb_def::table_footer_slot_size);
     }
     for (uint32_t copy = 0; ret == ESP_OK && copy < on9kvdb_def::table_header_slot_count; copy += 1) {
         memset(io_frame, 0, on9kvdb_def::wal_frame_size);
@@ -429,12 +428,12 @@ esp_err_t on9kvdb::finish_compaction_output_unsafe(compaction_output *output, on
         }
         const uint64_t header_offset =
             on9kvdb_def::table_header_region_offset + static_cast<uint64_t>(copy) * on9kvdb_def::table_header_slot_size;
-        ret = write_exact_fd(output->build.file_fd, manifest.geometry.table_size, header_offset, io_frame,
-                             on9kvdb_def::table_header_slot_size);
+        ret = write_storage_bytes_unsafe(on9kvdb_def::file_kind::table, output->build.slot, header_offset, io_frame,
+                                         on9kvdb_def::table_header_slot_size);
     }
     if (ret == ESP_OK) {
         // The output remains unreachable until the later manifest bank swap, so one sync can publish the complete file.
-        ret = sync_fd(output->build.file_fd);
+        ret = sync_storage_unsafe();
     }
     if (ret != ESP_OK) {
         return ret;
@@ -469,8 +468,7 @@ esp_err_t on9kvdb::compact_tables_unsafe()
     // The destination bank is overwritten from its beginning. Readers publish direct pointers into their dedicated buffers,
     // so a reader retaining a value from the previous generation makes that bank unavailable for this compaction. A finished
     // but uncommitted writer is also a pin: it may hold a descriptor for an old bank which has not reached the memtable yet.
-    if (value_bank_is_pinned_unsafe(destination_value_bank) ||
-        value_bank_has_staged_reference_unsafe(destination_value_bank)) {
+    if (value_bank_is_pinned_unsafe(destination_value_bank) || value_bank_has_staged_reference_unsafe(destination_value_bank)) {
         return ESP_ERR_INVALID_STATE;
     }
     const uint64_t destination_value_generation = manifest.value_bank_generation[destination_value_bank] + 1U;
@@ -726,7 +724,7 @@ esp_err_t on9kvdb::compact_tables_unsafe()
     const uint32_t inactive_wal_slot = 1U - manifest.active_wal_slot;
     manifest.wal_generation[inactive_wal_slot] = 0;
 
-    ret = sync_fd(storage_fds[descriptor_index(on9kvdb_def::file_kind::value_bank, destination_value_bank)]);
+    ret = sync_storage_unsafe();
     if (ret == ESP_OK) {
         ret = write_manifest_copy(manifest.generation + 1U, on9kvdb_def::manifest_state_ready);
     }

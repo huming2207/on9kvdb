@@ -378,17 +378,12 @@ esp_err_t on9kvdb::commit(on9kvdb_transaction_handle transaction_handle)
         }
     }
     bool wal_durable = false;
-    if (ret == ESP_OK) {
+    if (ret == ESP_OK && value_bank_dirty_mask != 0) {
         // A WAL descriptor can make a large value reachable after reboot.  Persist its chunks before the WAL commit record
         // is written, otherwise recovery could publish a reference to unwritten media.
-        for (uint32_t bank_slot = 0; bank_slot < on9kvdb_def::value_bank_count && ret == ESP_OK; bank_slot += 1U) {
-            const uint8_t bank_bit = static_cast<uint8_t>(UINT8_C(1) << bank_slot);
-            if ((value_bank_dirty_mask & bank_bit) != 0) {
-                ret = sync_fd(storage_fds[descriptor_index(on9kvdb_def::file_kind::value_bank, bank_slot)]);
-                if (ret == ESP_OK) {
-                    value_bank_dirty_mask &= static_cast<uint8_t>(~bank_bit);
-                }
-            }
+        ret = sync_storage_unsafe();
+        if (ret == ESP_OK) {
+            value_bank_dirty_mask = 0;
         }
     }
     if (ret == ESP_OK) {

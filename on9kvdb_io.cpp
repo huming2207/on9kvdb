@@ -1,355 +1,211 @@
-#include <cerrno>
-#include <cstdio>
 #include <cstring>
-#include <dirent.h>
-#include <fcntl.h>
-#include <inttypes.h>
-#include <limits>
-#include <sys/stat.h>
-#include <unistd.h>
-
-#include <esp_log.h>
-#include <esp_vfs_fat.h>
 
 #include "on9kvdb.hpp"
 
-size_t on9kvdb::descriptor_index(on9kvdb_def::file_kind kind, uint32_t slot)
-{
-    switch (kind) {
-    case on9kvdb_def::file_kind::manifest:
-        return slot == 0 ? 0 : storage_fd_count;
-    case on9kvdb_def::file_kind::wal:
-        return slot < on9kvdb_def::wal_file_count ? 1U + slot : storage_fd_count;
-    case on9kvdb_def::file_kind::table:
-        return slot < CONFIG_ON9KVDB_SSTABLE_COUNT ? 1U + on9kvdb_def::wal_file_count + slot : storage_fd_count;
-    case on9kvdb_def::file_kind::value_bank:
-        return slot < on9kvdb_def::value_bank_count ? 1U + on9kvdb_def::wal_file_count + CONFIG_ON9KVDB_SSTABLE_COUNT + slot
-                                                    : storage_fd_count;
-    default:
-        return storage_fd_count;
-    }
-}
+#include <freertos/task.h>
 
-esp_err_t on9kvdb::build_manifest_path()
+esp_err_t on9kvdb::get_storage_region_unsafe(on9kvdb_def::file_kind kind, uint32_t slot, uint64_t *offset_out,
+                                             uint64_t *size_out) const
 {
-    const size_t len = strlen(file_path);
-    const char *separator = len > 0 && file_path[len - 1] == '/' ? "" : "/";
-    const int result = snprintf(manifest_path, sizeof(manifest_path), "%s%smanifest.db", file_path, separator);
-    if (result < 0 || static_cast<size_t>(result) >= sizeof(manifest_path)) {
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    return ESP_OK;
-}
-
-esp_err_t on9kvdb::build_data_path(on9kvdb_def::file_kind kind, uint32_t slot, char *path_out, size_t path_out_len) const
-{
-    if (path_out == nullptr || path_out_len == 0) {
+    if (offset_out == nullptr || size_out == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    const char *prefix = nullptr;
-    if (kind == on9kvdb_def::file_kind::wal) {
-        prefix = "wal";
+    // The physical image has no allocation metadata: this arithmetic is the
+    // format's authoritative manifest -> WAL -> table -> value-bank mapping.
+    // During first provisioning no manifest exists yet, so use the exact
+    // build geometry; after open, use the geometry validated from the image.
+    const on9kvdb_def::storage_geometry &geometry =
+        manifest.geometry.provisioned_size != 0 ? manifest.geometry : get_build_geometry();
+    uint64_t offset = 0;
+    uint64_t size = 0;
+    if (kind == on9kvdb_def::file_kind::manifest) {
+        if (slot != 0) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        size = geometry.manifest_size;
+    } else if (kind == on9kvdb_def::file_kind::wal) {
+        if (slot >= geometry.wal_count || !on9kvdb_def::checked_mul_u64(slot, geometry.wal_size, &offset) ||
+            !on9kvdb_def::checked_add_u64(geometry.manifest_size, offset, &offset)) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        size = geometry.wal_size;
     } else if (kind == on9kvdb_def::file_kind::table) {
-        prefix = "table";
+        uint64_t wal_bytes = 0;
+        uint64_t table_offset = 0;
+        if (slot >= geometry.table_count || !on9kvdb_def::checked_mul_u64(geometry.wal_count, geometry.wal_size, &wal_bytes) ||
+            !on9kvdb_def::checked_mul_u64(slot, geometry.table_size, &table_offset) ||
+            !on9kvdb_def::checked_add_u64(geometry.manifest_size, wal_bytes, &offset) ||
+            !on9kvdb_def::checked_add_u64(offset, table_offset, &offset)) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        size = geometry.table_size;
     } else if (kind == on9kvdb_def::file_kind::value_bank) {
-        prefix = "value";
+        uint64_t wal_bytes = 0;
+        uint64_t table_bytes = 0;
+        uint64_t value_offset = 0;
+        if (slot >= geometry.value_bank_count ||
+            !on9kvdb_def::checked_mul_u64(geometry.wal_count, geometry.wal_size, &wal_bytes) ||
+            !on9kvdb_def::checked_mul_u64(geometry.table_count, geometry.table_size, &table_bytes) ||
+            !on9kvdb_def::checked_mul_u64(slot, geometry.value_bank_size, &value_offset) ||
+            !on9kvdb_def::checked_add_u64(geometry.manifest_size, wal_bytes, &offset) ||
+            !on9kvdb_def::checked_add_u64(offset, table_bytes, &offset) ||
+            !on9kvdb_def::checked_add_u64(offset, value_offset, &offset)) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        size = geometry.value_bank_size;
     } else {
         return ESP_ERR_INVALID_ARG;
     }
 
-    const size_t len = strlen(file_path);
-    const char *separator = len > 0 && file_path[len - 1] == '/' ? "" : "/";
-    const int result = snprintf(path_out, path_out_len, "%s%s%s_%" PRIu32 ".db", file_path, separator, prefix, slot);
-    if (result < 0 || static_cast<size_t>(result) >= path_out_len) {
+    uint64_t region_end = 0;
+    if (!on9kvdb_def::checked_add_u64(offset, size, &region_end) || region_end > geometry.provisioned_size) {
         return ESP_ERR_INVALID_SIZE;
     }
 
+    *offset_out = offset;
+    *size_out = size;
     return ESP_OK;
 }
 
-bool on9kvdb::parse_slot_file_name(const char *name, const char *prefix, uint32_t *slot_out)
+esp_err_t on9kvdb::read_storage_bytes_unsafe(on9kvdb_def::file_kind kind, uint32_t slot, uint64_t offset, void *destination,
+                                             size_t size) const
 {
-    if (name == nullptr || prefix == nullptr || slot_out == nullptr) {
-        return false;
-    }
-
-    const size_t prefix_len = strlen(prefix);
-    if (strncmp(name, prefix, prefix_len) != 0) {
-        return false;
-    }
-
-    const char *cursor = name + prefix_len;
-    if (*cursor < '0' || *cursor > '9' || (*cursor == '0' && cursor[1] >= '0' && cursor[1] <= '9')) {
-        return false;
-    }
-
-    uint32_t slot = 0;
-    while (*cursor >= '0' && *cursor <= '9') {
-        const uint32_t digit = static_cast<uint32_t>(*cursor - '0');
-        if (slot > (UINT32_MAX - digit) / 10U) {
-            return false;
-        }
-        slot = slot * 10U + digit;
-        cursor += 1;
-    }
-
-    if (strcmp(cursor, ".db") != 0) {
-        return false;
-    }
-
-    *slot_out = slot;
-    return true;
-}
-
-esp_err_t on9kvdb::verify_canonical_file_set(bool creating) const
-{
-    DIR *directory = opendir(file_path);
-    if (directory == nullptr) {
-        ESP_LOGE(TAG, "Files: opendir(%s) failed: errno=%d", file_path, errno);
-        return ESP_FAIL;
-    }
-
-    esp_err_t ret = ESP_OK;
-    errno = 0;
-    while (true) {
-        const struct dirent *entry = readdir(directory);
-        if (entry == nullptr) {
-            if (errno != 0) {
-                ESP_LOGE(TAG, "Files: readdir failed: errno=%d", errno);
-                ret = ESP_FAIL;
-            }
-            break;
-        }
-
-        if (strcmp(entry->d_name, "manifest.db") == 0) {
-            if (creating) {
-                ret = ESP_ERR_INVALID_CRC;
-                break;
-            }
-            continue;
-        }
-
-        uint32_t slot = 0;
-        if (parse_slot_file_name(entry->d_name, "wal_", &slot)) {
-            if (creating || slot >= on9kvdb_def::wal_file_count) {
-                ret = ESP_ERR_INVALID_CRC;
-                break;
-            }
-            continue;
-        }
-        if (parse_slot_file_name(entry->d_name, "table_", &slot)) {
-            if (creating || slot >= manifest.geometry.table_count) {
-                ret = ESP_ERR_INVALID_CRC;
-                break;
-            }
-            continue;
-        }
-        if (parse_slot_file_name(entry->d_name, "value_", &slot)) {
-            if (creating || slot >= on9kvdb_def::value_bank_count) {
-                ret = ESP_ERR_INVALID_CRC;
-                break;
-            }
-            continue;
-        }
-
-        const bool reserved_name = strncmp(entry->d_name, "wal_", 4) == 0 || strncmp(entry->d_name, "table_", 6) == 0 ||
-                                   strncmp(entry->d_name, "value_", 6) == 0;
-        if (reserved_name) {
-            ret = ESP_ERR_INVALID_CRC;
-            break;
-        }
-    }
-
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Files: canonical database namespace collision");
-    }
-    (void)closedir(directory);
-    return ret;
-}
-
-esp_err_t on9kvdb::validate_fatfs_mount(uint64_t *free_bytes_out) const
-{
-    if (free_bytes_out == nullptr) {
+    if ((destination == nullptr && size != 0) || storage == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    uint64_t total_bytes = 0;
-    uint64_t free_bytes = 0;
-    const esp_err_t ret = esp_vfs_fat_info(file_path, &total_bytes, &free_bytes);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "FATFS: mounted-volume query failed: 0x%x", ret);
-        return ret;
+    uint64_t region_offset = 0;
+    uint64_t region_size = 0;
+    esp_err_t ret = get_storage_region_unsafe(kind, slot, &region_offset, &region_size);
+    if (ret != ESP_OK || offset > region_size || size > region_size - offset) {
+        return ret != ESP_OK ? ret : ESP_ERR_INVALID_SIZE;
+    }
+    if (size == 0) {
+        return ESP_OK;
+    }
+
+    const uint32_t block_size = storage->block_size();
+    if (block_size == 0 || on9kvdb_def::format_alignment % block_size != 0 || block_size > on9kvdb_def::format_alignment ||
+        io_bounce == nullptr) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    uint64_t absolute_offset = 0;
+    if (!on9kvdb_def::checked_add_u64(region_offset, offset, &absolute_offset)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    if (absolute_offset % block_size == 0 && size % block_size == 0) {
+        // The common table/WAL/value path is already device-block aligned and
+        // can DMA directly into the caller's fixed buffer without a copy.
+        const uint64_t block_count = size / block_size;
+        if (block_count > UINT32_MAX) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        return storage->read_blocks(absolute_offset / block_size, destination, static_cast<uint32_t>(block_count));
+    }
+
+    // Metadata decoders often request a small record prefix. Read each native
+    // block into the permanent bounce frame rather than making callers round
+    // up their output buffers or allocating a temporary buffer per request.
+    uint8_t *output = static_cast<uint8_t *>(destination);
+    size_t remaining = size;
+    while (remaining > 0) {
+        const uint32_t block_offset = static_cast<uint32_t>(absolute_offset % block_size);
+        const size_t copy_size = remaining < block_size - block_offset ? remaining : block_size - block_offset;
+        ret = storage->read_blocks(absolute_offset / block_size, io_bounce, 1);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+        memcpy(output, io_bounce + block_offset, copy_size);
+        output += copy_size;
+        remaining -= copy_size;
+        absolute_offset += copy_size;
+    }
+    return ESP_OK;
+}
+
+esp_err_t on9kvdb::write_storage_bytes_unsafe(on9kvdb_def::file_kind kind, uint32_t slot, uint64_t offset, const void *source,
+                                              size_t size)
+{
+    if ((source == nullptr && size != 0) || storage == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint64_t region_offset = 0;
+    uint64_t region_size = 0;
+    esp_err_t ret = get_storage_region_unsafe(kind, slot, &region_offset, &region_size);
+    if (ret != ESP_OK || offset > region_size || size > region_size - offset) {
+        return ret != ESP_OK ? ret : ESP_ERR_INVALID_SIZE;
+    }
+    if (size == 0) {
+        return ESP_OK;
+    }
+
+    const uint32_t block_size = storage->block_size();
+    if (block_size == 0 || on9kvdb_def::format_alignment % block_size != 0 || offset % block_size != 0 ||
+        size % block_size != 0) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    uint64_t absolute_offset = 0;
+    if (!on9kvdb_def::checked_add_u64(region_offset, offset, &absolute_offset)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    const uint64_t block_count = size / block_size;
+    if (block_count > UINT32_MAX) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    return storage->write_blocks(absolute_offset / block_size, source, static_cast<uint32_t>(block_count));
+}
+
+esp_err_t on9kvdb::sync_storage_unsafe()
+{
+    return storage == nullptr ? ESP_ERR_INVALID_STATE : storage->sync();
+}
+
+esp_err_t on9kvdb::storage_region_is_blank_unsafe(bool *blank_out) const
+{
+    if (blank_out == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *blank_out = false;
+    if (io_frame == nullptr || storage == nullptr) {
+        return ESP_ERR_INVALID_STATE;
     }
 
     const on9kvdb_def::storage_geometry geometry = get_build_geometry();
-    if (total_bytes < geometry.provisioned_size) {
-        ESP_LOGE(TAG, "FATFS: volume is smaller than database geometry");
-        return ESP_ERR_NO_MEM;
+    const uint32_t block_size = storage->block_size();
+    if (block_size == 0 || on9kvdb_def::format_alignment % block_size != 0 || geometry.provisioned_size % block_size != 0) {
+        return ESP_ERR_INVALID_SIZE;
     }
 
-    *free_bytes_out = free_bytes;
-    return ESP_OK;
-}
-
-esp_err_t on9kvdb::validate_contiguous_file(const char *path, uint64_t size) const
-{
-    if (path == nullptr || size == 0 || size > on9kvdb_def::max_fat32_file_size) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    struct stat file_stat = {};
-    if (stat(path, &file_stat) != 0) {
-        ESP_LOGE(TAG, "File: stat(%s) failed: errno=%d", path, errno);
-        return ESP_ERR_INVALID_CRC;
-    }
-    if (!S_ISREG(file_stat.st_mode) || file_stat.st_size < 0 || static_cast<uint64_t>(file_stat.st_size) != size) {
-        ESP_LOGE(TAG, "File: invalid type or size for %s", path);
-        return ESP_ERR_INVALID_CRC;
-    }
-
-    bool contiguous = false;
-    const esp_err_t ret = esp_vfs_fat_test_contiguous_file(file_path, path, &contiguous);
-    if (ret != ESP_OK || !contiguous) {
-        ESP_LOGE(TAG, "File: non-contiguous %s: ret=0x%x", path, ret);
-        return ret == ESP_OK ? ESP_ERR_INVALID_CRC : ret;
-    }
-
-    return ESP_OK;
-}
-
-esp_err_t on9kvdb::provision_contiguous_file(const char *path, uint64_t size, bool *created_out) const
-{
-    if (path == nullptr || created_out == nullptr || size == 0 || size > on9kvdb_def::max_fat32_file_size) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    *created_out = false;
-    struct stat file_stat = {};
-    const int stat_result = stat(path, &file_stat);
-    if (stat_result == 0 && file_stat.st_size > 0) {
-        return validate_contiguous_file(path, size);
-    }
-    if (stat_result == 0 && !S_ISREG(file_stat.st_mode)) {
-        return ESP_ERR_INVALID_CRC;
-    }
-    if (stat_result != 0 && errno != ENOENT) {
-        ESP_LOGE(TAG, "File: stat(%s) failed: errno=%d", path, errno);
-        return ESP_FAIL;
-    }
-
-    uint64_t free_bytes = 0;
-    esp_err_t ret = validate_fatfs_mount(&free_bytes);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-    if (free_bytes < size) {
-        return ESP_ERR_NO_MEM;
-    }
-
-    errno = 0;
-    ret = esp_vfs_fat_create_contiguous_file(file_path, path, size, true);
-    if (ret != ESP_OK) {
-        const int create_errno = errno;
-        ESP_LOGE(TAG,
-                 "File: contiguous create failed for %s: "
-                 "ret=0x%x errno=%d",
-                 path, ret, create_errno);
-        return create_errno == ENOSPC ? ESP_ERR_NO_MEM : ret;
-    }
-
-    *created_out = true;
-    return validate_contiguous_file(path, size);
-}
-
-esp_err_t on9kvdb::open_file(const char *path, int *fd_out) const
-{
-    if (path == nullptr || fd_out == nullptr) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    const int opened_fd = ::open(path, O_RDWR);
-    if (opened_fd < 0) {
-        ESP_LOGE(TAG,
-                 "File: open(%s) failed: errno=%d; "
-                 "check FATFS max_files",
-                 path, errno);
-        return ESP_FAIL;
-    }
-
-    *fd_out = opened_fd;
-    return ESP_OK;
-}
-
-esp_err_t on9kvdb::read_exact_fd(int file_fd, uint64_t file_size, uint64_t offset, void *buf_out, size_t len) const
-{
-    if (len == 0) {
-        return ESP_OK;
-    }
-    if (file_fd < 0 || buf_out == nullptr || len > file_size || offset > file_size - len ||
-        offset > static_cast<uint64_t>(std::numeric_limits<off_t>::max())) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    uint8_t *out = static_cast<uint8_t *>(buf_out);
-    size_t remaining = len;
-    uint64_t position = offset;
-    while (remaining > 0) {
-        const ssize_t result = pread(file_fd, out, remaining, static_cast<off_t>(position));
-        if (result < 0 && errno == EINTR) {
-            continue;
+    // A raw range has no mount/format operation to distinguish first use from
+    // an unknown existing image. Accept only one uniformly erased byte value
+    // over the entire configured range, so a wrong first LBA can never cause
+    // init() to overwrite another owner's data based on a blank first sector.
+    bool blank_value_known = false;
+    uint8_t blank_value = 0;
+    const uint64_t blocks_per_frame = on9kvdb_def::format_alignment / block_size;
+    const uint64_t frame_count = geometry.provisioned_size / on9kvdb_def::format_alignment;
+    for (uint64_t frame = 0; frame < frame_count; frame += 1U) {
+        const esp_err_t ret = storage->read_blocks(frame * blocks_per_frame, io_frame, static_cast<uint32_t>(blocks_per_frame));
+        if (ret != ESP_OK) {
+            return ret;
         }
-        if (result <= 0) {
-            ESP_LOGE(TAG, "File: exact read failed: errno=%d", errno);
-            return ESP_FAIL;
+        for (size_t index = 0; index < on9kvdb_def::format_alignment; index += 1U) {
+            if (!blank_value_known) {
+                blank_value = io_frame[index];
+                blank_value_known = blank_value == 0 || blank_value == UINT8_MAX;
+            }
+            if (!blank_value_known || io_frame[index] != blank_value) {
+                return ESP_OK;
+            }
         }
-
-        out += result;
-        remaining -= static_cast<size_t>(result);
-        position += static_cast<size_t>(result);
-    }
-
-    return ESP_OK;
-}
-
-esp_err_t on9kvdb::write_exact_fd(int file_fd, uint64_t file_size, uint64_t offset, const void *buf, size_t len) const
-{
-    if (len == 0) {
-        return ESP_OK;
-    }
-    if (file_fd < 0 || buf == nullptr || len > file_size || offset > file_size - len ||
-        offset > static_cast<uint64_t>(std::numeric_limits<off_t>::max())) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    const uint8_t *in = static_cast<const uint8_t *>(buf);
-    size_t remaining = len;
-    uint64_t position = offset;
-    while (remaining > 0) {
-        const ssize_t result = pwrite(file_fd, in, remaining, static_cast<off_t>(position));
-        if (result < 0 && errno == EINTR) {
-            continue;
+        if ((frame + 1U) % 128U == 0U) {
+            vTaskDelay(1);
         }
-        if (result <= 0) {
-            ESP_LOGE(TAG, "File: exact write failed: errno=%d", errno);
-            return ESP_FAIL;
-        }
-
-        in += result;
-        remaining -= static_cast<size_t>(result);
-        position += static_cast<size_t>(result);
     }
-
-    return ESP_OK;
-}
-
-esp_err_t on9kvdb::sync_fd(int file_fd) const
-{
-    if (file_fd < 0 || fsync(file_fd) != 0) {
-        ESP_LOGE(TAG, "File: fsync failed: errno=%d", errno);
-        return ESP_FAIL;
-    }
-
+    *blank_out = blank_value_known;
     return ESP_OK;
 }

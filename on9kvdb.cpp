@@ -1,8 +1,6 @@
 #include <inttypes.h>
-#include <limits>
 #include <cstring>
 #include <new>
-#include <unistd.h>
 
 #include <esp_heap_caps.h>
 #include <esp_log.h>
@@ -61,13 +59,11 @@ static_assert(static_cast<uint64_t>(on9kvdb_def::manifest_file_size) +
                   static_cast<uint64_t>(on9kvdb_def::value_bank_count) * CONFIG_ON9KVDB_VALUE_BANK_SIZE ==
               CONFIG_ON9KVDB_PROVISIONED_DATABASE_SIZE);
 
-#if !defined(CONFIG_FATFS_SECTOR_512) && !defined(CONFIG_FATFS_SECTOR_4096)
-#error "on9kvdb v1 requires ESP-IDF FATFS 512-byte or 4096-byte sectors"
-#endif
-
 namespace
 {
-    static const constexpr size_t internal_io_bytes = on9kvdb_def::wal_frame_size * (2U + CONFIG_ON9KVDB_MAX_VALUE_READERS);
+    // One frame is the encoded-I/O scratch, one is used for unaligned read-modify-copy transfers, then readers and the
+    // single writer each retain a private 4 KiB value chunk. Every byte is allocated only during init().
+    static const constexpr size_t internal_io_bytes = on9kvdb_def::wal_frame_size * (3U + CONFIG_ON9KVDB_MAX_VALUE_READERS);
     static const constexpr size_t table_sort_bytes = CONFIG_ON9KVDB_MEMTABLE_ENTRY_COUNT * sizeof(uint32_t);
     static const constexpr size_t table_scratch_bytes = table_sort_bytes + 2U * CONFIG_ON9KVDB_SSTABLE_BLOCK_SIZE;
     static const constexpr size_t manifest_scratch_bytes = 2U * sizeof(on9kvdb_def::manifest_record);
@@ -95,14 +91,10 @@ namespace
     }
 }
 
-on9kvdb::on9kvdb(const char *_file_path, const on9kvdb_cfg *config) : file_path(_file_path)
+on9kvdb::on9kvdb(on9kvdb_io *new_storage, const on9kvdb_cfg *config) : storage(new_storage)
 {
     if (config != nullptr) {
         cfg = *config;
-    }
-
-    for (size_t idx = 0; idx < storage_fd_count; idx += 1) {
-        storage_fds[idx] = -1;
     }
 }
 
@@ -221,7 +213,7 @@ esp_err_t on9kvdb::create_locks()
 
 esp_err_t on9kvdb::validate_init_args() const
 {
-    if (file_path == nullptr || file_path[0] != '/') {
+    if (storage == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
     if (cfg.runtime_memory_budget < minimum_runtime_memory_budget() ||
@@ -231,10 +223,11 @@ esp_err_t on9kvdb::validate_init_args() const
 
     const on9kvdb_def::storage_geometry geometry = get_build_geometry();
     const on9kvdb_def::logical_limits limits = get_build_limits();
-    if (!on9kvdb_def::validate_compaction_capacity(geometry, limits) ||
-        geometry.manifest_size > static_cast<uint64_t>(std::numeric_limits<off_t>::max()) ||
-        geometry.wal_size > static_cast<uint64_t>(std::numeric_limits<off_t>::max()) ||
-        geometry.table_size > static_cast<uint64_t>(std::numeric_limits<off_t>::max())) {
+    const uint32_t block_size = storage->block_size();
+    const uint64_t block_count = storage->block_count();
+    if (!on9kvdb_def::validate_compaction_capacity(geometry, limits) || block_size == 0 ||
+        block_size > on9kvdb_def::format_alignment || on9kvdb_def::format_alignment % block_size != 0 ||
+        geometry.provisioned_size % block_size != 0 || block_count < geometry.provisioned_size / block_size) {
         return ESP_ERR_INVALID_SIZE;
     }
 
@@ -254,8 +247,8 @@ esp_err_t on9kvdb::allocate_runtime_memory()
     }
     memset(io_frame, 0, internal_io_bytes);
     value_reader_buffers = io_frame + on9kvdb_def::wal_frame_size;
-    value_writer_buffer =
-        value_reader_buffers + static_cast<size_t>(CONFIG_ON9KVDB_MAX_VALUE_READERS) * on9kvdb_def::value_chunk_size;
+    io_bounce = value_reader_buffers + static_cast<size_t>(CONFIG_ON9KVDB_MAX_VALUE_READERS) * on9kvdb_def::value_chunk_size;
+    value_writer_buffer = io_bounce + on9kvdb_def::wal_frame_size;
 
     runtime_arena_size = cfg.runtime_memory_budget - internal_io_bytes;
     uint32_t arena_caps = MALLOC_CAP_8BIT;
@@ -372,18 +365,7 @@ esp_err_t on9kvdb::allocate_runtime_memory()
 
 esp_err_t on9kvdb::initialise_storage()
 {
-    uint64_t free_bytes = 0;
-    esp_err_t ret = validate_fatfs_mount(&free_bytes);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-
-    ret = build_manifest_path();
-    if (ret != ESP_OK) {
-        return ret;
-    }
-
-    ret = setup_manifest();
+    esp_err_t ret = setup_manifest();
     if (ret != ESP_OK) {
         return ret;
     }
@@ -393,7 +375,7 @@ esp_err_t on9kvdb::initialise_storage()
         return ret;
     }
 
-    return verify_canonical_file_set(false);
+    return ESP_OK;
 }
 
 esp_err_t on9kvdb::finish_initialisation()
@@ -495,6 +477,7 @@ void on9kvdb::reset_runtime_state_unsafe()
     runtime_arena_size = 0;
     io_frame = nullptr;
     value_reader_buffers = nullptr;
+    io_bounce = nullptr;
     value_writer_buffer = nullptr;
     namespaces = nullptr;
     handles = nullptr;
@@ -522,18 +505,10 @@ void on9kvdb::reset_runtime_state_unsafe()
 
 void on9kvdb::close_storage_unsafe()
 {
-    for (size_t idx = 0; idx < storage_fd_count; idx += 1) {
-        if (storage_fds[idx] >= 0) {
-            (void)::close(storage_fds[idx]);
-            storage_fds[idx] = -1;
-        }
-    }
-
     manifest = {};
     manifest_slot = 0;
     manifest_valid_copy_count = 0;
     manifest_stabilization_required = false;
-    manifest_path[0] = '\0';
     reset_runtime_state_unsafe();
 }
 

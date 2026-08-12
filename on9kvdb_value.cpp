@@ -138,9 +138,8 @@ esp_err_t on9kvdb::fill_reader_buffer_unsafe(value_reader_slot *reader)
     }
 
     uint8_t *buffer = value_reader_buffers + static_cast<size_t>(reader_index) * on9kvdb_def::value_chunk_size;
-    const int file_fd = storage_fds[descriptor_index(on9kvdb_def::file_kind::value_bank, reader->external_value.bank_slot)];
-    esp_err_t ret =
-        read_exact_fd(file_fd, manifest.geometry.value_bank_size, chunk_offset, buffer, on9kvdb_def::value_chunk_size);
+    esp_err_t ret = read_storage_bytes_unsafe(on9kvdb_def::file_kind::value_bank, reader->external_value.bank_slot, chunk_offset,
+                                              buffer, on9kvdb_def::value_chunk_size);
     if (ret != ESP_OK) {
         return ret;
     }
@@ -423,9 +422,8 @@ esp_err_t on9kvdb::flush_value_writer_chunk_unsafe(value_writer_slot *writer, bo
         !on9kvdb_def::encode_value_chunk(io_frame, on9kvdb_def::value_chunk_size, header, value_writer_buffer)) {
         return ESP_ERR_INVALID_STATE;
     }
-    const int file_fd = storage_fds[descriptor_index(on9kvdb_def::file_kind::value_bank, writer->reference.bank_slot)];
-    esp_err_t ret = write_exact_fd(file_fd, manifest.geometry.value_bank_size, writer->next_chunk_offset, io_frame,
-                                   on9kvdb_def::value_chunk_size);
+    esp_err_t ret = write_storage_bytes_unsafe(on9kvdb_def::file_kind::value_bank, writer->reference.bank_slot,
+                                               writer->next_chunk_offset, io_frame, on9kvdb_def::value_chunk_size);
     if (ret != ESP_OK) {
         return ret;
     }
@@ -460,14 +458,12 @@ esp_err_t on9kvdb::copy_external_value_unsafe(const on9kvdb_def::value_ref &sour
     destination.bank_generation = destination_generation;
     destination.first_chunk_offset = *destination_tail;
 
-    const int source_fd = storage_fds[descriptor_index(on9kvdb_def::file_kind::value_bank, source.bank_slot)];
-    const int destination_fd = storage_fds[descriptor_index(on9kvdb_def::file_kind::value_bank, destination_bank)];
     uint32_t checksum_state = UINT32_MAX;
     uint32_t output_offset = destination.first_chunk_offset;
     for (uint64_t index = 0; index < chunk_count; index += 1U) {
         const uint64_t input_offset = static_cast<uint64_t>(source.first_chunk_offset) + index * on9kvdb_def::value_chunk_size;
-        esp_err_t ret =
-            read_exact_fd(source_fd, manifest.geometry.value_bank_size, input_offset, io_frame, on9kvdb_def::value_chunk_size);
+        esp_err_t ret = read_storage_bytes_unsafe(on9kvdb_def::file_kind::value_bank, source.bank_slot, input_offset, io_frame,
+                                                  on9kvdb_def::value_chunk_size);
         if (ret != ESP_OK) {
             return ret;
         }
@@ -500,8 +496,8 @@ esp_err_t on9kvdb::copy_external_value_unsafe(const on9kvdb_def::value_ref &sour
         if (!on9kvdb_def::encode_value_chunk(value_writer_buffer, on9kvdb_def::value_chunk_size, output_header, payload)) {
             return ESP_ERR_INVALID_STATE;
         }
-        ret = write_exact_fd(destination_fd, manifest.geometry.value_bank_size, output_offset, value_writer_buffer,
-                             on9kvdb_def::value_chunk_size);
+        ret = write_storage_bytes_unsafe(on9kvdb_def::file_kind::value_bank, destination_bank, output_offset, value_writer_buffer,
+                                         on9kvdb_def::value_chunk_size);
         if (ret != ESP_OK) {
             return ret;
         }

@@ -5,6 +5,7 @@ idf_component_register(
             "on9kvdb_compaction.cpp"
             "on9kvdb_format.cpp"
             "on9kvdb_io.cpp"
+            "on9kvdb_io_sdmmc.cpp"
             "on9kvdb_manifest.cpp"
             "on9kvdb_memtable.cpp"
             "on9kvdb_table.cpp"
@@ -18,10 +19,12 @@ idf_component_register(
             "esp_common"
             "esp_system"
             "esp_timer"
-            "fatfs"
+            "esp_driver_sdmmc"
+            "esp_psram"
             "freertos"
             "heap"
             "log"
+            "sdmmc"
 )
 
 target_compile_options(${COMPONENT_LIB} PRIVATE

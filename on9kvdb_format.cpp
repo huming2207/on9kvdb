@@ -791,7 +791,7 @@ bool on9kvdb_def::encode_file_identity(uint8_t *buf, size_t buf_len, const file_
     const uint32_t magic = magic_for_kind(identity.kind);
     if (buf == nullptr || buf_len < file_identity_size || magic == 0 || identity.kind == file_kind::manifest ||
         identity.generation == 0 || identity.database_id == 0 || identity.file_size <= identity_region_size ||
-        identity.file_size > max_fat32_file_size || identity.file_size % format_alignment != 0) {
+        identity.file_size > max_storage_object_size || identity.file_size % format_alignment != 0) {
         return false;
     }
 
@@ -838,7 +838,7 @@ on9kvdb_def::format_status on9kvdb_def::decode_file_identity(const uint8_t *buf,
 
     identity.generation = prefix.generation;
     identity.kind = expected_kind;
-    if (identity.database_id == 0 || identity.file_size <= identity_region_size || identity.file_size > max_fat32_file_size ||
+    if (identity.database_id == 0 || identity.file_size <= identity_region_size || identity.file_size > max_storage_object_size ||
         identity.file_size % format_alignment != 0 || !is_zero_range(buf, 48, 4)) {
         return format_status::corrupt;
     }
@@ -1365,7 +1365,7 @@ bool on9kvdb_def::encode_table_entry(uint8_t *buf, size_t buf_len, size_t offset
         (((entry.flags & table_entry_flag_tombstone) != 0) &&
          (entry.value_size != 0 || (entry.flags & table_entry_flag_external_value) != 0)) ||
         (((entry.flags & table_entry_flag_external_value) != 0) &&
-         !value_ref_is_valid(entry.external_value, static_cast<uint32_t>(max_fat32_file_size)))) {
+         !value_ref_is_valid(entry.external_value, static_cast<uint32_t>(max_storage_object_size)))) {
         return false;
     }
     const bool external = (entry.flags & table_entry_flag_external_value) != 0;
@@ -1431,8 +1431,8 @@ on9kvdb_def::format_status on9kvdb_def::decode_table_entry(const uint8_t *buf, s
     const uint32_t encoded_value_size = external ? value_ref_encoded_size : entry.value_size;
     const uint32_t meaningful_size = table_entry_header_size + entry.namespace_size + entry.key_size + encoded_value_size;
     if (entry.transaction_sequence == 0 || entry.total_size < meaningful_size || entry.total_size % 8 != 0 ||
-        !is_range_valid(buf_len, offset, entry.total_size) || entry.value_size > max_value_len ||
-        entry.reserved0 != 0 || (entry.flags & ~(table_entry_flag_tombstone | table_entry_flag_external_value)) != 0 ||
+        !is_range_valid(buf_len, offset, entry.total_size) || entry.value_size > max_value_len || entry.reserved0 != 0 ||
+        (entry.flags & ~(table_entry_flag_tombstone | table_entry_flag_external_value)) != 0 ||
         (((entry.flags & table_entry_flag_tombstone) != 0) && (entry.value_size != 0 || external)) ||
         !read_u32_le(buf, buf_len, offset + 20, &record_checksum) ||
         record_checksum != calc_record_crc(buf + offset, entry.total_size, 20)) {
@@ -1453,7 +1453,7 @@ on9kvdb_def::format_status on9kvdb_def::decode_table_entry(const uint8_t *buf, s
             return format_status::corrupt;
         }
         entry.external_value.value_size = entry.value_size;
-        if (!value_ref_is_valid(entry.external_value, static_cast<uint32_t>(max_fat32_file_size))) {
+        if (!value_ref_is_valid(entry.external_value, static_cast<uint32_t>(max_storage_object_size))) {
             return format_status::corrupt;
         }
         entry.value = nullptr;

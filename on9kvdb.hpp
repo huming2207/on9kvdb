@@ -10,6 +10,7 @@
 #include <sdkconfig.h>
 
 #include "on9kvdb_defs.hpp"
+#include "on9kvdb_io.hpp"
 
 /**
  * @brief Access permissions requested when opening a namespace.
@@ -182,14 +183,14 @@ struct on9kvdb_stats {
     uint64_t last_compaction_time_us = 0;         /**< Duration of the most recent compaction. */
     uint64_t maximum_compaction_time_us = 0;      /**< Longest compaction duration observed. */
     uint64_t logical_state_capacity_bytes = 0;    /**< Configured maximum logical-state capacity. */
-    uint64_t wal_record_capacity_bytes = 0;       /**< Total record payload capacity of referenced WAL files. */
-    uint64_t provisioned_database_bytes = 0;      /**< Total fixed database storage provisioned on the volume. */
+    uint64_t wal_record_capacity_bytes = 0;       /**< Total record payload capacity of referenced WAL slots. */
+    uint64_t provisioned_database_bytes = 0;      /**< Total fixed database storage provisioned in the raw block range. */
     uint64_t runtime_memory_bytes = 0;            /**< Runtime arena budget selected at construction. */
     uint64_t runtime_scratch_bytes = 0;           /**< Runtime arena bytes reserved for future scratch work. */
     uint64_t manifest_generation = 0;             /**< Generation of the selected manifest copy. */
     uint64_t safe_checkpoint_sequence = 0;        /**< Highest transaction checkpointed into SSTables. */
     uint32_t active_table_count = 0;              /**< Number of SSTables referenced by the manifest. */
-    uint32_t referenced_wal_count = 0;            /**< Number of WAL files referenced by the manifest. */
+    uint32_t referenced_wal_count = 0;            /**< Number of WAL slots referenced by the manifest. */
     uint32_t valid_manifest_copy_count = 0;       /**< Number of independently valid manifest copies. */
     uint32_t active_table_bank = 0;               /**< Currently published SSTable-bank index. */
     uint32_t active_wal_slot = 0;                 /**< WAL slot receiving the next committed transaction. */
@@ -203,15 +204,16 @@ public:
     /**
      * @brief Construct an uninitialized database instance.
      *
-     * @param file_path Base directory on an already mounted FATFS volume.
-     * The pointed-to string must remain valid until deinit() completes.
+     * @param storage Exclusive raw block device. It must be initialized before
+     * init(), remain valid until deinit() completes, and expose at least the
+     * configured provisioned database capacity.
      * @param config Optional runtime-memory configuration. Passing @c nullptr
      * selects the Kconfig default.
      *
      * @note Construction performs no allocation or storage I/O. Call init()
      * before any other database operation.
      */
-    explicit on9kvdb(const char *file_path, const on9kvdb_cfg *config);
+    explicit on9kvdb(on9kvdb_io *storage, const on9kvdb_cfg *config);
 
     /**
      * @brief Release database resources.
@@ -634,7 +636,6 @@ private:
     };
 
     struct table_build_state {
-        int file_fd = -1;
         uint8_t *data_block = nullptr;
         uint8_t *index_block = nullptr;
         uint64_t generation = 0;
@@ -727,9 +728,9 @@ private: // Manifest and provisioning
     esp_err_t stabilize_manifest_unsafe();
     esp_err_t provision_all_data_files();
     esp_err_t provision_one_data_file(on9kvdb_def::file_kind kind, uint32_t slot);
-    esp_err_t load_file_identity(int file_fd, on9kvdb_def::file_kind kind, uint32_t slot,
+    esp_err_t load_file_identity(on9kvdb_def::file_kind kind, uint32_t slot,
                                  bool valid_copies[on9kvdb_def::identity_slot_count]) const;
-    esp_err_t write_file_identity_copy(int file_fd, on9kvdb_def::file_kind kind, uint32_t slot, uint32_t copy_slot) const;
+    esp_err_t write_file_identity_copy(on9kvdb_def::file_kind kind, uint32_t slot, uint32_t copy_slot);
 
 private: // WAL
     esp_err_t initialise_first_wal();
@@ -737,7 +738,7 @@ private: // WAL
     esp_err_t load_wal_header(uint32_t slot, uint64_t expected_generation, on9kvdb_def::wal_header *header_out) const;
     esp_err_t recover_wal();
     esp_err_t scan_wal_slot(uint32_t slot, uint64_t generation, uint64_t *expected_sequence);
-    esp_err_t find_later_wal_frame_unsafe(int wal_fd, uint32_t start_offset, uint32_t region_end, uint64_t generation,
+    esp_err_t find_later_wal_frame_unsafe(uint32_t slot, uint32_t start_offset, uint32_t region_end, uint64_t generation,
                                           uint64_t minimum_sequence, bool *found_out);
     esp_err_t rotate_wal_unsafe();
     esp_err_t append_transaction_unsafe(transaction_slot *transaction, const handle_slot &handle);
@@ -793,32 +794,22 @@ private: // Memtable and namespace registry
     esp_err_t apply_transaction_to_memtable_unsafe(const transaction_slot &transaction, uint16_t namespace_slot_index,
                                                    uint64_t transaction_sequence);
 
-private: // FATFS and bounded I/O
-    esp_err_t build_manifest_path();
-    esp_err_t build_data_path(on9kvdb_def::file_kind kind, uint32_t slot, char *path_out, size_t path_out_len) const;
-    esp_err_t verify_canonical_file_set(bool creating) const;
-    esp_err_t validate_fatfs_mount(uint64_t *free_bytes_out) const;
-    esp_err_t provision_contiguous_file(const char *path, uint64_t size, bool *created_out) const;
-    esp_err_t validate_contiguous_file(const char *path, uint64_t size) const;
-    esp_err_t open_file(const char *path, int *fd_out) const;
-    esp_err_t read_exact_fd(int file_fd, uint64_t file_size, uint64_t offset, void *buf_out, size_t len) const;
-    esp_err_t write_exact_fd(int file_fd, uint64_t file_size, uint64_t offset, const void *buf, size_t len) const;
-    esp_err_t sync_fd(int file_fd) const;
-    static bool parse_slot_file_name(const char *name, const char *prefix, uint32_t *slot_out);
+private: // Raw block I/O and fixed logical regions
+    esp_err_t get_storage_region_unsafe(on9kvdb_def::file_kind kind, uint32_t slot, uint64_t *offset_out,
+                                        uint64_t *size_out) const;
+    esp_err_t read_storage_bytes_unsafe(on9kvdb_def::file_kind kind, uint32_t slot, uint64_t offset, void *destination,
+                                        size_t size) const;
+    esp_err_t write_storage_bytes_unsafe(on9kvdb_def::file_kind kind, uint32_t slot, uint64_t offset, const void *source,
+                                         size_t size);
+    esp_err_t sync_storage_unsafe();
+    esp_err_t storage_region_is_blank_unsafe(bool *blank_out) const;
 
 private:
     static on9kvdb_def::storage_geometry get_build_geometry();
     static on9kvdb_def::logical_limits get_build_limits();
-    static size_t descriptor_index(on9kvdb_def::file_kind kind, uint32_t slot);
 
-private:
-    static const constexpr size_t storage_fd_count =
-        1U + on9kvdb_def::wal_file_count + CONFIG_ON9KVDB_SSTABLE_COUNT + on9kvdb_def::value_bank_count;
-
-    const char *file_path = nullptr;
+    on9kvdb_io *storage = nullptr;
     on9kvdb_cfg cfg = {};
-    char manifest_path[PATH_MAX] = {};
-    int storage_fds[storage_fd_count] = {};
     on9kvdb_def::manifest_record manifest = {};
     uint32_t manifest_slot = 0;
     uint32_t manifest_valid_copy_count = 0;
@@ -830,6 +821,7 @@ private:
     void *runtime_arena = nullptr;
     size_t runtime_arena_size = 0;
     uint8_t *io_frame = nullptr;
+    uint8_t *io_bounce = nullptr;
     uint8_t *value_reader_buffers = nullptr;
     uint8_t *value_writer_buffer = nullptr;
     namespace_slot *namespaces = nullptr;

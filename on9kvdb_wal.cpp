@@ -57,7 +57,6 @@ esp_err_t on9kvdb::ensure_wal_header(uint32_t slot, uint64_t generation, uint64_
     header.frame_size = on9kvdb_def::wal_frame_size;
     header.state = on9kvdb_def::wal_header_state_active;
 
-    const int wal_fd = storage_fds[descriptor_index(on9kvdb_def::file_kind::wal, slot)];
     esp_err_t ret = ESP_OK;
     for (uint32_t copy_slot = 0; copy_slot < on9kvdb_def::wal_header_slot_count; copy_slot += 1) {
         memset(io_frame, 0, on9kvdb_def::wal_header_slot_size);
@@ -67,13 +66,13 @@ esp_err_t on9kvdb::ensure_wal_header(uint32_t slot, uint64_t generation, uint64_
 
         const uint64_t offset =
             on9kvdb_def::wal_header_region_offset + static_cast<uint64_t>(copy_slot) * on9kvdb_def::wal_header_slot_size;
-        ret = write_exact_fd(wal_fd, manifest.geometry.wal_size, offset, io_frame, on9kvdb_def::wal_header_slot_size);
+        ret = write_storage_bytes_unsafe(on9kvdb_def::file_kind::wal, slot, offset, io_frame, on9kvdb_def::wal_header_slot_size);
         if (ret != ESP_OK) {
             return ret;
         }
     }
     // The generation remains unreachable until its manifest publication. Make both redundant headers durable together.
-    return sync_fd(wal_fd);
+    return sync_storage_unsafe();
 }
 
 esp_err_t on9kvdb::initialise_first_wal()
@@ -87,14 +86,13 @@ esp_err_t on9kvdb::load_wal_header(uint32_t slot, uint64_t expected_generation, 
         return ESP_ERR_INVALID_ARG;
     }
 
-    const int wal_fd = storage_fds[descriptor_index(on9kvdb_def::file_kind::wal, slot)];
     bool found = false;
     on9kvdb_def::wal_header selected = {};
     for (uint32_t copy_slot = 0; copy_slot < on9kvdb_def::wal_header_slot_count; copy_slot += 1) {
         uint8_t encoded[on9kvdb_def::wal_header_size] = {};
         const uint64_t offset =
             on9kvdb_def::wal_header_region_offset + static_cast<uint64_t>(copy_slot) * on9kvdb_def::wal_header_slot_size;
-        esp_err_t ret = read_exact_fd(wal_fd, manifest.geometry.wal_size, offset, encoded, sizeof(encoded));
+        esp_err_t ret = read_storage_bytes_unsafe(on9kvdb_def::file_kind::wal, slot, offset, encoded, sizeof(encoded));
         if (ret != ESP_OK) {
             return ret;
         }
@@ -325,7 +323,6 @@ esp_err_t on9kvdb::append_transaction_unsafe(transaction_slot *transaction_state
         return ESP_ERR_NO_MEM;
     }
 
-    const int wal_fd = storage_fds[descriptor_index(on9kvdb_def::file_kind::wal, active_slot)];
     uint32_t payload_offset = 0;
     for (uint32_t frame_index = 0; frame_index < frame_count; frame_index += 1) {
         const uint32_t frame_payload_size = payload_size - payload_offset < on9kvdb_def::wal_frame_payload_capacity
@@ -352,16 +349,16 @@ esp_err_t on9kvdb::append_transaction_unsafe(transaction_slot *transaction_state
             return ESP_ERR_INVALID_STATE;
         }
 
-        ret = write_exact_fd(wal_fd, manifest.geometry.wal_size,
-                             wal_tail[active_slot] + static_cast<uint64_t>(frame_index) * on9kvdb_def::wal_frame_size, io_frame,
-                             on9kvdb_def::wal_frame_size);
+        ret = write_storage_bytes_unsafe(on9kvdb_def::file_kind::wal, active_slot,
+                                         wal_tail[active_slot] + static_cast<uint64_t>(frame_index) * on9kvdb_def::wal_frame_size,
+                                         io_frame, on9kvdb_def::wal_frame_size);
         if (ret != ESP_OK) {
             return ret;
         }
         payload_offset += frame_payload_size;
     }
 
-    ret = sync_fd(wal_fd);
+    ret = sync_storage_unsafe();
     if (ret != ESP_OK) {
         return ret;
     }
@@ -503,11 +500,10 @@ esp_err_t on9kvdb::scan_wal_slot(uint32_t slot, uint64_t generation, uint64_t *e
         return ESP_ERR_INVALID_CRC;
     }
 
-    const int wal_fd = storage_fds[descriptor_index(on9kvdb_def::file_kind::wal, slot)];
     uint32_t offset = wal_header.record_region_start;
     uint32_t transactions_since_delay = 0;
     while (offset <= wal_header.record_region_end - on9kvdb_def::wal_frame_size) {
-        ret = read_exact_fd(wal_fd, manifest.geometry.wal_size, offset, io_frame, on9kvdb_def::wal_frame_size);
+        ret = read_storage_bytes_unsafe(on9kvdb_def::file_kind::wal, slot, offset, io_frame, on9kvdb_def::wal_frame_size);
         if (ret != ESP_OK) {
             return ret;
         }
@@ -522,7 +518,7 @@ esp_err_t on9kvdb::scan_wal_slot(uint32_t slot, uint64_t generation, uint64_t *e
         }
         if (first_status != on9kvdb_def::format_status::ok) {
             bool later_valid = false;
-            ret = find_later_wal_frame_unsafe(wal_fd, offset + on9kvdb_def::wal_frame_size, wal_header.record_region_end,
+            ret = find_later_wal_frame_unsafe(slot, offset + on9kvdb_def::wal_frame_size, wal_header.record_region_end,
                                               generation, *expected_sequence, &later_valid);
             if (ret != ESP_OK) {
                 return ret;
@@ -538,7 +534,7 @@ esp_err_t on9kvdb::scan_wal_slot(uint32_t slot, uint64_t generation, uint64_t *e
             // A valid frame from an older generation therefore marks the new generation's tail unless a later new-generation
             // frame proves that a hole exists.
             bool later_valid = false;
-            ret = find_later_wal_frame_unsafe(wal_fd, offset + on9kvdb_def::wal_frame_size, wal_header.record_region_end,
+            ret = find_later_wal_frame_unsafe(slot, offset + on9kvdb_def::wal_frame_size, wal_header.record_region_end,
                                               generation, *expected_sequence, &later_valid);
             if (ret != ESP_OK) {
                 return ret;
@@ -558,9 +554,9 @@ esp_err_t on9kvdb::scan_wal_slot(uint32_t slot, uint64_t generation, uint64_t *e
         uint32_t payload_offset = 0;
         uint32_t transaction_crc = UINT32_MAX;
         for (uint16_t frame_index = 0; frame_index < first.frame_count; frame_index += 1) {
-            ret = read_exact_fd(wal_fd, manifest.geometry.wal_size,
-                                offset + static_cast<uint32_t>(frame_index) * on9kvdb_def::wal_frame_size, io_frame,
-                                on9kvdb_def::wal_frame_size);
+            ret = read_storage_bytes_unsafe(on9kvdb_def::file_kind::wal, slot,
+                                            offset + static_cast<uint32_t>(frame_index) * on9kvdb_def::wal_frame_size, io_frame,
+                                            on9kvdb_def::wal_frame_size);
             if (ret != ESP_OK) {
                 return ret;
             }
@@ -581,7 +577,7 @@ esp_err_t on9kvdb::scan_wal_slot(uint32_t slot, uint64_t generation, uint64_t *e
                 frame.payload_size > first.transaction_payload_size - payload_offset) {
                 bool later_valid = false;
                 const uint32_t later_offset = offset + (static_cast<uint32_t>(frame_index) + 1U) * on9kvdb_def::wal_frame_size;
-                ret = find_later_wal_frame_unsafe(wal_fd, later_offset, wal_header.record_region_end, generation,
+                ret = find_later_wal_frame_unsafe(slot, later_offset, wal_header.record_region_end, generation,
                                                   *expected_sequence, &later_valid);
                 if (ret != ESP_OK) {
                     return ret;
@@ -601,7 +597,7 @@ esp_err_t on9kvdb::scan_wal_slot(uint32_t slot, uint64_t generation, uint64_t *e
         if (payload_offset != first.transaction_payload_size || ~transaction_crc != first.transaction_checksum) {
             bool later_valid = false;
             const uint32_t later_offset = offset + static_cast<uint32_t>(first.frame_count) * on9kvdb_def::wal_frame_size;
-            ret = find_later_wal_frame_unsafe(wal_fd, later_offset, wal_header.record_region_end, generation, *expected_sequence,
+            ret = find_later_wal_frame_unsafe(slot, later_offset, wal_header.record_region_end, generation, *expected_sequence,
                                               &later_valid);
             if (ret != ESP_OK) {
                 return ret;
@@ -676,10 +672,11 @@ esp_err_t on9kvdb::scan_wal_slot(uint32_t slot, uint64_t generation, uint64_t *e
     return ESP_OK;
 }
 
-esp_err_t on9kvdb::find_later_wal_frame_unsafe(int wal_fd, uint32_t start_offset, uint32_t region_end, uint64_t generation,
+esp_err_t on9kvdb::find_later_wal_frame_unsafe(uint32_t slot, uint32_t start_offset, uint32_t region_end, uint64_t generation,
                                                uint64_t minimum_sequence, bool *found_out)
 {
-    if (wal_fd < 0 || start_offset > region_end || generation == 0 || minimum_sequence == 0 || found_out == nullptr) {
+    if (slot >= on9kvdb_def::wal_file_count || start_offset > region_end || generation == 0 || minimum_sequence == 0 ||
+        found_out == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -687,7 +684,8 @@ esp_err_t on9kvdb::find_later_wal_frame_unsafe(int wal_fd, uint32_t start_offset
     uint32_t frames_since_delay = 0;
     for (uint32_t offset = start_offset; offset <= region_end - on9kvdb_def::wal_frame_size;
          offset += on9kvdb_def::wal_frame_size) {
-        esp_err_t ret = read_exact_fd(wal_fd, manifest.geometry.wal_size, offset, io_frame, on9kvdb_def::wal_frame_size);
+        esp_err_t ret =
+            read_storage_bytes_unsafe(on9kvdb_def::file_kind::wal, slot, offset, io_frame, on9kvdb_def::wal_frame_size);
         if (ret != ESP_OK) {
             return ret;
         }

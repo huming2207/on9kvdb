@@ -21,7 +21,7 @@ namespace on9kvdb_def
     static const constexpr uint32_t handle_slot_bits = 9;
     static const constexpr uint32_t handle_slot_mask = (UINT32_C(1) << handle_slot_bits) - 1U;
     static const constexpr uint32_t max_handle_generation = UINT32_MAX >> handle_slot_bits;
-    static const constexpr uint64_t max_fat32_file_size = UINT32_MAX;
+    static const constexpr uint64_t max_storage_object_size = UINT32_MAX;
     static const constexpr uint32_t format_alignment = 4096;
     static const constexpr uint32_t manifest_slot_size = format_alignment;
     static const constexpr uint32_t manifest_slot_count = 2;
@@ -55,7 +55,9 @@ namespace on9kvdb_def
     static const constexpr uint32_t value_chunk_header_size = 64;
     static const constexpr uint32_t value_chunk_payload_size = value_chunk_size - value_chunk_header_size;
 
-    static const constexpr uint16_t storage_revision = 6;
+    // Revision 7 replaces the old file-backed layout with one exclusive raw block-device range. Earlier images are
+    // deliberately rejected; the caller must select a blank raw range and provision it explicitly through init().
+    static const constexpr uint16_t storage_revision = 7;
     static const constexpr uint16_t geometry_revision = 2;
     static const constexpr uint16_t logical_limits_revision = 3;
     static const constexpr uint16_t wal_header_revision = 1;

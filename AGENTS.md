@@ -12,14 +12,14 @@ approved.
 
 ## Non-negotiable rules
 
-- Operate only on an application-mounted FATFS path. The component does not
-  mount, unmount, format, delete, migrate, resize, rename, or silently repair
-  database files.
+- Operate only on an application-owned exclusive `on9kvdb_io` block range.
+  The component does not initialize/deinitialize transports, mount, unmount,
+  format, partition, erase, migrate, resize, or silently repair media.
 - Persistent geometry and revisions fail closed. Existing geometry must match
   the running configuration exactly.
 - Preserve transaction durability: write and validate unreachable state,
-  synchronize it, publish it through a separately synchronized manifest, and
-  return commit success only after the WAL durability barrier.
+  synchronize it through `on9kvdb_io::sync()`, publish it through a separately
+  synchronized manifest, and return commit success only after the WAL barrier.
 - Never reuse a table or WAL slot while either valid manifest copy can still
   reference it.
 - Corruption returns an explicit typed error. It must never silently truncate
@@ -44,8 +44,8 @@ approved.
 ## Documentation map
 
 - [`doc/REQUIREMENTS.md`](doc/REQUIREMENTS.md): scope, mandatory constraints,
-  platform assumptions, memory rules, and WAL/memtable architecture.
-- [`doc/STORAGE_FORMAT.md`](doc/STORAGE_FORMAT.md): permanent files, manifest,
+  raw-block ownership, memory rules, and WAL/memtable architecture.
+- [`doc/STORAGE_FORMAT.md`](doc/STORAGE_FORMAT.md): raw regions, manifest,
   WAL, SSTable, publication, and reuse ordering.
 - [`doc/API_AND_RECOVERY.md`](doc/API_AND_RECOVERY.md): public behavior,
   logical model, provisioning, recovery, and concurrency.
