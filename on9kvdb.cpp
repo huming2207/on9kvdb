@@ -66,9 +66,16 @@ namespace
     static const constexpr size_t internal_io_bytes = on9kvdb_def::wal_frame_size * (3U + CONFIG_ON9KVDB_MAX_VALUE_READERS);
     static const constexpr size_t table_sort_bytes = CONFIG_ON9KVDB_MEMTABLE_ENTRY_COUNT * sizeof(uint32_t);
     static const constexpr size_t table_scratch_bytes = table_sort_bytes + 2U * CONFIG_ON9KVDB_SSTABLE_BLOCK_SIZE;
-    static const constexpr size_t manifest_scratch_bytes = 2U * sizeof(on9kvdb_def::manifest_record);
+    static const constexpr size_t manifest_snapshot_offset =
+        (sizeof(on9kvdb_def::manifest_record) + 15U) & ~static_cast<size_t>(15U);
+    static const constexpr size_t manifest_scratch_bytes =
+        manifest_snapshot_offset + sizeof(on9kvdb_def::manifest_record) +
+        on9kvdb_def::max_transaction_mutations * sizeof(on9kvdb_def::value_ref);
+    // WAL recovery temporarily stores the complete encoded transaction.  Each
+    // mutation has a 32-byte descriptor in addition to its key; only inline
+    // value bytes count toward TRANSACTION_STAGING_SIZE.
     static const constexpr size_t transaction_recovery_overhead =
-        8U + on9kvdb_def::max_name_len + on9kvdb_def::max_transaction_mutations * (8U + on9kvdb_def::max_name_len);
+        8U + on9kvdb_def::max_name_len + on9kvdb_def::max_transaction_mutations * (32U + on9kvdb_def::max_name_len);
 
     bool carve_arena(uint8_t **cursor, size_t *remaining, size_t alignment, size_t size, void **result_out)
     {
@@ -164,7 +171,8 @@ size_t on9kvdb::minimum_runtime_memory_budget()
         (alignof(value_writer_slot) - 1U) + sizeof(value_writer_slot) + (alignof(memtable_bucket) - 1U) +
         sizeof(memtable_bucket) * CONFIG_ON9KVDB_MEMTABLE_ENTRY_COUNT + (alignof(uint64_t) - 1U) +
         CONFIG_ON9KVDB_TRANSACTION_STAGING_SIZE + transaction_recovery_overhead + (alignof(uint64_t) - 1U) +
-        CONFIG_ON9KVDB_MEMTABLE_DATA_SIZE + (alignof(uint64_t) - 1U) + minimum_future_scratch_size();
+        CONFIG_ON9KVDB_MEMTABLE_DATA_SIZE + (alignof(table_key_filter_slot) - 1U) +
+        sizeof(table_key_filter_slot) * CONFIG_ON9KVDB_SSTABLE_COUNT + (alignof(uint64_t) - 1U) + minimum_future_scratch_size();
     return internal_io_bytes + arena_bytes;
 }
 
@@ -306,6 +314,11 @@ esp_err_t on9kvdb::allocate_runtime_memory()
     memtable_data = static_cast<uint8_t *>(allocation);
     allocation = nullptr;
 
+    all_carved = all_carved && carve_arena(&cursor, &remaining, alignof(table_key_filter_slot),
+                                           sizeof(table_key_filter_slot) * CONFIG_ON9KVDB_SSTABLE_COUNT, &allocation);
+    table_key_filters = static_cast<table_key_filter_slot *>(allocation);
+    allocation = nullptr;
+
     all_carved = all_carved && carve_arena(&cursor, &remaining, alignof(value_reader_slot),
                                            sizeof(value_reader_slot) * CONFIG_ON9KVDB_MAX_VALUE_READERS, &allocation);
     value_readers = static_cast<value_reader_slot *>(allocation);
@@ -315,8 +328,8 @@ esp_err_t on9kvdb::allocate_runtime_memory()
     value_writer = static_cast<value_writer_slot *>(allocation);
     allocation = nullptr;
 
-    // The approved default budget remains 100 KiB. A caller can opt into the fixed SSTable index cache and a stable lookup
-    // value buffer by supplying enough additional arena space; otherwise lookup retains its checked on-disk fallback.
+    // Use any arena space beyond the mandatory fixed structures for an SSTable index cache and a stable inline-value lookup
+    // buffer. If the configured budget cannot fit both, lookup retains its checked on-disk fallback.
     uint8_t *optional_cursor = cursor;
     size_t optional_remaining = remaining;
     void *optional_cache = nullptr;
@@ -359,6 +372,9 @@ esp_err_t on9kvdb::allocate_runtime_memory()
     for (uint32_t idx = 0; idx < CONFIG_ON9KVDB_MEMTABLE_ENTRY_COUNT; idx += 1) {
         new (&memtable_index[idx]) memtable_bucket{};
         memtable_index[idx].record_offset = UINT32_MAX;
+    }
+    for (uint32_t idx = 0; idx < CONFIG_ON9KVDB_SSTABLE_COUNT; idx += 1U) {
+        new (&table_key_filters[idx]) table_key_filter_slot{};
     }
     return ESP_OK;
 }
@@ -486,6 +502,7 @@ void on9kvdb::reset_runtime_state_unsafe()
     transaction_staging = nullptr;
     memtable_data = nullptr;
     table_index_cache = nullptr;
+    table_key_filters = nullptr;
     table_lookup_value = nullptr;
     future_scratch = nullptr;
     future_scratch_size = 0;

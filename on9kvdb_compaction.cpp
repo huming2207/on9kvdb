@@ -320,6 +320,10 @@ esp_err_t on9kvdb::append_compaction_entry_unsafe(compaction_output *output, con
             if (ret != ESP_OK) {
                 return ret;
             }
+            // The decoded name and key point into the destination record. The encoder clears that record before copying its
+            // fields, so use the cursor's stable key copy when rewriting the relocated external-value descriptor in place.
+            decoded.namespace_name = reinterpret_cast<const uint8_t *>(table_cursor->key.namespace_name);
+            decoded.key = reinterpret_cast<const uint8_t *>(table_cursor->key.key);
             decoded.external_value = relocated;
             if (!on9kvdb_def::encode_table_entry(output->build.data_block, manifest.limits.sstable_block_bytes,
                                                  destination_offset, decoded, &actual_size)) {
@@ -458,7 +462,12 @@ esp_err_t on9kvdb::compact_tables_unsafe()
     const size_t sort_bytes = static_cast<size_t>(CONFIG_ON9KVDB_MEMTABLE_ENTRY_COUNT) * sizeof(uint32_t);
     const size_t block_bytes = manifest.limits.sstable_block_bytes;
     const size_t cursor_offset = sort_bytes + 2U * block_bytes;
-    const size_t required_scratch = cursor_offset + bank_size * sizeof(compaction_cursor);
+    const size_t snapshot_offset = (sizeof(on9kvdb_def::manifest_record) + 15U) & ~static_cast<size_t>(15U);
+    const size_t relocation_offset = snapshot_offset + sizeof(on9kvdb_def::manifest_record);
+    const size_t relocation_bytes = on9kvdb_def::max_transaction_mutations * sizeof(on9kvdb_def::value_ref);
+    const size_t compaction_scratch = cursor_offset + bank_size * sizeof(compaction_cursor);
+    const size_t relocation_scratch = relocation_offset + relocation_bytes;
+    const size_t required_scratch = compaction_scratch > relocation_scratch ? compaction_scratch : relocation_scratch;
     if (future_scratch == nullptr || future_scratch_size < required_scratch ||
         manifest.next_table_generation > UINT64_MAX - bank_size || manifest.generation > UINT64_MAX - 2U ||
         manifest.active_value_bank >= on9kvdb_def::value_bank_count ||
@@ -700,7 +709,40 @@ esp_err_t on9kvdb::compact_tables_unsafe()
         return ret != ESP_OK ? ret : ESP_ERR_INVALID_STATE;
     }
 
-    const size_t snapshot_offset = (sizeof(on9kvdb_def::manifest_record) + 15U) & ~static_cast<size_t>(15U);
+    // A completed writer may have staged a value-bank descriptor in the
+    // current transaction before an unrelated flush/WAL rotation asks for a
+    // compaction.  The bank swap must relocate those not-yet-committed values
+    // as well; otherwise their later WAL record would point into the inactive
+    // bank, which a subsequent compaction is permitted to overwrite.
+    auto *relocated_staged = reinterpret_cast<on9kvdb_def::value_ref *>(future_scratch + relocation_offset);
+    for (uint16_t mutation_index = 0; mutation_index < on9kvdb_def::max_transaction_mutations; mutation_index += 1U) {
+        new (&relocated_staged[mutation_index]) on9kvdb_def::value_ref{};
+    }
+    if (transaction != nullptr && transaction->active) {
+        for (uint16_t mutation_index = 0; mutation_index < transaction->mutation_count; mutation_index += 1U) {
+            const mutation_slot &mutation = transaction->mutations[mutation_index];
+            if (!mutation.external_value) {
+                continue;
+            }
+            if (mutation.external_value_ref.bank_slot != manifest.active_value_bank ||
+                mutation.external_value_ref.bank_generation != manifest.value_bank_generation[manifest.active_value_bank]) {
+                ret = ESP_ERR_INVALID_STATE;
+                break;
+            }
+            ret = copy_external_value_unsafe(mutation.external_value_ref, destination_value_bank, destination_value_generation,
+                                             &destination_value_tail, &relocated_staged[mutation_index]);
+            if (ret != ESP_OK) {
+                break;
+            }
+        }
+    }
+    if (ret != ESP_OK) {
+        for (uint32_t slot = output_start; slot < output_start + bank_size; slot += 1U) {
+            manifest.tables[slot] = {};
+        }
+        return ret;
+    }
+
     if (future_scratch_size < snapshot_offset + sizeof(on9kvdb_def::manifest_record)) {
         for (uint32_t slot = output_start; slot < output_start + bank_size; slot += 1) {
             manifest.tables[slot] = {};
@@ -734,6 +776,14 @@ esp_err_t on9kvdb::compact_tables_unsafe()
             manifest.tables[slot] = {};
         }
         return ret;
+    }
+
+    if (transaction != nullptr && transaction->active) {
+        for (uint16_t mutation_index = 0; mutation_index < transaction->mutation_count; mutation_index += 1U) {
+            if (transaction->mutations[mutation_index].external_value) {
+                transaction->mutations[mutation_index].external_value_ref = relocated_staged[mutation_index];
+            }
+        }
     }
 
     reset_memtable_unsafe();

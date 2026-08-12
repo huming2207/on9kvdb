@@ -15,7 +15,7 @@ namespace on9kvdb_def
     static const constexpr uint32_t max_value_len = UINT32_MAX - 1U;
     static const constexpr uint32_t inline_value_len = CONFIG_ON9KVDB_INLINE_VALUE_SIZE;
     static const constexpr size_t max_transaction_mutations = 10;
-    static const constexpr size_t runtime_memory_budget_default = 100U * 1024U;
+    static const constexpr size_t runtime_memory_budget_default = 140U * 1024U;
     static const constexpr size_t runtime_memory_budget_max = 200U * 1024U - 1U;
     static const constexpr uint32_t handle_slot_capacity = 256;
     static const constexpr uint32_t handle_slot_bits = 9;

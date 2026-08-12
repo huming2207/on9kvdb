@@ -427,6 +427,29 @@ bool on9kvdb_def::validate_compaction_capacity(const storage_geometry &geometry,
     }
     const uint64_t block_payload_bytes = limits.sstable_block_bytes - table_block_header_size;
 
+    // Chunk allocation has its highest physical/logical ratio at the smallest
+    // external value.  Reserve enough bank space for the conservative case in
+    // which the complete logical-state budget consists of such records.  This
+    // prevents accepting a geometry that can fill SSTables with a live set
+    // which can never be copied into the other value bank.
+    const uint64_t minimum_external_value = static_cast<uint64_t>(limits.inline_value_bytes) + 1U;
+    const uint64_t minimum_external_record = (table_entry_header_size + 2U + minimum_external_value + 7U) & ~UINT64_C(7);
+    const uint64_t chunks_per_minimum_value = (minimum_external_value + value_chunk_payload_size - 1U) / value_chunk_payload_size;
+    uint64_t record_count_ceiling = 0;
+    uint64_t physical_bytes_per_record = 0;
+    uint64_t required_value_bytes = 0;
+    uint64_t rounded_live_bytes = 0;
+    if (!checked_add_u64(geometry.max_live_bytes, minimum_external_record - 1U, &rounded_live_bytes) ||
+        !checked_mul_u64(chunks_per_minimum_value, value_chunk_size, &physical_bytes_per_record)) {
+        return false;
+    }
+    record_count_ceiling = rounded_live_bytes / minimum_external_record;
+    if (!checked_mul_u64(record_count_ceiling, physical_bytes_per_record, &required_value_bytes) ||
+        !checked_add_u64(required_value_bytes, identity_region_size, &required_value_bytes) ||
+        required_value_bytes > geometry.value_bank_size) {
+        return false;
+    }
+
     // Next-fit block packing guarantees that every completed pair of blocks contains more than one block of encoded records.
     // Reserving the unpaired block gives a simple hard bound for arbitrary permitted record-size mixtures.
     const uint64_t guaranteed_logical_bytes = (bank_block_count / 2U) * block_payload_bytes;

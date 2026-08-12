@@ -224,7 +224,10 @@ esp_err_t on9kvdb::stage_value_unsafe(on9kvdb_transaction_handle transaction_han
     }
 
     mutation_slot *mutation = find_staged_mutation_unsafe(transaction_state, key);
-    const uint32_t old_value_size = mutation == nullptr ? 0 : mutation->value_size;
+    // External values occupy the value bank, not transaction_staging.  Their
+    // logical value_size must therefore never participate in staging-arena
+    // accounting when the same key is replaced inside a transaction.
+    const uint32_t old_value_size = mutation == nullptr || mutation->external_value ? 0 : mutation->value_size;
     const uint32_t new_staged_size = transaction_state->staged_value_bytes - old_value_size + static_cast<uint32_t>(value_size);
     if (new_staged_size > CONFIG_ON9KVDB_TRANSACTION_STAGING_SIZE) {
         return ESP_ERR_INVALID_SIZE;
@@ -241,7 +244,8 @@ esp_err_t on9kvdb::stage_value_unsafe(on9kvdb_transaction_handle transaction_han
         }
         for (uint16_t idx = 0; idx < transaction_state->mutation_count; idx += 1) {
             mutation_slot &candidate = transaction_state->mutations[idx];
-            if (&candidate != mutation && candidate.value_size > 0 && candidate.value_offset > mutation->value_offset) {
+            if (&candidate != mutation && !candidate.external_value && candidate.value_size > 0 &&
+                candidate.value_offset > mutation->value_offset) {
                 candidate.value_offset -= old_value_size;
             }
         }
@@ -259,6 +263,8 @@ esp_err_t on9kvdb::stage_value_unsafe(on9kvdb_transaction_handle transaction_han
     mutation->key_size = key.size;
     mutation->reserved0 = 0;
     mutation->kind = mutation_kind;
+    mutation->external_value = false;
+    mutation->external_value_ref = {};
     memcpy(mutation->key, key.data, key.size);
     if (value_size > 0) {
         memcpy(transaction_staging + transaction_state->staged_value_bytes, value, value_size);
@@ -356,6 +362,13 @@ esp_err_t on9kvdb::commit(on9kvdb_transaction_handle transaction_handle)
 
     transaction_slot *transaction_state = nullptr;
     ret = get_transaction_unsafe(transaction_handle, &transaction_state);
+    if (ret == ESP_OK && value_writer != nullptr && value_writer->active &&
+        value_writer->transaction_handle_raw == transaction_handle.raw) {
+        // A writer may already have emitted unreachable value-bank chunks, but
+        // it has not staged an exact-length descriptor yet.  Committing here
+        // would silently omit that value and could switch/recycle its bank.
+        ret = ESP_ERR_INVALID_STATE;
+    }
     if (ret != ESP_OK) {
         release_operation_lock();
         return ret;
@@ -426,6 +439,12 @@ esp_err_t on9kvdb::abort(on9kvdb_transaction_handle transaction_handle)
     }
     transaction_slot *transaction_state = nullptr;
     ret = get_transaction_unsafe(transaction_handle, &transaction_state);
+    if (ret == ESP_OK && value_writer != nullptr && value_writer->active &&
+        value_writer->transaction_handle_raw == transaction_handle.raw) {
+        // Keep writer lifetime explicit.  The caller must abort the writer
+        // first so its token cannot outlive the transaction it belongs to.
+        ret = ESP_ERR_INVALID_STATE;
+    }
     if (ret == ESP_OK) {
         clear_transaction_unsafe();
     }

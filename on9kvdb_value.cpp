@@ -100,6 +100,8 @@ esp_err_t on9kvdb::open_value_unsafe(const value_view &view, on9kvdb_value_reade
         reader.value_size = view.value_size;
         reader.used = true;
         reader.external = view.is_external;
+        reader.checksum_enabled = view.is_external;
+        reader.checksum_state = UINT32_MAX;
         reader.external_value = view.external_value;
         if (!view.is_external && view.value_size > 0) {
             memcpy(value_reader_buffers + static_cast<size_t>(index) * on9kvdb_def::value_chunk_size, view.value,
@@ -120,6 +122,11 @@ esp_err_t on9kvdb::fill_reader_buffer_unsafe(value_reader_slot *reader)
     }
     const uint32_t chunk_index = reader->cursor / on9kvdb_def::value_chunk_payload_size;
     const uint32_t payload_offset = reader->cursor % on9kvdb_def::value_chunk_payload_size;
+    const uint32_t logical_chunk_offset = chunk_index * on9kvdb_def::value_chunk_payload_size;
+    const uint32_t expected_payload = reader->value_size - logical_chunk_offset < on9kvdb_def::value_chunk_payload_size
+                                          ? reader->value_size - logical_chunk_offset
+                                          : on9kvdb_def::value_chunk_payload_size;
+    const bool expected_final = logical_chunk_offset + expected_payload == reader->value_size;
     const uint64_t chunk_offset = static_cast<uint64_t>(reader->external_value.first_chunk_offset) +
                                   static_cast<uint64_t>(chunk_index) * on9kvdb_def::value_chunk_size;
     if (chunk_offset > manifest.geometry.value_bank_size - on9kvdb_def::value_chunk_size) {
@@ -153,7 +160,8 @@ esp_err_t on9kvdb::fill_reader_buffer_unsafe(value_reader_slot *reader)
     if (status != on9kvdb_def::format_status::ok || header.database_id != manifest.database_id ||
         header.bank_generation != reader->external_value.bank_generation ||
         header.first_chunk_offset != reader->external_value.first_chunk_offset || header.value_size != reader->value_size ||
-        header.value_offset != chunk_index * on9kvdb_def::value_chunk_payload_size || payload_offset >= header.payload_size) {
+        header.value_offset != logical_chunk_offset || header.payload_size != expected_payload ||
+        expected_final != ((header.flags & on9kvdb_def::value_chunk_flag_final) != 0) || payload_offset >= header.payload_size) {
         return ESP_ERR_INVALID_CRC;
     }
     const uint32_t available = header.payload_size - payload_offset;
@@ -248,8 +256,44 @@ esp_err_t on9kvdb::consume_value(on9kvdb_value_reader reader, uint32_t size)
     if (ret == ESP_OK && size > reader_state->value_size - reader_state->cursor) {
         ret = ESP_ERR_INVALID_SIZE;
     }
-    if (ret == ESP_OK) {
-        reader_state->cursor += size;
+    uint32_t remaining = size;
+    while (ret == ESP_OK && remaining > 0 && reader_state->external && reader_state->checksum_enabled) {
+        if (reader_state->cursor < reader_state->buffer_value_offset ||
+            reader_state->cursor >= reader_state->buffer_value_offset + reader_state->buffer_size) {
+            ret = fill_reader_buffer_unsafe(reader_state);
+            if (ret != ESP_OK) {
+                break;
+            }
+        }
+        const uint32_t buffer_offset = reader_state->cursor - reader_state->buffer_value_offset;
+        uint32_t part = reader_state->buffer_size - buffer_offset;
+        if (part > remaining) {
+            part = remaining;
+        }
+        uint32_t reader_index = CONFIG_ON9KVDB_MAX_VALUE_READERS;
+        for (uint32_t index = 0; index < CONFIG_ON9KVDB_MAX_VALUE_READERS; index += 1U) {
+            if (&value_readers[index] == reader_state) {
+                reader_index = index;
+                break;
+            }
+        }
+        if (reader_index == CONFIG_ON9KVDB_MAX_VALUE_READERS) {
+            ret = ESP_ERR_INVALID_STATE;
+            break;
+        }
+        reader_state->checksum_state = on9kvdb_def::calc_crc32_update(
+            reader_state->checksum_state,
+            value_reader_buffers + static_cast<size_t>(reader_index) * on9kvdb_def::value_chunk_size + buffer_offset, part);
+        reader_state->cursor += part;
+        remaining -= part;
+    }
+    if (ret == ESP_OK && remaining > 0) {
+        reader_state->cursor += remaining;
+    }
+    if (ret == ESP_OK && reader_state->external && reader_state->checksum_enabled &&
+        reader_state->cursor == reader_state->value_size &&
+        ~reader_state->checksum_state != reader_state->external_value.value_checksum) {
+        ret = ESP_ERR_INVALID_CRC;
     }
     release_operation_lock();
     return ret;
@@ -297,8 +341,19 @@ esp_err_t on9kvdb::read_value_into(on9kvdb_value_reader reader, void *destinatio
         memcpy(output + *read_size_out,
                value_reader_buffers + static_cast<size_t>(reader_index) * on9kvdb_def::value_chunk_size + buffer_offset,
                copy_size);
+        if (reader_state->external && reader_state->checksum_enabled) {
+            reader_state->checksum_state = on9kvdb_def::calc_crc32_update(
+                reader_state->checksum_state,
+                value_reader_buffers + static_cast<size_t>(reader_index) * on9kvdb_def::value_chunk_size + buffer_offset,
+                copy_size);
+        }
         *read_size_out += copy_size;
         reader_state->cursor += copy_size;
+    }
+    if (ret == ESP_OK && reader_state->external && reader_state->checksum_enabled &&
+        reader_state->cursor == reader_state->value_size &&
+        ~reader_state->checksum_state != reader_state->external_value.value_checksum) {
+        ret = ESP_ERR_INVALID_CRC;
     }
     release_operation_lock();
     return ret;
@@ -316,6 +371,17 @@ esp_err_t on9kvdb::seek_value(on9kvdb_value_reader reader, uint32_t offset)
         ret = ESP_ERR_INVALID_SIZE;
     }
     if (ret == ESP_OK) {
+        if (reader_state->external) {
+            if (offset == 0) {
+                reader_state->checksum_state = UINT32_MAX;
+                reader_state->checksum_enabled = true;
+            } else if (offset != reader_state->cursor) {
+                // Random access still validates every addressed chunk.  A
+                // whole-value checksum can only be proven after a complete,
+                // ordered pass beginning at byte zero.
+                reader_state->checksum_enabled = false;
+            }
+        }
         reader_state->cursor = offset;
     }
     release_operation_lock();

@@ -12,6 +12,16 @@ namespace
     {
         return (size + 7U) & ~UINT32_C(7);
     }
+
+    uint64_t logical_record_size(uint16_t namespace_size, uint16_t key_size, uint32_t value_size)
+    {
+        // Logical capacity describes the persistent KV state, not the larger
+        // implementation-only memtable header.  Using the SSTable record
+        // header here keeps commit, recovery, and compaction accounting equal.
+        const uint64_t size =
+            static_cast<uint64_t>(on9kvdb_def::table_entry_header_size) + namespace_size + key_size + value_size;
+        return (size + 7U) & ~UINT64_C(7);
+    }
 }
 
 esp_err_t on9kvdb::find_namespace_unsafe(on9kvdb_bytes namespace_name, uint16_t *slot_index_out) const
@@ -301,8 +311,7 @@ esp_err_t on9kvdb::preflight_memtable_transaction_unsafe(transaction_slot &trans
         const uint32_t value_size = mutation.kind == on9kvdb_def::mutation_kind_set ? mutation.value_size : 0;
         const uint32_t memtable_value_size = mutation.external_value ? 0 : value_size;
         if (mutation.previous_state != previous_state_none) {
-            const uint32_t previous_size = align_record_size(static_cast<uint32_t>(sizeof(memtable_record_header)) +
-                                                             namespace_size + mutation.key_size + mutation.previous_value_size);
+            const uint64_t previous_size = logical_record_size(namespace_size, mutation.key_size, mutation.previous_value_size);
             if (previous_size > final_logical_state_bytes) {
                 return ESP_ERR_INVALID_STATE;
             }
@@ -310,13 +319,12 @@ esp_err_t on9kvdb::preflight_memtable_transaction_unsafe(transaction_slot &trans
         }
         const uint32_t record_size =
             align_record_size(static_cast<uint32_t>(sizeof(memtable_record_header)) + mutation.key_size + memtable_value_size);
-        const uint32_t logical_record_size = align_record_size(static_cast<uint32_t>(sizeof(memtable_record_header)) +
-                                                               namespace_size + mutation.key_size + value_size);
+        const uint64_t new_logical_record_size = logical_record_size(namespace_size, mutation.key_size, value_size);
         if (record_size > CONFIG_ON9KVDB_MEMTABLE_DATA_SIZE - final_bytes) {
             return ESP_ERR_NO_MEM;
         }
         final_bytes += record_size;
-        final_logical_state_bytes += logical_record_size;
+        final_logical_state_bytes += new_logical_record_size;
         if (final_logical_state_bytes > manifest.geometry.max_live_bytes) {
             return ESP_ERR_NO_MEM;
         }
@@ -349,9 +357,8 @@ esp_err_t on9kvdb::apply_transaction_to_memtable_unsafe(const transaction_slot &
             const memtable_bucket &old_bucket = memtable_index[bucket_index];
             const auto *old_header = reinterpret_cast<const memtable_record_header *>(memtable_data + old_bucket.record_offset);
             const bool old_tombstone = (old_header->flags & on9kvdb_def::memtable_flag_tombstone) != 0;
-            const uint32_t old_logical_size = align_record_size(static_cast<uint32_t>(sizeof(memtable_record_header)) +
-                                                                namespaces[old_header->namespace_slot_index].name_size +
-                                                                old_header->key_size + old_header->value_size);
+            const uint64_t old_logical_size = logical_record_size(namespaces[old_header->namespace_slot_index].name_size,
+                                                                  old_header->key_size, old_header->value_size);
             stats.logical_state_bytes -= old_logical_size;
             if (old_tombstone) {
                 stats.tombstone_count -= 1;
@@ -361,9 +368,8 @@ esp_err_t on9kvdb::apply_transaction_to_memtable_unsafe(const transaction_slot &
             }
             remove_memtable_record_unsafe(bucket_index);
         } else {
-            const uint32_t previous_logical_size =
-                align_record_size(static_cast<uint32_t>(sizeof(memtable_record_header)) +
-                                  namespaces[namespace_slot_index].name_size + mutation.key_size + mutation.previous_value_size);
+            const uint64_t previous_logical_size =
+                logical_record_size(namespaces[namespace_slot_index].name_size, mutation.key_size, mutation.previous_value_size);
             if (mutation.previous_state == previous_state_tombstone) {
                 stats.tombstone_count -= 1;
                 stats.logical_state_bytes -= previous_logical_size;
@@ -413,8 +419,7 @@ esp_err_t on9kvdb::apply_transaction_to_memtable_unsafe(const transaction_slot &
         bucket.record_size = record_size;
         memtable_data_used += record_size;
         stats.logical_state_bytes +=
-            align_record_size(static_cast<uint32_t>(sizeof(memtable_record_header)) + namespaces[namespace_slot_index].name_size +
-                              mutation.key_size + value_size);
+            logical_record_size(namespaces[namespace_slot_index].name_size, mutation.key_size, value_size);
         if (tombstone) {
             stats.tombstone_count += 1;
         } else {

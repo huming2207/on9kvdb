@@ -292,6 +292,7 @@ esp_err_t on9kvdb::append_transaction_unsafe(transaction_slot *transaction_state
         (payload_size + on9kvdb_def::wal_frame_payload_capacity - 1U) / on9kvdb_def::wal_frame_payload_capacity;
     const uint64_t transaction_bytes = static_cast<uint64_t>(frame_count) * on9kvdb_def::wal_frame_size;
     uint32_t active_slot = manifest.active_wal_slot;
+    bool staged_descriptors_may_have_moved = false;
     if (transaction_bytes > manifest.geometry.wal_size - wal_tail[active_slot]) {
         const uint32_t target_slot = 1U - active_slot;
         if (manifest.wal_generation[target_slot] != 0) {
@@ -303,6 +304,7 @@ esp_err_t on9kvdb::append_transaction_unsafe(transaction_slot *transaction_state
                          esp_err_to_name(ret), next_transaction_sequence, active_slot, target_slot);
                 return ret;
             }
+            staged_descriptors_may_have_moved = true;
         } else if (memtable_entry_count > 0) {
             // The current transaction is not included because its WAL record has not been written yet.
             ret = flush_memtable_unsafe();
@@ -321,6 +323,17 @@ esp_err_t on9kvdb::append_transaction_unsafe(transaction_slot *transaction_state
     }
     if (transaction_bytes > manifest.geometry.wal_size - wal_tail[active_slot]) {
         return ESP_ERR_NO_MEM;
+    }
+
+    if (staged_descriptors_may_have_moved) {
+        uint32_t recalculated_payload_size = 0;
+        ret = calculate_transaction_payload_unsafe(*transaction_state, handle, &recalculated_payload_size, &transaction_checksum);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+        if (recalculated_payload_size != payload_size) {
+            return ESP_ERR_INVALID_STATE;
+        }
     }
 
     uint32_t payload_offset = 0;

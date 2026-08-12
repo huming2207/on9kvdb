@@ -12,7 +12,7 @@ menu "on9kvdb"
 
     config ON9KVDB_PROVISIONED_DATABASE_SIZE
         int "Total provisioned database size in bytes"
-        default 6291456
+        default 10485760
         range 196608 4294967295
         help
             Exact size of the exclusive raw block-device range containing the
@@ -58,7 +58,7 @@ menu "on9kvdb"
 
     config ON9KVDB_VALUE_BANK_SIZE
         int "Size of each append-only value bank in bytes"
-        default 1048576
+        default 3145728
         range 65536 4294967295
         help
             Fixed logical size of each of the two append-only value banks.
@@ -85,7 +85,7 @@ menu "on9kvdb"
 
     config ON9KVDB_RUNTIME_MEMORY_BUDGET
         int "Default component-owned runtime memory budget in bytes"
-        default 102400
+        default 143360
         range 32768 204799
         help
             Default memory budget used by on9kvdb_cfg. The v1 target is

@@ -49,6 +49,20 @@ namespace
         reference.max_key = metadata.max_key;
         return reference;
     }
+
+    uint32_t filter_hash(const on9kvdb_def::composite_key &key)
+    {
+        uint32_t hash = UINT32_C(2166136261);
+        hash = (hash ^ static_cast<uint8_t>(key.namespace_size)) * UINT32_C(16777619);
+        for (uint16_t index = 0; index < key.namespace_size; index += 1U) {
+            hash = (hash ^ key.namespace_name[index]) * UINT32_C(16777619);
+        }
+        hash = (hash ^ static_cast<uint8_t>(key.key_size)) * UINT32_C(16777619);
+        for (uint16_t index = 0; index < key.key_size; index += 1U) {
+            hash = (hash ^ key.key[index]) * UINT32_C(16777619);
+        }
+        return hash;
+    }
 }
 
 esp_err_t on9kvdb::read_table_bytes_unsafe(uint32_t slot, uint64_t offset, uint8_t *destination, size_t size) const
@@ -416,6 +430,7 @@ esp_err_t on9kvdb::validate_table_unsafe(const on9kvdb_def::table_reference &ref
         return ESP_ERR_INVALID_ARG;
     }
     invalidate_table_index_cache_unsafe(reference.slot);
+    reset_table_key_filter_unsafe(reference.slot);
 
     uint8_t *data_block = future_scratch + sort_bytes;
     uint8_t *index_block = data_block + manifest.limits.sstable_block_bytes;
@@ -529,6 +544,7 @@ esp_err_t on9kvdb::validate_table_unsafe(const on9kvdb_def::table_reference &ref
             }
             previous_key = current_key;
             have_previous_key = true;
+            add_table_key_filter_unsafe(reference.slot, current_key);
             entry_offset += entry.total_size;
             total_data_bytes += entry.total_size;
             total_entries += 1U;
@@ -542,6 +558,8 @@ esp_err_t on9kvdb::validate_table_unsafe(const on9kvdb_def::table_reference &ref
         total_entries != footer.entry_count || total_data_bytes != footer.data_bytes || ~content_crc != footer.content_checksum) {
         return ESP_ERR_INVALID_CRC;
     }
+    table_key_filters[reference.slot].generation = reference.generation;
+    table_key_filters[reference.slot].valid = true;
     return cache_table_index_unsafe(reference, index_block);
 }
 
@@ -594,6 +612,50 @@ void on9kvdb::invalidate_table_index_cache_unsafe(uint32_t slot)
     if (table_index_cache != nullptr && slot < manifest.geometry.table_count) {
         table_index_cache[slot] = {};
     }
+}
+
+void on9kvdb::reset_table_key_filter_unsafe(uint32_t slot)
+{
+    if (table_key_filters != nullptr && slot < manifest.geometry.table_count) {
+        table_key_filters[slot] = {};
+    }
+}
+
+void on9kvdb::add_table_key_filter_unsafe(uint32_t slot, const on9kvdb_def::composite_key &key)
+{
+    if (table_key_filters == nullptr || slot >= manifest.geometry.table_count) {
+        return;
+    }
+    table_key_filter_slot &filter = table_key_filters[slot];
+    const uint32_t first = filter_hash(key);
+    const uint32_t step = ((first >> 16U) ^ UINT32_C(0x9e3779b9)) | 1U;
+    const uint32_t bit_count = static_cast<uint32_t>(table_key_filter_bytes * 8U);
+    for (uint32_t probe = 0; probe < 3U; probe += 1U) {
+        const uint32_t bit = (first + probe * step) % bit_count;
+        filter.bits[bit / 8U] |= static_cast<uint8_t>(UINT8_C(1) << (bit % 8U));
+    }
+}
+
+bool on9kvdb::table_key_filter_may_contain_unsafe(const on9kvdb_def::table_reference &reference,
+                                                  const on9kvdb_def::composite_key &key) const
+{
+    if (table_key_filters == nullptr || reference.slot >= manifest.geometry.table_count) {
+        return true;
+    }
+    const table_key_filter_slot &filter = table_key_filters[reference.slot];
+    if (!filter.valid || filter.generation != reference.generation) {
+        return true;
+    }
+    const uint32_t first = filter_hash(key);
+    const uint32_t step = ((first >> 16U) ^ UINT32_C(0x9e3779b9)) | 1U;
+    const uint32_t bit_count = static_cast<uint32_t>(table_key_filter_bytes * 8U);
+    for (uint32_t probe = 0; probe < 3U; probe += 1U) {
+        const uint32_t bit = (first + probe * step) % bit_count;
+        if ((filter.bits[bit / 8U] & static_cast<uint8_t>(UINT8_C(1) << (bit % 8U))) == 0) {
+            return false;
+        }
+    }
+    return true;
 }
 
 esp_err_t on9kvdb::lookup_table_unsafe(const on9kvdb_def::table_reference &reference, const on9kvdb_def::composite_key &key,
@@ -712,16 +774,32 @@ esp_err_t on9kvdb::lookup_tables_unsafe(on9kvdb_bytes namespace_name, on9kvdb_by
     copy_composite_key(&composite, namespace_name.data, namespace_name.size, key.data, key.size);
     uint64_t best_sequence = 0;
     uint32_t best_slot = manifest.geometry.table_count;
+    uint32_t examined_slots = 0;
     value_view best = {};
-    for (uint32_t slot = 0; slot < manifest.geometry.table_count; slot += 1) {
+    // Examine plausible tables by descending maximum sequence. This commonly finds the newest version first and lets older
+    // tables be skipped without reading either their index or data blocks. The fixed 16-slot mask keeps this allocation-free.
+    for (uint32_t pass = 0; pass < manifest.geometry.table_count; pass += 1U) {
+        uint32_t slot = manifest.geometry.table_count;
+        uint64_t greatest_max_sequence = 0;
+        for (uint32_t candidate_slot = 0; candidate_slot < manifest.geometry.table_count; candidate_slot += 1U) {
+            const uint32_t candidate_bit = UINT32_C(1) << candidate_slot;
+            const on9kvdb_def::table_reference &candidate = manifest.tables[candidate_slot];
+            if ((examined_slots & candidate_bit) != 0 || !candidate.active ||
+                on9kvdb_def::compare_composite_key(composite, candidate.min_key) < 0 ||
+                on9kvdb_def::compare_composite_key(composite, candidate.max_key) > 0 ||
+                !table_key_filter_may_contain_unsafe(candidate, composite)) {
+                continue;
+            }
+            if (slot == manifest.geometry.table_count || candidate.max_sequence > greatest_max_sequence) {
+                slot = candidate_slot;
+                greatest_max_sequence = candidate.max_sequence;
+            }
+        }
+        if (slot == manifest.geometry.table_count || greatest_max_sequence < best_sequence) {
+            break;
+        }
+        examined_slots |= UINT32_C(1) << slot;
         const on9kvdb_def::table_reference &reference = manifest.tables[slot];
-        if (!reference.active) {
-            continue;
-        }
-        if (on9kvdb_def::compare_composite_key(composite, reference.min_key) < 0 ||
-            on9kvdb_def::compare_composite_key(composite, reference.max_key) > 0) {
-            continue;
-        }
         value_view candidate = {};
         const esp_err_t ret = lookup_table_unsafe(reference, composite, &candidate);
         if (ret != ESP_OK && ret != ESP_ERR_NOT_FOUND) {
@@ -754,8 +832,8 @@ esp_err_t on9kvdb::lookup_tables_unsafe(on9kvdb_bytes namespace_name, on9kvdb_by
         return ESP_OK;
     }
 
-    // The approved 100 KiB arena does not have room for the optional stable result buffer. Retain the checked fallback that
-    // re-reads the winning table so its value remains valid until the caller copies it under the operation lock.
+    // Without the optional stable result buffer, re-read the winning table so its value remains valid until the caller copies
+    // it under the operation lock.
     return lookup_table_unsafe(manifest.tables[best_slot], composite, view_out);
 }
 

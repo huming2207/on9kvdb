@@ -585,6 +585,7 @@ private:
     };
 
     struct value_reader_slot {
+        uint32_t checksum_state = UINT32_MAX;
         uint32_t generation = 0;
         uint32_t value_size = 0;
         uint32_t cursor = 0;
@@ -593,6 +594,7 @@ private:
         on9kvdb_def::value_ref external_value = {};
         bool used = false;
         bool external = false;
+        bool checksum_enabled = false;
     };
 
     struct value_writer_slot {
@@ -625,6 +627,14 @@ private:
         uint32_t entry_count = 0;
         bool valid = false;
         table_index_cache_entry entries[maximum_table_data_blocks] = {};
+    };
+
+    static const constexpr size_t table_key_filter_bytes = 256;
+
+    struct table_key_filter_slot {
+        uint64_t generation = 0;
+        bool valid = false;
+        uint8_t bits[table_key_filter_bytes] = {};
     };
 
     struct wal_payload_copy_state {
@@ -766,6 +776,10 @@ private: // Immutable SSTables
     esp_err_t validate_table_unsafe(const on9kvdb_def::table_reference &reference);
     esp_err_t cache_table_index_unsafe(const on9kvdb_def::table_reference &reference, const uint8_t *index_block);
     void invalidate_table_index_cache_unsafe(uint32_t slot);
+    void reset_table_key_filter_unsafe(uint32_t slot);
+    void add_table_key_filter_unsafe(uint32_t slot, const on9kvdb_def::composite_key &key);
+    bool table_key_filter_may_contain_unsafe(const on9kvdb_def::table_reference &reference,
+                                             const on9kvdb_def::composite_key &key) const;
     esp_err_t lookup_tables_unsafe(on9kvdb_bytes namespace_name, on9kvdb_bytes key, value_view *view_out) const;
     esp_err_t lookup_table_unsafe(const on9kvdb_def::table_reference &reference, const on9kvdb_def::composite_key &key,
                                   value_view *view_out) const;
@@ -831,6 +845,7 @@ private:
     uint8_t *transaction_staging = nullptr;
     uint8_t *memtable_data = nullptr;
     table_index_cache_slot *table_index_cache = nullptr;
+    table_key_filter_slot *table_key_filters = nullptr;
     uint8_t *table_lookup_value = nullptr;
     uint8_t *future_scratch = nullptr;
     size_t future_scratch_size = 0;
