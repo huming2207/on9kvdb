@@ -28,7 +28,10 @@ documented alternate manifest copy is valid.
 Each data region begins with two independently encoded identity slots. The
 identity binds its logical kind/slot/final size to the random database ID in
 the manifest. Provisioning writes missing identities only while the manifest
-is in the dedicated provisioning-owned state.
+is in the dedicated provisioning-owned state. Before first initialization
+returns, both manifest slots are transitioned to the ready state; a later loss
+of either copy can therefore never fall back into provisioning and overwrite
+acknowledged WAL data.
 
 ## Publication order
 

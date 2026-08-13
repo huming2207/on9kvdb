@@ -11,7 +11,8 @@ qualification. Before changing the storage protocol, capture:
 5. Reboot recovery duration after an orderly shutdown and after injected
    failures at each manifest/WAL/value publication boundary.
 
-Possible future work requires separate approval: host-side fake-block-device
-fault injection, card-specific cache-flush support if ESP-IDF exposes a safe
-portable contract, larger sequential table reads, and a raw NOR adapter over
-a wear-levelled partition.
+Possible future work requires separate approval: torn native-block fault
+simulation, card-specific cache-flush support if ESP-IDF exposes a safe
+portable contract, larger sequential table reads, and a raw NOR adapter over a
+wear-levelled partition. The host suite now injects complete-call write and
+sync failures across external commits, table publication, and compaction.

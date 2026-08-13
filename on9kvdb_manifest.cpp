@@ -453,5 +453,14 @@ esp_err_t on9kvdb::provision_all_data_files()
     manifest.wal_generation[0] = 1;
     manifest.wal_generation[1] = 0;
     manifest.safe_checkpoint_sequence = 0;
-    return write_manifest_copy(manifest.generation + 1U, on9kvdb_def::manifest_state_ready);
+    ret = write_manifest_copy(manifest.generation + 1U, on9kvdb_def::manifest_state_ready);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    // Do not return a usable database while the redundant fallback still says
+    // "provisioning". If the sole ready copy were later lost, selecting that
+    // fallback would legitimately restart provisioning and erase acknowledged
+    // WAL data. Publish the same ready state to the second slot now.
+    manifest_stabilization_required = true;
+    return stabilize_manifest_unsafe();
 }

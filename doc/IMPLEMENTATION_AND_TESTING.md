@@ -27,11 +27,14 @@ idf.py build
 git diff --check
 ```
 
-The host test verifies encoders/decoders and API-facing binary invariants. The
-ESP-IDF build verifies the full raw-SDMMC component path. Hardware qualification
-must additionally test the selected SDMMC wiring, a known exclusive LBA range,
-card removal/error propagation, reboot recovery, and power interruptions at
-every write/publication boundary.
+The host tests verify encoders/decoders, API-facing binary invariants, and a
+durable-image fault matrix. The matrix fails every individual write and sync
+call in external-value commit, table-flush publication, and full compaction,
+then simulates reboot from the last successful sync and verifies acknowledged
+data. The ESP-IDF build verifies the full raw-SDMMC component path. Hardware
+qualification must additionally test the selected SDMMC wiring, a known
+exclusive LBA range, card removal/error propagation, reboot recovery, and real
+power interruptions at every write/publication boundary.
 
 When changing the FATFS adapter, verify an empty mounted volume creates one
 contiguous file, then that a second boot reopens it without creating or touching

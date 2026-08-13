@@ -46,3 +46,29 @@ target_compile_options(on9kvdb_core_tests PRIVATE
 )
 
 add_test(NAME on9kvdb_core COMMAND on9kvdb_core_tests)
+
+add_executable(on9kvdb_fault_tests
+        "on9kvdb_fault_tests.cpp"
+        "../on9kvdb.cpp"
+        "../on9kvdb_api.cpp"
+        "../on9kvdb_compaction.cpp"
+        "../on9kvdb_format.cpp"
+        "../on9kvdb_io.cpp"
+        "../on9kvdb_manifest.cpp"
+        "../on9kvdb_memtable.cpp"
+        "../on9kvdb_table.cpp"
+        "../on9kvdb_value.cpp"
+        "../on9kvdb_wal.cpp"
+)
+
+target_include_directories(on9kvdb_fault_tests PRIVATE "host_stubs" "..")
+target_compile_features(on9kvdb_fault_tests PRIVATE cxx_std_17)
+target_compile_options(on9kvdb_fault_tests PRIVATE
+        "-Wall"
+        "-Wextra"
+        "-Werror"
+        "-fno-exceptions"
+        "-fno-rtti"
+)
+
+add_test(NAME on9kvdb_fault COMMAND on9kvdb_fault_tests)
