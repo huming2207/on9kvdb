@@ -6,9 +6,10 @@ menu "on9kvdb"
         range 65536 4294967295
         help
             Maximum encoded size of the newest committed namespace/key
-            records, including tombstones. This includes record metadata,
-            namespace, key, type, and value bytes. Existing databases must
-            match this build-time value exactly.
+            records. Tombstones count until the next full compaction, which
+            drops them after all older versions have been merged away. This
+            includes record metadata, namespace, key, and value bytes.
+            Existing databases must match this build-time value exactly.
 
     config ON9KVDB_PROVISIONED_DATABASE_SIZE
         int "Total provisioned database size in bytes"

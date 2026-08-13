@@ -622,7 +622,8 @@ bool on9kvdb_def::encode_manifest_record(uint8_t *buf, size_t buf_len, const man
         (record.state == manifest_state_ready && record.generation < 3) ||
         !validate_compaction_capacity(record.geometry, record.limits) || record.active_wal_slot >= wal_file_count ||
         record.next_table_generation == 0 || !table_references_valid ||
-        greatest_table_generation >= record.next_table_generation || greatest_table_sequence != record.safe_checkpoint_sequence ||
+        greatest_table_generation >= record.next_table_generation ||
+        (active_table_count != 0 && greatest_table_sequence != record.safe_checkpoint_sequence) ||
         (record.state == manifest_state_provisioning_owned &&
          (record.wal_generation[0] != 0 || record.wal_generation[1] != 0 || record.safe_checkpoint_sequence != 0 ||
           active_table_count != 0 || record.next_table_generation != 1 || record.active_table_bank != 0 ||
@@ -786,7 +787,8 @@ on9kvdb_def::format_status on9kvdb_def::decode_manifest_record(const uint8_t *bu
                            (manifest_table_reference_offset + max_table_count * manifest_table_reference_size)) ||
         !validate_compaction_capacity(record.geometry, record.limits) || record.active_wal_slot >= wal_file_count ||
         record.next_table_generation == 0 || active_table_count != encoded_active_table_count ||
-        greatest_table_generation >= record.next_table_generation || greatest_table_sequence != record.safe_checkpoint_sequence ||
+        greatest_table_generation >= record.next_table_generation ||
+        (active_table_count != 0 && greatest_table_sequence != record.safe_checkpoint_sequence) ||
         (record.state == manifest_state_provisioning_owned &&
          (record.wal_generation[0] != 0 || record.wal_generation[1] != 0 || record.safe_checkpoint_sequence != 0 ||
           active_table_count != 0 || record.next_table_generation != 1 || record.active_table_bank != 0 ||

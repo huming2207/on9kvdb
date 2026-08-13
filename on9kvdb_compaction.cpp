@@ -550,7 +550,8 @@ esp_err_t on9kvdb::compact_tables_unsafe()
     uint32_t processed_entries = 0;
     esp_err_t ret = ESP_OK;
     // All sources are sorted by composite key. Select the smallest key, retain its greatest transaction sequence, and advance
-    // every source carrying that key. The newest tombstone is emitted like any other record.
+    // every source carrying that key. This is a full merge of every active source, so a newest tombstone can be omitted: no
+    // older value for that key remains reachable in the output bank. Its sequence still advances the checkpoint below.
     while (memtable_position < memtable_offset_count || cursor_count > 0) {
         bool found = false;
         on9kvdb_def::composite_key smallest = {};
@@ -611,57 +612,62 @@ esp_err_t on9kvdb::compact_tables_unsafe()
             break;
         }
 
-        const uint64_t winner_logical_size =
-            winner_is_memtable
-                ? logical_entry_size(memtable_namespace->name_size, memtable_record->key_size, memtable_record->value_size)
-                : logical_entry_size(winner_cursor->key.namespace_size, winner_cursor->key.key_size, winner_cursor->value_size);
-        if (winner_logical_size > manifest.geometry.max_live_bytes - logical_state_bytes) {
-            ret = ESP_ERR_NO_MEM;
-            break;
-        }
-        logical_state_bytes += winner_logical_size;
-
-        if (!output.active) {
-            if (output_count >= bank_size) {
-                ret = ESP_ERR_NO_MEM;
-                break;
-            }
-            ret = start_compaction_output_unsafe(&output, output_start + output_count,
-                                                 manifest.next_table_generation + output_count, data_block, index_block);
-            if (ret != ESP_OK) {
-                break;
-            }
-        }
-        ret = append_compaction_entry_unsafe(&output, winner_is_memtable ? nullptr : winner_cursor,
-                                             winner_is_memtable ? memtable_record : nullptr,
-                                             winner_is_memtable ? memtable_namespace : nullptr, destination_value_bank,
-                                             destination_value_generation, &destination_value_tail);
-        if (ret == ESP_ERR_NO_MEM) {
-            on9kvdb_def::table_reference reference = {};
-            ret = finish_compaction_output_unsafe(&output, &reference);
-            if (ret != ESP_OK) {
-                break;
-            }
-            manifest.tables[output_start + output_count] = reference;
-            output_count += 1U;
-            if (output_count >= bank_size) {
-                ret = ESP_ERR_NO_MEM;
-                break;
-            }
-            ret = start_compaction_output_unsafe(&output, output_start + output_count,
-                                                 manifest.next_table_generation + output_count, data_block, index_block);
-            if (ret == ESP_OK) {
-                ret = append_compaction_entry_unsafe(&output, winner_is_memtable ? nullptr : winner_cursor,
-                                                     winner_is_memtable ? memtable_record : nullptr,
-                                                     winner_is_memtable ? memtable_namespace : nullptr, destination_value_bank,
-                                                     destination_value_generation, &destination_value_tail);
-            }
-        }
-        if (ret != ESP_OK) {
-            break;
-        }
         if (winner_sequence > greatest_sequence) {
             greatest_sequence = winner_sequence;
+        }
+        const bool winner_tombstone = winner_is_memtable ? (memtable_record->flags & on9kvdb_def::memtable_flag_tombstone) != 0
+                                                         : (winner_cursor->flags & on9kvdb_def::table_entry_flag_tombstone) != 0;
+        if (!winner_tombstone) {
+            const uint64_t winner_logical_size =
+                winner_is_memtable
+                    ? logical_entry_size(memtable_namespace->name_size, memtable_record->key_size, memtable_record->value_size)
+                    : logical_entry_size(winner_cursor->key.namespace_size, winner_cursor->key.key_size,
+                                         winner_cursor->value_size);
+            if (winner_logical_size > manifest.geometry.max_live_bytes - logical_state_bytes) {
+                ret = ESP_ERR_NO_MEM;
+                break;
+            }
+            logical_state_bytes += winner_logical_size;
+
+            if (!output.active) {
+                if (output_count >= bank_size) {
+                    ret = ESP_ERR_NO_MEM;
+                    break;
+                }
+                ret = start_compaction_output_unsafe(&output, output_start + output_count,
+                                                     manifest.next_table_generation + output_count, data_block, index_block);
+                if (ret != ESP_OK) {
+                    break;
+                }
+            }
+            ret = append_compaction_entry_unsafe(&output, winner_is_memtable ? nullptr : winner_cursor,
+                                                 winner_is_memtable ? memtable_record : nullptr,
+                                                 winner_is_memtable ? memtable_namespace : nullptr, destination_value_bank,
+                                                 destination_value_generation, &destination_value_tail);
+            if (ret == ESP_ERR_NO_MEM) {
+                on9kvdb_def::table_reference reference = {};
+                ret = finish_compaction_output_unsafe(&output, &reference);
+                if (ret != ESP_OK) {
+                    break;
+                }
+                manifest.tables[output_start + output_count] = reference;
+                output_count += 1U;
+                if (output_count >= bank_size) {
+                    ret = ESP_ERR_NO_MEM;
+                    break;
+                }
+                ret = start_compaction_output_unsafe(&output, output_start + output_count,
+                                                     manifest.next_table_generation + output_count, data_block, index_block);
+                if (ret == ESP_OK) {
+                    ret = append_compaction_entry_unsafe(
+                        &output, winner_is_memtable ? nullptr : winner_cursor, winner_is_memtable ? memtable_record : nullptr,
+                        winner_is_memtable ? memtable_namespace : nullptr, destination_value_bank, destination_value_generation,
+                        &destination_value_tail);
+                }
+            }
+            if (ret != ESP_OK) {
+                break;
+            }
         }
 
         if (memtable_record != nullptr) {
@@ -702,7 +708,7 @@ esp_err_t on9kvdb::compact_tables_unsafe()
             output_count += 1U;
         }
     }
-    if (ret != ESP_OK || output_count == 0 || greatest_sequence != next_transaction_sequence - 1U) {
+    if (ret != ESP_OK || greatest_sequence != next_transaction_sequence - 1U) {
         for (uint32_t slot = output_start; slot < output_start + bank_size; slot += 1) {
             manifest.tables[slot] = {};
         }
@@ -793,6 +799,7 @@ esp_err_t on9kvdb::compact_tables_unsafe()
     wal_tail[inactive_wal_slot] = on9kvdb_def::wal_record_region_offset;
     stats.wal_bytes_used = wal_tail[manifest.active_wal_slot] - on9kvdb_def::wal_record_region_offset;
     stats.logical_state_bytes = logical_state_bytes;
+    stats.tombstone_count = 0;
     stats.table_bytes_used = 0;
     uint64_t output_record_bytes = 0;
     for (uint32_t slot = output_start; slot < output_start + output_count; slot += 1) {

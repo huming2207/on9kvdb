@@ -121,6 +121,18 @@ namespace
         return ret ?: database.commit(transaction);
     }
 
+    esp_err_t erase_batch(on9kvdb &database, on9kvdb_handle handle, uint32_t batch, uint32_t count)
+    {
+        on9kvdb_transaction_handle transaction = {};
+        esp_err_t ret = database.begin(handle, &transaction);
+        for (uint32_t index = 0; ret == ESP_OK && index < count; index += 1U) {
+            char key[24] = {};
+            std::snprintf(key, sizeof(key), "b%02u-k%02u", static_cast<unsigned>(batch), static_cast<unsigned>(index));
+            ret = database.erase_key(transaction, as_bytes(key));
+        }
+        return ret ?: database.commit(transaction);
+    }
+
     void test_core_lifecycle_and_recovery()
     {
         memory_io storage;
@@ -302,6 +314,50 @@ namespace
         check(database.close(handle) == ESP_OK, "close recovered rotation namespace");
         check(database.deinit() == ESP_OK, "deinitialize recovered rotation database");
     }
+
+    void test_full_compaction_reclaims_tombstones()
+    {
+        memory_io storage;
+        const on9kvdb_cfg config = {CONFIG_ON9KVDB_RUNTIME_MEMORY_BUDGET};
+        on9kvdb database(&storage, &config);
+        check(database.init() == ESP_OK, "initialize tombstone database");
+        on9kvdb_handle handle = {};
+        check(database.open(as_bytes("tombstones"), on9kvdb_open_mode::read_write, &handle) == ESP_OK,
+              "open tombstone namespace");
+
+        on9kvdb_stats baseline = {};
+        for (uint32_t batch = 0; batch < 6; batch += 1U) {
+            check(commit_batch(database, handle, batch, 7, 800) == ESP_OK, "commit batch before tombstone compaction");
+            if (batch == 0) {
+                check(database.get_stats(&baseline) == ESP_OK, "capture one-batch logical size");
+            }
+            check(erase_batch(database, handle, batch, 7) == ESP_OK, "erase batch before tombstone compaction");
+        }
+
+        // The seventh batch cannot fit beside the fourteen current tombstones.
+        // Flushing them finds both table slots occupied by older tombstones and
+        // therefore runs a full, all-tombstone compaction before this batch is
+        // applied to the fresh memtable.
+        const esp_err_t compaction_ret = commit_batch(database, handle, 6, 7, 800);
+        check(compaction_ret == ESP_OK, "trigger all-tombstone compaction");
+        on9kvdb_stats compacted = {};
+        check(database.get_stats(&compacted) == ESP_OK && compacted.compaction_count > 0 && compacted.active_table_count == 0 &&
+                  compacted.tombstone_count == 0 && compacted.logical_state_bytes == baseline.logical_state_bytes,
+              "drop all obsolete tombstones and retain only the new live batch");
+
+        uint8_t missing = 0;
+        check(read_exact(database, handle, "b00-k00", &missing, sizeof(missing)) == ESP_ERR_NOT_FOUND,
+              "deleted key remains absent after tombstone reclamation");
+        check(database.close(handle) == ESP_OK, "close tombstone namespace");
+        check(database.deinit() == ESP_OK, "deinitialize tombstone database");
+        check(database.init() == ESP_OK, "recover tombstone database");
+        check(database.open(as_bytes("tombstones"), on9kvdb_open_mode::read_write, &handle) == ESP_OK,
+              "reopen tombstone namespace");
+        check(read_exact(database, handle, "b00-k00", &missing, sizeof(missing)) == ESP_ERR_NOT_FOUND,
+              "deleted key remains absent after tombstone recovery");
+        check(database.close(handle) == ESP_OK, "close recovered tombstone namespace");
+        check(database.deinit() == ESP_OK, "deinitialize recovered tombstone database");
+    }
 }
 
 int main()
@@ -309,5 +365,6 @@ int main()
     test_core_lifecycle_and_recovery();
     test_table_accounting_and_staged_value_relocation();
     test_wal_rotation_rechecks_relocated_descriptor_checksum();
+    test_full_compaction_reclaims_tombstones();
     return failures == 0 ? 0 : 1;
 }
