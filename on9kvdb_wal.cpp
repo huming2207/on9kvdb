@@ -647,8 +647,10 @@ esp_err_t on9kvdb::scan_wal_slot(uint32_t slot, uint64_t generation, uint64_t *e
                 const uint64_t end = static_cast<uint64_t>(mutation.external_value_ref.first_chunk_offset) +
                                      chunk_count * on9kvdb_def::value_chunk_size;
                 const uint32_t bank_slot = mutation.external_value_ref.bank_slot;
-                if (bank_slot >= on9kvdb_def::value_bank_count || end > manifest.geometry.value_bank_size ||
-                    mutation.external_value_ref.bank_generation != manifest.value_bank_generation[bank_slot]) {
+                if (bank_slot != manifest.active_value_bank || end > manifest.geometry.value_bank_size ||
+                    !value_ref_matches_bank_unsafe(mutation.external_value_ref, bank_slot,
+                                                   manifest.value_bank_generation[bank_slot],
+                                                   manifest.geometry.value_bank_size)) {
                     return ESP_ERR_INVALID_CRC;
                 }
                 if (end > manifest.value_bank_tail[bank_slot]) {

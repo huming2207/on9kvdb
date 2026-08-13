@@ -124,7 +124,9 @@ esp_err_t on9kvdb::find_memtable_bucket_unsafe(uint16_t namespace_slot_index, co
             inline_size > bucket.record_size - sizeof(memtable_record_header) ||
             header->key_size > bucket.record_size - sizeof(memtable_record_header) - inline_size ||
             header->namespace_slot_index >= CONFIG_ON9KVDB_MAX_NAMESPACES || !namespaces[header->namespace_slot_index].used ||
-            (external && !on9kvdb_def::value_ref_is_valid(header->external_value, manifest.geometry.value_bank_size))) {
+            (external && !value_ref_matches_bank_unsafe(header->external_value, manifest.active_value_bank,
+                                                        manifest.value_bank_generation[manifest.active_value_bank],
+                                                        manifest.value_bank_tail[manifest.active_value_bank]))) {
             return ESP_ERR_INVALID_STATE;
         }
         if (header->namespace_slot_index != namespace_slot_index) {

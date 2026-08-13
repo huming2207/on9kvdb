@@ -380,7 +380,8 @@ esp_err_t on9kvdb::append_compaction_entry_unsafe(compaction_output *output, con
     return ESP_OK;
 }
 
-esp_err_t on9kvdb::finish_compaction_output_unsafe(compaction_output *output, on9kvdb_def::table_reference *reference_out)
+esp_err_t on9kvdb::finish_compaction_output_unsafe(compaction_output *output, uint32_t value_bank, uint64_t value_bank_generation,
+                                                   uint32_t value_bank_tail, on9kvdb_def::table_reference *reference_out)
 {
     if (output == nullptr || reference_out == nullptr || !output->active || output->build.entry_count == 0) {
         return ESP_ERR_INVALID_ARG;
@@ -444,7 +445,7 @@ esp_err_t on9kvdb::finish_compaction_output_unsafe(compaction_output *output, on
     }
 
     const on9kvdb_def::table_reference reference = make_table_reference(output->metadata);
-    ret = validate_table_unsafe(reference);
+    ret = validate_table_unsafe(reference, value_bank, value_bank_generation, value_bank_tail);
     if (ret == ESP_OK) {
         *reference_out = reference;
         output->active = false;
@@ -646,7 +647,8 @@ esp_err_t on9kvdb::compact_tables_unsafe()
                                                  destination_value_generation, &destination_value_tail);
             if (ret == ESP_ERR_NO_MEM) {
                 on9kvdb_def::table_reference reference = {};
-                ret = finish_compaction_output_unsafe(&output, &reference);
+                ret = finish_compaction_output_unsafe(&output, destination_value_bank, destination_value_generation,
+                                                      destination_value_tail, &reference);
                 if (ret != ESP_OK) {
                     break;
                 }
@@ -702,7 +704,8 @@ esp_err_t on9kvdb::compact_tables_unsafe()
 
     if (ret == ESP_OK && output.active) {
         on9kvdb_def::table_reference reference = {};
-        ret = finish_compaction_output_unsafe(&output, &reference);
+        ret = finish_compaction_output_unsafe(&output, destination_value_bank, destination_value_generation,
+                                              destination_value_tail, &reference);
         if (ret == ESP_OK) {
             manifest.tables[output_start + output_count] = reference;
             output_count += 1U;

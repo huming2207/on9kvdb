@@ -90,6 +90,25 @@ namespace
             return rewritten;
         }
 
+        bool switch_manifest_value_bank()
+        {
+            bool rewritten = false;
+            for (uint32_t slot = 0; slot < on9kvdb_def::manifest_slot_count; slot += 1U) {
+                const size_t offset = static_cast<size_t>(slot) * on9kvdb_def::manifest_slot_size;
+                on9kvdb_def::manifest_record record = {};
+                if (on9kvdb_def::decode_manifest_record(bytes.data() + offset, on9kvdb_def::manifest_record_size, &record) !=
+                    on9kvdb_def::format_status::ok) {
+                    continue;
+                }
+                record.active_value_bank = 1U - record.active_value_bank;
+                if (!on9kvdb_def::encode_manifest_record(bytes.data() + offset, on9kvdb_def::manifest_record_size, record)) {
+                    return false;
+                }
+                rewritten = true;
+            }
+            return rewritten;
+        }
+
         std::vector<uint8_t> bytes;
         bool fail_sync = false;
     };
@@ -392,6 +411,37 @@ namespace
         check(database.close(handle) == ESP_OK, "close large-value delay namespace");
         check(database.deinit() == ESP_OK, "deinitialize large-value delay database");
     }
+
+    void test_recovery_rejects_unreachable_external_descriptor()
+    {
+        memory_io storage;
+        const on9kvdb_cfg config = {CONFIG_ON9KVDB_RUNTIME_MEMORY_BUDGET};
+        on9kvdb database(&storage, &config);
+        check(database.init() == ESP_OK, "initialize external descriptor database");
+        on9kvdb_handle handle = {};
+        check(database.open(as_bytes("descriptor"), on9kvdb_open_mode::read_write, &handle) == ESP_OK,
+              "open external descriptor namespace");
+
+        std::vector<uint8_t> external(5000, UINT8_C(0x39));
+        on9kvdb_transaction_handle transaction = {};
+        esp_err_t ret = database.begin(handle, &transaction);
+        ret = ret ?: database.set(transaction, as_bytes("external"), external.data(), external.size());
+        ret = ret ?: database.commit(transaction);
+        check(ret == ESP_OK, "commit external descriptor value");
+        check(commit_batch(database, handle, 0, 7, 800) == ESP_OK, "fill descriptor memtable");
+        check(commit_batch(database, handle, 1, 7, 800) == ESP_OK, "flush external descriptor into table");
+        on9kvdb_stats stats = {};
+        check(database.get_stats(&stats) == ESP_OK && stats.active_table_count > 0,
+              "publish table containing external descriptor");
+        check(database.close(handle) == ESP_OK, "close external descriptor namespace");
+        check(database.deinit() == ESP_OK, "deinitialize external descriptor database");
+
+        // Keep both manifest copies individually CRC-valid while selecting the
+        // opposite value bank. Recovery must reject the now-unreachable table
+        // descriptor instead of opening data from an inactive generation.
+        check(storage.switch_manifest_value_bank(), "rewrite valid manifests to select opposite value bank");
+        check(database.init() == ESP_ERR_INVALID_CRC, "reject table descriptor outside the manifest-selected value bank");
+    }
 }
 
 int main()
@@ -401,5 +451,6 @@ int main()
     test_wal_rotation_rechecks_relocated_descriptor_checksum();
     test_full_compaction_reclaims_tombstones();
     test_large_value_operations_delay_for_idle_task();
+    test_recovery_rejects_unreachable_external_descriptor();
     return failures == 0 ? 0 : 1;
 }

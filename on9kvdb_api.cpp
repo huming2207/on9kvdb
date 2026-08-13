@@ -276,7 +276,9 @@ esp_err_t on9kvdb::stage_value_unsafe(on9kvdb_transaction_handle transaction_han
 esp_err_t on9kvdb::stage_external_value_unsafe(on9kvdb_transaction_handle transaction_handle, on9kvdb_bytes key,
                                                const on9kvdb_def::value_ref &reference)
 {
-    if (!on9kvdb_def::value_ref_is_valid(reference, manifest.geometry.value_bank_size)) {
+    if (!value_ref_matches_bank_unsafe(reference, manifest.active_value_bank,
+                                       manifest.value_bank_generation[manifest.active_value_bank],
+                                       manifest.geometry.value_bank_size)) {
         return ESP_ERR_INVALID_ARG;
     }
     esp_err_t ret = stage_value_unsafe(transaction_handle, key, nullptr, 0, on9kvdb_def::mutation_kind_set);

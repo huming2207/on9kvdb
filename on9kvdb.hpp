@@ -714,6 +714,8 @@ private: // Value banks and streaming handles
                                          on9kvdb_def::value_ref *destination_out);
     bool value_bank_is_pinned_unsafe(uint32_t bank_slot) const;
     bool value_bank_has_staged_reference_unsafe(uint32_t bank_slot) const;
+    bool value_ref_matches_bank_unsafe(const on9kvdb_def::value_ref &reference, uint32_t bank_slot, uint64_t bank_generation,
+                                       uint32_t published_tail) const;
 
 private: // Handles and transactions
     esp_err_t get_handle_slot_unsafe(on9kvdb_handle handle, handle_slot **slot_out, uint16_t *slot_index_out = nullptr);
@@ -771,9 +773,11 @@ private: // Immutable SSTables
                                              const memtable_record_header *memtable_record,
                                              const namespace_slot *memtable_namespace, uint32_t destination_value_bank,
                                              uint64_t destination_value_generation, uint32_t *destination_value_tail);
-    esp_err_t finish_compaction_output_unsafe(compaction_output *output, on9kvdb_def::table_reference *reference_out);
+    esp_err_t finish_compaction_output_unsafe(compaction_output *output, uint32_t value_bank, uint64_t value_bank_generation,
+                                              uint32_t value_bank_tail, on9kvdb_def::table_reference *reference_out);
     esp_err_t recover_tables_unsafe();
-    esp_err_t validate_table_unsafe(const on9kvdb_def::table_reference &reference);
+    esp_err_t validate_table_unsafe(const on9kvdb_def::table_reference &reference, uint32_t value_bank = UINT32_MAX,
+                                    uint64_t value_bank_generation = 0, uint32_t value_bank_tail = 0);
     esp_err_t cache_table_index_unsafe(const on9kvdb_def::table_reference &reference, const uint8_t *index_block);
     void invalidate_table_index_cache_unsafe(uint32_t slot);
     void reset_table_key_filter_unsafe(uint32_t slot);

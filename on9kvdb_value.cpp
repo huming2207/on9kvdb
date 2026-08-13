@@ -90,6 +90,23 @@ bool on9kvdb::value_bank_has_staged_reference_unsafe(uint32_t bank_slot) const
     return false;
 }
 
+bool on9kvdb::value_ref_matches_bank_unsafe(const on9kvdb_def::value_ref &reference, uint32_t bank_slot, uint64_t bank_generation,
+                                            uint32_t published_tail) const
+{
+    if (bank_slot >= on9kvdb_def::value_bank_count || bank_generation == 0 ||
+        published_tail > manifest.geometry.value_bank_size || reference.value_size <= on9kvdb_def::inline_value_len ||
+        reference.bank_slot != bank_slot || reference.bank_generation != bank_generation ||
+        !on9kvdb_def::value_ref_is_valid(reference, manifest.geometry.value_bank_size)) {
+        return false;
+    }
+    const uint64_t chunk_count = (static_cast<uint64_t>(reference.value_size) + on9kvdb_def::value_chunk_payload_size - 1U) /
+                                 on9kvdb_def::value_chunk_payload_size;
+    uint64_t chunk_bytes = 0;
+    uint64_t end = 0;
+    return on9kvdb_def::checked_mul_u64(chunk_count, on9kvdb_def::value_chunk_size, &chunk_bytes) &&
+           on9kvdb_def::checked_add_u64(reference.first_chunk_offset, chunk_bytes, &end) && end <= published_tail;
+}
+
 esp_err_t on9kvdb::open_value_unsafe(const value_view &view, on9kvdb_value_reader *reader_out)
 {
     if (reader_out == nullptr) {
@@ -98,7 +115,9 @@ esp_err_t on9kvdb::open_value_unsafe(const value_view &view, on9kvdb_value_reade
     if (view.tombstone) {
         return ESP_ERR_NOT_FOUND;
     }
-    if ((view.is_external && !on9kvdb_def::value_ref_is_valid(view.external_value, manifest.geometry.value_bank_size)) ||
+    if ((view.is_external && !value_ref_matches_bank_unsafe(view.external_value, manifest.active_value_bank,
+                                                            manifest.value_bank_generation[manifest.active_value_bank],
+                                                            manifest.value_bank_tail[manifest.active_value_bank])) ||
         (!view.is_external && view.value_size != 0 && view.value == nullptr)) {
         return ESP_ERR_INVALID_CRC;
     }

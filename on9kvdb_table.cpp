@@ -229,7 +229,9 @@ esp_err_t on9kvdb::flush_memtable_unsafe()
         if (record->total_size != entry.record_size || record->key_size == 0 || record->key_size > on9kvdb_def::max_name_len ||
             inline_value_size > entry.record_size - record_header_bytes ||
             record->key_size > entry.record_size - record_header_bytes - inline_value_size ||
-            (external && !on9kvdb_def::value_ref_is_valid(record->external_value, manifest.geometry.value_bank_size)) ||
+            (external && !value_ref_matches_bank_unsafe(record->external_value, manifest.active_value_bank,
+                                                        manifest.value_bank_generation[manifest.active_value_bank],
+                                                        manifest.value_bank_tail[manifest.active_value_bank])) ||
             record->namespace_slot_index >= CONFIG_ON9KVDB_MAX_NAMESPACES || !namespaces[record->namespace_slot_index].used) {
             return ESP_ERR_INVALID_STATE;
         }
@@ -422,7 +424,8 @@ esp_err_t on9kvdb::flush_memtable_unsafe()
     return ESP_OK;
 }
 
-esp_err_t on9kvdb::validate_table_unsafe(const on9kvdb_def::table_reference &reference)
+esp_err_t on9kvdb::validate_table_unsafe(const on9kvdb_def::table_reference &reference, uint32_t value_bank,
+                                         uint64_t value_bank_generation, uint32_t value_bank_tail)
 {
     const size_t sort_bytes = static_cast<size_t>(CONFIG_ON9KVDB_MEMTABLE_ENTRY_COUNT) * sizeof(uint32_t);
     if (!reference.active || reference.slot >= manifest.geometry.table_count ||
@@ -431,6 +434,18 @@ esp_err_t on9kvdb::validate_table_unsafe(const on9kvdb_def::table_reference &ref
     }
     invalidate_table_index_cache_unsafe(reference.slot);
     reset_table_key_filter_unsafe(reference.slot);
+    if (value_bank == UINT32_MAX) {
+        value_bank = manifest.active_value_bank;
+        if (value_bank >= on9kvdb_def::value_bank_count) {
+            return ESP_ERR_INVALID_CRC;
+        }
+        value_bank_generation = manifest.value_bank_generation[value_bank];
+        value_bank_tail = manifest.value_bank_tail[value_bank];
+    }
+    if (value_bank >= on9kvdb_def::value_bank_count || value_bank_generation == 0 ||
+        value_bank_tail > manifest.geometry.value_bank_size) {
+        return ESP_ERR_INVALID_CRC;
+    }
 
     uint8_t *data_block = future_scratch + sort_bytes;
     uint8_t *index_block = data_block + manifest.limits.sstable_block_bytes;
@@ -528,7 +543,9 @@ esp_err_t on9kvdb::validate_table_unsafe(const on9kvdb_def::table_reference &ref
             const bool tombstone = (entry.flags & on9kvdb_def::table_entry_flag_tombstone) != 0;
             const bool external = (entry.flags & on9kvdb_def::table_entry_flag_external_value) != 0;
             if (entry.transaction_sequence < footer.min_sequence || entry.transaction_sequence > footer.max_sequence ||
-                entry.reserved0 != 0 || !valid_table_value(entry.value, entry.value_size, tombstone, external)) {
+                entry.reserved0 != 0 || !valid_table_value(entry.value, entry.value_size, tombstone, external) ||
+                (external &&
+                 !value_ref_matches_bank_unsafe(entry.external_value, value_bank, value_bank_generation, value_bank_tail))) {
                 return ESP_ERR_INVALID_CRC;
             }
 
