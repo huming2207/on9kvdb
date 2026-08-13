@@ -243,23 +243,23 @@ bool on9kvdb_def::validate_bytes(const uint8_t *data, uint16_t size, uint16_t ma
     return data != nullptr && size > 0 && size <= maximum_size;
 }
 
-uint32_t on9kvdb_def::make_handle_value(uint16_t slot, uint32_t generation)
+uint64_t on9kvdb_def::make_handle_value(uint16_t slot, uint64_t generation)
 {
     if (slot >= handle_slot_capacity || generation == 0 || generation > max_handle_generation) {
         return 0;
     }
 
-    return (generation << handle_slot_bits) | (static_cast<uint32_t>(slot) + 1U);
+    return (generation << handle_slot_bits) | (static_cast<uint64_t>(slot) + 1U);
 }
 
-bool on9kvdb_def::decode_handle_value(uint32_t value, uint16_t *slot_out, uint32_t *generation_out)
+bool on9kvdb_def::decode_handle_value(uint64_t value, uint16_t *slot_out, uint64_t *generation_out)
 {
     if (slot_out == nullptr || generation_out == nullptr) {
         return false;
     }
 
-    const uint32_t slot_token = value & handle_slot_mask;
-    const uint32_t generation = value >> handle_slot_bits;
+    const uint64_t slot_token = value & handle_slot_mask;
+    const uint64_t generation = value >> handle_slot_bits;
     if (slot_token == 0 || slot_token > handle_slot_capacity || generation == 0) {
         return false;
     }
@@ -269,7 +269,7 @@ bool on9kvdb_def::decode_handle_value(uint32_t value, uint16_t *slot_out, uint32
     return true;
 }
 
-bool on9kvdb_def::is_handle_value(uint32_t value, uint16_t slot, uint32_t generation)
+bool on9kvdb_def::is_handle_value(uint64_t value, uint16_t slot, uint64_t generation)
 {
     return value != 0 && value == make_handle_value(slot, generation);
 }

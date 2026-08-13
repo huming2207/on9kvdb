@@ -61,10 +61,10 @@ public:
     }
 
 private:
-    explicit constexpr on9kvdb_handle(uint32_t value) : raw(value) {}
+    explicit constexpr on9kvdb_handle(uint64_t value) : raw(value) {}
 
 private:
-    uint32_t raw = 0;
+    uint64_t raw = 0;
 
     friend class on9kvdb;
 };
@@ -88,10 +88,10 @@ public:
     }
 
 private:
-    explicit constexpr on9kvdb_transaction_handle(uint32_t value) : raw(value) {}
+    explicit constexpr on9kvdb_transaction_handle(uint64_t value) : raw(value) {}
 
 private:
-    uint32_t raw = 0;
+    uint64_t raw = 0;
 
     friend class on9kvdb;
 };
@@ -115,10 +115,10 @@ public:
     }
 
 private:
-    explicit constexpr on9kvdb_value_reader(uint32_t value) : raw(value) {}
+    explicit constexpr on9kvdb_value_reader(uint64_t value) : raw(value) {}
 
 private:
-    uint32_t raw = 0;
+    uint64_t raw = 0;
 
     friend class on9kvdb;
 };
@@ -142,10 +142,10 @@ public:
     }
 
 private:
-    explicit constexpr on9kvdb_value_writer(uint32_t value) : raw(value) {}
+    explicit constexpr on9kvdb_value_writer(uint64_t value) : raw(value) {}
 
 private:
-    uint32_t raw = 0;
+    uint64_t raw = 0;
 
     friend class on9kvdb;
 };
@@ -523,7 +523,7 @@ private:
     };
 
     struct handle_slot {
-        uint32_t generation;
+        uint64_t generation;
         bool used;
         bool transaction_active;
         on9kvdb_open_mode mode;
@@ -545,9 +545,9 @@ private:
     };
 
     struct transaction_slot {
-        uint32_t generation;
+        uint64_t generation;
         uint16_t handle_slot_index;
-        uint32_t handle_generation;
+        uint64_t handle_generation;
         uint16_t mutation_count;
         uint32_t staged_value_bytes;
         bool active;
@@ -586,7 +586,7 @@ private:
 
     struct value_reader_slot {
         uint32_t checksum_state = UINT32_MAX;
-        uint32_t generation = 0;
+        uint64_t generation = 0;
         uint32_t value_size = 0;
         uint32_t cursor = 0;
         uint32_t buffer_size = 0;
@@ -599,8 +599,8 @@ private:
 
     struct value_writer_slot {
         uint64_t checksum_state = UINT32_MAX;
-        uint32_t transaction_handle_raw = 0;
-        uint32_t generation = 0;
+        uint64_t transaction_handle_raw = 0;
+        uint64_t generation = 0;
         uint32_t expected_size = 0;
         uint32_t written_size = 0;
         uint32_t chunk_payload_size = 0;
@@ -856,8 +856,8 @@ private:
     uint32_t memtable_entry_count = 0;
     uint32_t wal_tail[on9kvdb_def::wal_file_count] = {};
     uint64_t next_transaction_sequence = 1;
-    uint32_t handle_generation_counter = 1;
-    uint32_t transaction_generation_counter = 1;
+    uint64_t handle_generation_counter = 1;
+    uint64_t transaction_generation_counter = 1;
     on9kvdb_stats stats = {};
     bool initialized = false;
     bool shutting_down = false;

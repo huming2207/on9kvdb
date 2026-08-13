@@ -1,8 +1,8 @@
 #include <cstring>
 
-#include <freertos/task.h>
-
 #include "on9kvdb.hpp"
+
+#include <freertos/task.h>
 
 namespace
 {
@@ -36,7 +36,7 @@ esp_err_t on9kvdb::get_value_reader_unsafe(on9kvdb_value_reader reader, const va
         return ESP_ERR_INVALID_ARG;
     }
     uint16_t index = 0;
-    uint32_t generation = 0;
+    uint64_t generation = 0;
     if (!on9kvdb_def::decode_handle_value(reader.raw, &index, &generation) || index >= CONFIG_ON9KVDB_MAX_VALUE_READERS ||
         value_readers == nullptr || !value_readers[index].used || value_readers[index].generation != generation) {
         return ESP_ERR_INVALID_ARG;
@@ -51,7 +51,7 @@ esp_err_t on9kvdb::get_value_writer_unsafe(on9kvdb_value_writer writer, value_wr
         return ESP_ERR_INVALID_ARG;
     }
     uint16_t index = 0;
-    uint32_t generation = 0;
+    uint64_t generation = 0;
     if (!on9kvdb_def::decode_handle_value(writer.raw, &index, &generation) || index != 0 || !value_writer->active ||
         value_writer->generation != generation) {
         return ESP_ERR_INVALID_ARG;
@@ -111,7 +111,7 @@ esp_err_t on9kvdb::open_value_unsafe(const value_view &view, on9kvdb_value_reade
         if (reader.used) {
             continue;
         }
-        const uint32_t generation = handle_generation_counter;
+        const uint64_t generation = handle_generation_counter;
         handle_generation_counter = generation == on9kvdb_def::max_handle_generation ? 0 : handle_generation_counter + 1U;
         reader = {};
         reader.generation = generation;
@@ -419,7 +419,7 @@ esp_err_t on9kvdb::close(on9kvdb_value_reader reader)
     value_reader_slot *reader_state = nullptr;
     ret = get_value_reader_unsafe(reader, &reader_state);
     if (ret == ESP_OK) {
-        const uint32_t generation = reader_state->generation;
+        const uint64_t generation = reader_state->generation;
         *reader_state = {};
         reader_state->generation = generation;
     }
@@ -469,7 +469,7 @@ esp_err_t on9kvdb::begin_value_write_unsafe(on9kvdb_transaction_handle transacti
             }
         }
     }
-    const uint32_t generation = handle_generation_counter;
+    const uint64_t generation = handle_generation_counter;
     handle_generation_counter = generation == on9kvdb_def::max_handle_generation ? 0 : handle_generation_counter + 1U;
     *value_writer = {};
     value_writer->generation = generation;
@@ -665,7 +665,7 @@ esp_err_t on9kvdb::finish_value_write_unsafe(value_writer_slot *writer)
         manifest.value_bank_tail[writer->reference.bank_slot] = writer->next_chunk_offset;
         value_bank_dirty_mask |= static_cast<uint8_t>(UINT8_C(1) << writer->reference.bank_slot);
     }
-    const uint32_t generation = writer->generation;
+    const uint64_t generation = writer->generation;
     *writer = {};
     writer->generation = generation;
     return ret;
@@ -713,7 +713,7 @@ esp_err_t on9kvdb::abort_value_write(on9kvdb_value_writer writer)
         value_writer_slot *writer_state = nullptr;
         ret = get_value_writer_unsafe(writer, &writer_state);
         if (ret == ESP_OK) {
-            const uint32_t generation = writer_state->generation;
+            const uint64_t generation = writer_state->generation;
             *writer_state = {};
             writer_state->generation = generation;
         }

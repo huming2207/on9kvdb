@@ -22,7 +22,7 @@ esp_err_t on9kvdb::get_handle_slot_unsafe(on9kvdb_handle handle, const handle_sl
     }
 
     uint16_t slot_index = 0;
-    uint32_t generation = 0;
+    uint64_t generation = 0;
     if (!on9kvdb_def::decode_handle_value(handle.raw, &slot_index, &generation) ||
         slot_index >= CONFIG_ON9KVDB_MAX_OPEN_HANDLES) {
         return ESP_ERR_INVALID_ARG;
@@ -57,7 +57,7 @@ esp_err_t on9kvdb::get_transaction_unsafe(on9kvdb_transaction_handle transaction
     }
 
     uint16_t slot_index = 0;
-    uint32_t generation = 0;
+    uint64_t generation = 0;
     if (!on9kvdb_def::decode_handle_value(transaction_handle.raw, &slot_index, &generation) || slot_index != 0 ||
         transaction == nullptr || !transaction->active || transaction->generation != generation) {
         return ESP_ERR_INVALID_ARG;
@@ -81,7 +81,7 @@ void on9kvdb::clear_transaction_unsafe()
         return;
     }
 
-    const uint32_t generation = transaction->generation;
+    const uint64_t generation = transaction->generation;
     if (transaction->active && transaction->handle_slot_index < CONFIG_ON9KVDB_MAX_OPEN_HANDLES) {
         handle_slot &handle = handles[transaction->handle_slot_index];
         if (handle.used && handle.generation == transaction->handle_generation) {
@@ -128,7 +128,7 @@ esp_err_t on9kvdb::open(on9kvdb_bytes namespace_name, on9kvdb_open_mode mode, on
             release_operation_lock();
             return ESP_ERR_INVALID_STATE;
         }
-        const uint32_t generation = handle_generation_counter;
+        const uint64_t generation = handle_generation_counter;
         handle_generation_counter = generation == on9kvdb_def::max_handle_generation ? 0 : handle_generation_counter + 1U;
         slot = {};
         slot.generation = generation;
@@ -158,7 +158,7 @@ esp_err_t on9kvdb::close(on9kvdb_handle handle)
         ret = ESP_ERR_INVALID_STATE;
     }
     if (ret == ESP_OK) {
-        const uint32_t generation = slot->generation;
+        const uint64_t generation = slot->generation;
         *slot = {};
         slot->generation = generation;
     }
@@ -191,7 +191,7 @@ esp_err_t on9kvdb::begin(on9kvdb_handle handle, on9kvdb_transaction_handle *tran
         if (transaction_generation_counter == 0) {
             ret = ESP_ERR_INVALID_STATE;
         } else {
-            const uint32_t generation = transaction_generation_counter;
+            const uint64_t generation = transaction_generation_counter;
             transaction_generation_counter =
                 generation == on9kvdb_def::max_handle_generation ? 0 : transaction_generation_counter + 1U;
             *transaction = {};
@@ -344,7 +344,7 @@ esp_err_t on9kvdb::set(on9kvdb_transaction_handle transaction_handle, on9kvdb_by
         ret = ret ?: write_value_unsafe(value_writer, value, value_size);
         ret = ret ?: finish_value_write_unsafe(value_writer);
         if (ret != ESP_OK && value_writer != nullptr && value_writer->active) {
-            const uint32_t generation = value_writer->generation;
+            const uint64_t generation = value_writer->generation;
             *value_writer = {};
             value_writer->generation = generation;
         }

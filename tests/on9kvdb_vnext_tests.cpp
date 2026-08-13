@@ -86,6 +86,20 @@ namespace
         check(decoded_payload != nullptr && decoded_payload[0] == 1 && decoded_payload[18] == 19,
               "in-place payload remains intact");
     }
+
+    void test_wide_handle_tokens()
+    {
+        check(on9kvdb_def::max_handle_generation > UINT32_MAX, "handle generation exceeds the old 23-bit lifetime");
+        const uint64_t token = on9kvdb_def::make_handle_value(255, on9kvdb_def::max_handle_generation);
+        uint16_t slot = 0;
+        uint64_t generation = 0;
+        check(token != 0 && on9kvdb_def::decode_handle_value(token, &slot, &generation) && slot == 255 &&
+                  generation == on9kvdb_def::max_handle_generation,
+              "maximum 55-bit handle generation round trips");
+        check(on9kvdb_def::make_handle_value(256, 1) == 0 &&
+                  on9kvdb_def::make_handle_value(0, on9kvdb_def::max_handle_generation + 1U) == 0,
+              "wide handle encoding rejects out-of-range fields");
+    }
 }
 
 int main()
@@ -93,5 +107,6 @@ int main()
     test_binary_names();
     test_external_table_record_crc();
     test_in_place_value_chunk();
+    test_wide_handle_tokens();
     return failures == 0 ? 0 : 1;
 }

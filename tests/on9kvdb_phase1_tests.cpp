@@ -242,24 +242,24 @@ namespace
 
     void test_handle_codec()
     {
-        const uint32_t value = on9kvdb_def::make_handle_value(7, 9);
+        const uint64_t value = on9kvdb_def::make_handle_value(7, 9);
         EXPECT_TRUE(value != 0);
 
         uint16_t slot = 0;
-        uint32_t generation = 0;
+        uint64_t generation = 0;
         EXPECT_TRUE(on9kvdb_def::decode_handle_value(value, &slot, &generation));
         EXPECT_EQ(static_cast<uint16_t>(7), slot);
         EXPECT_EQ(UINT32_C(9), generation);
         EXPECT_TRUE(on9kvdb_def::is_handle_value(value, 7, 9));
         EXPECT_TRUE(!on9kvdb_def::is_handle_value(value, 7, 10));
-        EXPECT_EQ(UINT32_C(0), on9kvdb_def::make_handle_value(UINT16_MAX, 1));
-        const uint32_t maximum = on9kvdb_def::make_handle_value(255, on9kvdb_def::max_handle_generation);
+        EXPECT_EQ(UINT64_C(0), on9kvdb_def::make_handle_value(UINT16_MAX, 1));
+        const uint64_t maximum = on9kvdb_def::make_handle_value(255, on9kvdb_def::max_handle_generation);
         EXPECT_TRUE(on9kvdb_def::decode_handle_value(maximum, &slot, &generation));
         EXPECT_EQ(static_cast<uint16_t>(255), slot);
         EXPECT_EQ(on9kvdb_def::max_handle_generation, generation);
-        EXPECT_EQ(UINT32_C(0), on9kvdb_def::make_handle_value(256, 1));
-        EXPECT_EQ(UINT32_C(0), on9kvdb_def::make_handle_value(0, on9kvdb_def::max_handle_generation + 1U));
-        EXPECT_EQ(UINT32_C(0), on9kvdb_def::make_handle_value(0, 0));
+        EXPECT_EQ(UINT64_C(0), on9kvdb_def::make_handle_value(256, 1));
+        EXPECT_EQ(UINT64_C(0), on9kvdb_def::make_handle_value(0, on9kvdb_def::max_handle_generation + 1U));
+        EXPECT_EQ(UINT64_C(0), on9kvdb_def::make_handle_value(0, 0));
         EXPECT_TRUE(!on9kvdb_def::decode_handle_value(0, &slot, &generation));
     }
 
