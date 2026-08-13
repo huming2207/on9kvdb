@@ -259,11 +259,55 @@ namespace
         check(database.close(handle) == ESP_OK, "close recovered compaction namespace");
         check(database.deinit() == ESP_OK, "deinitialize accounting database");
     }
+
+    void test_wal_rotation_rechecks_relocated_descriptor_checksum()
+    {
+        memory_io storage;
+        const on9kvdb_cfg config = {CONFIG_ON9KVDB_RUNTIME_MEMORY_BUDGET};
+        on9kvdb database(&storage, &config);
+        check(database.init() == ESP_OK, "initialize WAL rotation database");
+        on9kvdb_handle handle = {};
+        check(database.open(as_bytes("rotate"), on9kvdb_open_mode::read_write, &handle) == ESP_OK, "open WAL rotation namespace");
+
+        // Fill both active table slots while leaving the current memtable
+        // non-empty. Six one-frame replacements then consume the remaining WAL
+        // capacity without increasing the memtable footprint.
+        check(commit_batch(database, handle, 0, 7, 800) == ESP_OK, "commit first rotation batch");
+        check(commit_batch(database, handle, 1, 7, 800) == ESP_OK, "commit second rotation batch");
+        check(commit_batch(database, handle, 2, 7, 800) == ESP_OK, "commit third rotation batch");
+        for (uint32_t index = 0; index < 6; index += 1U) {
+            on9kvdb_transaction_handle transaction = {};
+            const uint8_t value = static_cast<uint8_t>(index);
+            esp_err_t ret = database.begin(handle, &transaction);
+            ret = ret ?: database.set(transaction, as_bytes("replacement"), &value, sizeof(value));
+            ret = ret ?: database.commit(transaction);
+            check(ret == ESP_OK, "fill final WAL frames with replacements");
+        }
+
+        std::vector<uint8_t> external(5000, UINT8_C(0x5a));
+        on9kvdb_transaction_handle transaction = {};
+        esp_err_t ret = database.begin(handle, &transaction);
+        ret = ret ?: database.set(transaction, as_bytes("external-after-rotation"), external.data(), external.size());
+        ret = ret ?: database.commit(transaction);
+        check(ret == ESP_OK, "commit external value across rotation-triggered compaction");
+        check(database.close(handle) == ESP_OK, "close rotation namespace");
+        check(database.deinit() == ESP_OK, "deinitialize rotation database");
+
+        check(database.init() == ESP_OK, "recover rotation database");
+        check(database.open(as_bytes("rotate"), on9kvdb_open_mode::read_write, &handle) == ESP_OK, "reopen rotation namespace");
+        std::vector<uint8_t> recovered(external.size());
+        check(read_exact(database, handle, "external-after-rotation", recovered.data(), recovered.size()) == ESP_OK &&
+                  recovered == external,
+              "recover external value committed after rotation-triggered relocation");
+        check(database.close(handle) == ESP_OK, "close recovered rotation namespace");
+        check(database.deinit() == ESP_OK, "deinitialize recovered rotation database");
+    }
 }
 
 int main()
 {
     test_core_lifecycle_and_recovery();
     test_table_accounting_and_staged_value_relocation();
+    test_wal_rotation_rechecks_relocated_descriptor_checksum();
     return failures == 0 ? 0 : 1;
 }

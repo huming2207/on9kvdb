@@ -313,6 +313,11 @@ esp_err_t on9kvdb::append_transaction_unsafe(transaction_slot *transaction_state
                          next_transaction_sequence);
                 return ret;
             }
+            // A nominal flush may become a full compaction when the active
+            // table bank has no free slot. Compaction relocates external
+            // descriptors staged by the current transaction, so the WAL
+            // checksum must be calculated from their final locations.
+            staged_descriptors_may_have_moved = true;
         }
         ret = rotate_wal_unsafe();
         if (ret != ESP_OK) {
