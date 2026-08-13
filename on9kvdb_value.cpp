@@ -1,6 +1,24 @@
 #include <cstring>
 
+#include <freertos/task.h>
+
 #include "on9kvdb.hpp"
+
+namespace
+{
+    static const constexpr uint32_t value_chunks_before_delay = 8;
+
+    void delay_after_value_chunk(uint32_t *chunks_since_delay)
+    {
+        *chunks_since_delay += 1U;
+        if (*chunks_since_delay >= value_chunks_before_delay) {
+            // Block for one tick instead of merely yielding so the lower-priority
+            // idle task can feed the task watchdog during a very large value.
+            vTaskDelay(1);
+            *chunks_since_delay = 0;
+        }
+    }
+}
 
 esp_err_t on9kvdb::get_value_reader_unsafe(on9kvdb_value_reader reader, value_reader_slot **slot_out)
 {
@@ -257,6 +275,7 @@ esp_err_t on9kvdb::consume_value(on9kvdb_value_reader reader, uint32_t size)
         ret = ESP_ERR_INVALID_SIZE;
     }
     uint32_t remaining = size;
+    uint32_t chunks_since_delay = 0;
     while (ret == ESP_OK && remaining > 0 && reader_state->external && reader_state->checksum_enabled) {
         if (reader_state->cursor < reader_state->buffer_value_offset ||
             reader_state->cursor >= reader_state->buffer_value_offset + reader_state->buffer_size) {
@@ -286,6 +305,7 @@ esp_err_t on9kvdb::consume_value(on9kvdb_value_reader reader, uint32_t size)
             value_reader_buffers + static_cast<size_t>(reader_index) * on9kvdb_def::value_chunk_size + buffer_offset, part);
         reader_state->cursor += part;
         remaining -= part;
+        delay_after_value_chunk(&chunks_since_delay);
     }
     if (ret == ESP_OK && remaining > 0) {
         reader_state->cursor += remaining;
@@ -313,6 +333,7 @@ esp_err_t on9kvdb::read_value_into(on9kvdb_value_reader reader, void *destinatio
     value_reader_slot *reader_state = nullptr;
     ret = get_value_reader_unsafe(reader, &reader_state);
     uint8_t *output = static_cast<uint8_t *>(destination);
+    uint32_t chunks_since_delay = 0;
     while (ret == ESP_OK && *read_size_out < destination_size && reader_state->cursor < reader_state->value_size) {
         if (reader_state->cursor < reader_state->buffer_value_offset ||
             reader_state->cursor >= reader_state->buffer_value_offset + reader_state->buffer_size) {
@@ -349,6 +370,7 @@ esp_err_t on9kvdb::read_value_into(on9kvdb_value_reader reader, void *destinatio
         }
         *read_size_out += copy_size;
         reader_state->cursor += copy_size;
+        delay_after_value_chunk(&chunks_since_delay);
     }
     if (ret == ESP_OK && reader_state->external && reader_state->checksum_enabled &&
         reader_state->cursor == reader_state->value_size &&
@@ -526,6 +548,7 @@ esp_err_t on9kvdb::copy_external_value_unsafe(const on9kvdb_def::value_ref &sour
 
     uint32_t checksum_state = UINT32_MAX;
     uint32_t output_offset = destination.first_chunk_offset;
+    uint32_t chunks_since_delay = 0;
     for (uint64_t index = 0; index < chunk_count; index += 1U) {
         const uint64_t input_offset = static_cast<uint64_t>(source.first_chunk_offset) + index * on9kvdb_def::value_chunk_size;
         esp_err_t ret = read_storage_bytes_unsafe(on9kvdb_def::file_kind::value_bank, source.bank_slot, input_offset, io_frame,
@@ -568,6 +591,7 @@ esp_err_t on9kvdb::copy_external_value_unsafe(const on9kvdb_def::value_ref &sour
             return ret;
         }
         output_offset += on9kvdb_def::value_chunk_size;
+        delay_after_value_chunk(&chunks_since_delay);
     }
     if (~checksum_state != source.value_checksum) {
         return ESP_ERR_INVALID_CRC;
@@ -594,6 +618,7 @@ esp_err_t on9kvdb::write_value_unsafe(value_writer_slot *writer, const uint8_t *
         return ESP_OK;
     }
     uint32_t copied = 0;
+    uint32_t chunks_since_delay = 0;
     while (copied < size) {
         const uint32_t available = on9kvdb_def::value_chunk_payload_size - writer->chunk_payload_size;
         uint32_t part = size - copied;
@@ -612,6 +637,7 @@ esp_err_t on9kvdb::write_value_unsafe(value_writer_slot *writer, const uint8_t *
             if (ret != ESP_OK) {
                 return ret;
             }
+            delay_after_value_chunk(&chunks_since_delay);
         }
     }
     return ESP_OK;

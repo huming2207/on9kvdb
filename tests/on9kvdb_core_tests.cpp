@@ -4,6 +4,8 @@
 #include <cstring>
 #include <vector>
 
+#include <freertos/task.h>
+
 #include "on9kvdb.hpp"
 
 namespace
@@ -358,6 +360,38 @@ namespace
         check(database.close(handle) == ESP_OK, "close recovered tombstone namespace");
         check(database.deinit() == ESP_OK, "deinitialize recovered tombstone database");
     }
+
+    void test_large_value_operations_delay_for_idle_task()
+    {
+        memory_io storage;
+        const on9kvdb_cfg config = {CONFIG_ON9KVDB_RUNTIME_MEMORY_BUDGET};
+        on9kvdb database(&storage, &config);
+        check(database.init() == ESP_OK, "initialize large-value delay database");
+        on9kvdb_handle handle = {};
+        check(database.open(as_bytes("delays"), on9kvdb_open_mode::read_write, &handle) == ESP_OK,
+              "open large-value delay namespace");
+
+        std::vector<uint8_t> large(on9kvdb_def::value_chunk_payload_size * 12U, UINT8_C(0xa7));
+        on9kvdb_transaction_handle transaction = {};
+        check(database.begin(handle, &transaction) == ESP_OK, "begin large-value delay transaction");
+        host_task_delay_call_count = 0;
+        check(database.set(transaction, as_bytes("large-delay"), large.data(), large.size()) == ESP_OK &&
+                  host_task_delay_call_count > 0,
+              "large convenience write periodically delays");
+        check(database.commit(transaction) == ESP_OK, "commit large-value delay transaction");
+
+        on9kvdb_value_reader reader = {};
+        check(database.open_value(handle, as_bytes("large-delay"), &reader) == ESP_OK, "open large delayed value");
+        std::vector<uint8_t> recovered(large.size());
+        uint32_t read_size = 0;
+        host_task_delay_call_count = 0;
+        check(database.read_value_into(reader, recovered.data(), recovered.size(), &read_size) == ESP_OK &&
+                  read_size == recovered.size() && recovered == large && host_task_delay_call_count > 0,
+              "large direct read periodically delays");
+        check(database.close(reader) == ESP_OK, "close large delayed value");
+        check(database.close(handle) == ESP_OK, "close large-value delay namespace");
+        check(database.deinit() == ESP_OK, "deinitialize large-value delay database");
+    }
 }
 
 int main()
@@ -366,5 +400,6 @@ int main()
     test_table_accounting_and_staged_value_relocation();
     test_wal_rotation_rechecks_relocated_descriptor_checksum();
     test_full_compaction_reclaims_tombstones();
+    test_large_value_operations_delay_for_idle_task();
     return failures == 0 ? 0 : 1;
 }
